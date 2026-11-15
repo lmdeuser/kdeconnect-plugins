@@ -9,8 +9,8 @@ Desktop KDE Connect builds, prerequisite backports, and remote Android verificat
 
 | Role | OBS Project | Packages | Configuration Invariants |
 | --- | --- | --- | --- |
-| Staging | `home:dwolfF:kdeconnect:staging` | `libei`, `kdeconnect`, `kdeconnect-android-probe` | Project publishing disabled (`obs/staging.xml`); package `<sourceaccess><disable/></sourceaccess>` (`obs/packages/*.xml`); builds with `ctest` / `apksigner verify` and `lintian`. |
-| Stable | `home:dwolfF:kdeconnect` | `libei`, `kdeconnect` | Direct builds disabled (`obs/project.xml`); receives binary promotion only after staging builds, tests, `lintian`, and isolated `.deb` checks pass. `kdeconnect-android-probe` stays staging-only. |
+| Staging | `home:dwolfF:kdeconnect:staging` | `libei`, `kdeconnect`, `kdeconnect-android-probe` | Project publishing disabled (`obs/staging.xml`); Ubuntu 26.04 solver preferences and `PublishFlags: nofailedpackages` (`obs/staging.prjconf`); package `<sourceaccess><disable/></sourceaccess>` (`obs/packages/*.xml`); builds with `ctest` / `apksigner verify` and `lintian`. |
+| Stable | `home:dwolfF:kdeconnect` | `libei`, `kdeconnect` | Direct builds disabled (`obs/project.xml`); `PublishFlags: nofailedpackages` (`obs/stable.prjconf`); receives binary promotion only after staging builds, tests, `lintian`, and isolated `.deb` checks pass. `kdeconnect-android-probe` stays staging-only. |
 
 ## Packaging Overlays and Bundle Generator
 

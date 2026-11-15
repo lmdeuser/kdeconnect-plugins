@@ -18,6 +18,7 @@ from tools.obs_controller import (
     parse_obs_result_states,
     verify_controller_environment,
 )
+from tools.obs_packaging import strip_spdx_comments
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -193,6 +194,17 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(entries[0]["dirty"])
         self.assertEqual(entries[1]["package"], "libei")
         self.assertFalse(entries[1]["dirty"])
+
+    def test_prjconf_strips_spdx_headers_and_preserves_solver_preferences(self) -> None:
+        staging_conf = strip_spdx_comments((ROOT / "obs" / "staging.prjconf").read_text(encoding="utf-8"))
+        stable_conf = strip_spdx_comments((ROOT / "obs" / "stable.prjconf").read_text(encoding="utf-8"))
+        self.assertNotIn("SPDX-", staging_conf)
+        self.assertNotIn("SPDX-", stable_conf)
+        self.assertIn("PublishFlags: nofailedpackages", staging_conf)
+        self.assertIn("Prefer: gpg", staging_conf)
+        self.assertIn("Prefer: libavcodec62", staging_conf)
+        self.assertIn("Prefer: libavformat62", staging_conf)
+        self.assertIn("PublishFlags: nofailedpackages", stable_conf)
 
     def test_public_workspace_has_no_private_identifiers_or_secrets(self) -> None:
         issues = scan_repository(ROOT, staged_only=False, skip_state_dir=True)

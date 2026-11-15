@@ -19,9 +19,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 try:
-    from tools.obs_packaging import strip_xml_comments, verify_bundle_manifest
+    from tools.obs_packaging import strip_spdx_comments, strip_xml_comments, verify_bundle_manifest
 except ImportError:
-    from obs_packaging import strip_xml_comments, verify_bundle_manifest
+    from obs_packaging import strip_spdx_comments, strip_xml_comments, verify_bundle_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / ".state"
@@ -278,6 +278,16 @@ def _cmd_ensure_projects(staging_proj: str, stable_proj: str) -> int:
         xml_body = strip_xml_comments(xml_path.read_text(encoding="utf-8"))
         _osc_api(api_path, method="PUT", xml_text=xml_body)
         ensured.append(api_path)
+
+    prjconf_operations = [
+        (f"/source/{stable_proj}/_config", ROOT / "obs" / "stable.prjconf"),
+        (f"/source/{staging_proj}/_config", ROOT / "obs" / "staging.prjconf"),
+    ]
+    for api_path, conf_path in prjconf_operations:
+        conf_body = strip_spdx_comments(conf_path.read_text(encoding="utf-8"))
+        _osc_api(api_path, method="PUT", xml_text=conf_body)
+        ensured.append(api_path)
+
     print(json.dumps({"ensured": ensured}, indent=2))
     return 0
 
