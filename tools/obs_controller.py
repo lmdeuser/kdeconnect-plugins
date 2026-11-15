@@ -13,10 +13,18 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[1]
+STATE = ROOT / ".state"
+
 DEFAULT_STAGING_PROJECT = "home:dwolfF:kdeconnect:staging"
 DEFAULT_STABLE_PROJECT = "home:dwolfF:kdeconnect"
 DEFAULT_DISTRO = "xUbuntu_26.04"
 DEFAULT_ARCH = "x86_64"
+
+
+def build_osc_command(*args: str, state_dir: Path = STATE) -> list[str]:
+    """Construct an osc command with keyring disabled and per-runner cookiejar isolation."""
+    return ["osc", "--no-keyring", "--setopt", f"cookiejar={state_dir / 'osc-cookiejar'}", *args]
 
 
 @dataclass(frozen=True)
@@ -137,7 +145,7 @@ def _cmd_status(project: str, package: str | None) -> int:
             f"stable={DEFAULT_STABLE_PROJECT}, distro={DEFAULT_DISTRO}, arch={DEFAULT_ARCH}"
         )
         return 0
-    cmd = ["osc", "results", project, package, "-r", DEFAULT_DISTRO, "-a", DEFAULT_ARCH]
+    cmd = build_osc_command("results", project, package, "-r", DEFAULT_DISTRO, "-a", DEFAULT_ARCH)
     proc = subprocess.run(cmd, check=False)
     return proc.returncode
 

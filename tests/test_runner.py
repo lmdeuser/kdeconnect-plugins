@@ -11,7 +11,7 @@ from pathlib import Path
 
 from tools.check_public_tree import scan_repository
 from tools.install_cron import BEGIN, END, job, merge, remove_block
-from tools.obs_controller import evaluate_promotion_readiness, verify_controller_environment
+from tools.obs_controller import build_osc_command, evaluate_promotion_readiness, verify_controller_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -52,6 +52,13 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("XDG_CONFIG_HOME", controller)
         self.assertIn("OSC_CONFIG", controller)
         self.assertIn("exec python3 tools/obs_controller.py", controller)
+
+    def test_build_osc_command_isolates_cookiejar_and_disables_keyring(self) -> None:
+        cmd = build_osc_command("results", state_dir=Path("/var/tmp/state"))
+        self.assertEqual(
+            cmd,
+            ["osc", "--no-keyring", "--setopt", "cookiejar=/var/tmp/state/osc-cookiejar", "results"],
+        )
 
     def test_verify_controller_environment_accepts_disk_tmpdir_and_oscrc(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
