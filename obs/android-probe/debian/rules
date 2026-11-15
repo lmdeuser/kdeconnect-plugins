@@ -1,0 +1,65 @@
+#!/usr/bin/make -f
+# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
+# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+DEB_VERSION := $(shell dpkg-parsechangelog -S Version)
+DEB_HOST_ARCH := $(shell dpkg-architecture -qDEB_HOST_ARCH)
+SDK_ROOT := $(CURDIR)/sdk
+ANDROID_JAR := $(SDK_ROOT)/platforms/android-35/android.jar
+BUILD_TOOLS := $(SDK_ROOT)/build-tools/36.0.0
+
+%:
+	dh $@
+
+override_dh_auto_clean:
+	rm -rf build
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	rm -rf build
+	mkdir -p build/gen build/classes build/dex
+	sed 's/<manifest /<manifest package="org.example.kdeconnectprobe" /' \
+		app/src/main/AndroidManifest.xml > build/AndroidManifest.xml
+	"$(BUILD_TOOLS)/aapt2" link \
+		--manifest build/AndroidManifest.xml \
+		-I "$(ANDROID_JAR)" \
+		--min-sdk-version 30 \
+		--target-sdk-version 35 \
+		--version-code 1 \
+		--version-name 0.1 \
+		--java build/gen \
+		-o build/unaligned.apk
+	javac --release 17 -encoding UTF-8 -cp "$(ANDROID_JAR)" -d build/classes \
+		$$(find app/src/main/java build/gen -name '*.java' | sort)
+	"$(BUILD_TOOLS)/d8" --min-api 30 --lib "$(ANDROID_JAR)" --output build/dex \
+		$$(find build/classes -name '*.class' | sort)
+	zip -j -q build/unaligned.apk build/dex/classes.dex
+	LD_LIBRARY_PATH="$(BUILD_TOOLS)/lib64" "$(BUILD_TOOLS)/zipalign" -p -f 4 \
+		build/unaligned.apk build/aligned.apk
+	keytool -genkeypair -noprompt \
+		-alias probe-debug \
+		-keyalg RSA -keysize 2048 -validity 3650 \
+		-dname "CN=KDEConnect Probe Debug, O=KDEConnect Plugins" \
+		-storetype PKCS12 \
+		-keystore build/debug.p12 \
+		-storepass android -keypass android
+	"$(BUILD_TOOLS)/apksigner" sign \
+		--ks build/debug.p12 \
+		--ks-pass pass:android \
+		--key-pass pass:android \
+		--ks-key-alias probe-debug \
+		--out build/kdeconnect-capture-probe.apk \
+		build/aligned.apk
+
+override_dh_auto_test:
+	"$(BUILD_TOOLS)/apksigner" verify --verbose build/kdeconnect-capture-probe.apk
+	@printf 'APK_VERIFIED=1\n'
+
+override_dh_auto_install:
+
+override_dh_builddeb:
+	dh_builddeb
+	lintian --fail-on error \
+		"$(CURDIR)/../kdeconnect-android-probe_$(DEB_VERSION)_$(DEB_HOST_ARCH).deb"

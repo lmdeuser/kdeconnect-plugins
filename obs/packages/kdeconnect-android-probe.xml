@@ -1,0 +1,12 @@
+<!-- SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com> -->
+<!-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL -->
+<package name="kdeconnect-android-probe" project="home:dwolfF:kdeconnect:staging">
+  <title>KDE Connect Android capture probe (staging)</title>
+  <description>Remote OBS build of the diagnostic Android MediaProjection and AudioPlaybackCapture APK.</description>
+  <publish>
+    <disable/>
+  </publish>
+  <sourceaccess>
+    <disable/>
+  </sourceaccess>
+</package>

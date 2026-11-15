@@ -1,0 +1,9 @@
+<!-- SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com> -->
+<!-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL -->
+<package name="libei" project="home:dwolfF:kdeconnect">
+  <title>Emulated Input library (1.6.x backport for Ubuntu 26.04)</title>
+  <description>Promoted libei 1.6.x packages for Ubuntu 26.04 x86_64.</description>
+  <sourceaccess>
+    <disable/>
+  </sourceaccess>
+</package>

@@ -17,7 +17,7 @@ Public engineering harness, protocol specifications, verification tools, and Ubu
 - `.agents/skills/` -- Gate runbooks (`plugin-design-gate`, `obs-staging-pipeline`, `live-acceptance-matrix`, `upstream-invent-handoff`).
 - `docs/WORKFLOW.md` -- Full gate criteria and verification reporting format.
 - `docs/templates/plugin-spec-template.md` -- Standard Code-Complete plugin specification template.
-- `docs/plugins/screen-stream/spec.md` -- Feature specification for Android screen and eligible playback audio streaming.
+- `docs/plugins/screenstream/spec.md` -- Feature specification for Android screen and eligible playback audio streaming.
 - `prototype/` -- Diagnostic Android capture probe (`MediaProjection` + `AudioPlaybackCapture`) and upstream boundary notes.
 - `obs/` -- Two-contour OBS staging/stable architecture notes and future packaging overlays.
 - `tools/` and `tests/` -- Public-tree leak scanner, REUSE 3.0 / KDE Invent upstream branch validator, OBS controller helpers, and Python `unittest` suite.

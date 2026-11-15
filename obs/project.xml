@@ -1,0 +1,16 @@
+<!-- SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com> -->
+<!-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL -->
+<project name="home:dwolfF:kdeconnect">
+  <title>KDE Connect for Ubuntu 26.04</title>
+  <description>Verified KDE Connect packages promoted from staging for Ubuntu 26.04 x86_64.</description>
+  <person userid="dwolfF" role="maintainer"/>
+  <build>
+    <disable/>
+  </build>
+  <repository name="xUbuntu_26.04">
+    <path project="Ubuntu:26.04" repository="standard"/>
+    <path project="Ubuntu:26.04" repository="universe"/>
+    <path project="Ubuntu:26.04" repository="universe-update"/>
+    <arch>x86_64</arch>
+  </repository>
+</project>

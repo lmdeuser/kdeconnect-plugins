@@ -11,7 +11,13 @@ from pathlib import Path
 
 from tools.check_public_tree import scan_repository
 from tools.install_cron import BEGIN, END, job, merge, remove_block
-from tools.obs_controller import build_osc_command, evaluate_promotion_readiness, verify_controller_environment
+from tools.obs_controller import (
+    build_osc_command,
+    evaluate_promotion_readiness,
+    parse_obs_build_log,
+    parse_obs_result_states,
+    verify_controller_environment,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -134,6 +140,59 @@ class RunnerTests(unittest.TestCase):
                 deb_verified=True,
             ).ready
         )
+
+    def test_parse_obs_build_log_extracts_ctest_lintian_and_apk_verification(self) -> None:
+        desktop_log = (
+            "[  100s] Test project /build/obj-x86_64-linux-gnu\n"
+            "[  102s] 1/6 Test #1: notificationstest .........   Passed    0.12 sec\n"
+            "[  104s] 100% tests passed, 0 tests failed out of 6\n"
+            "[  120s] W: kdeconnect: no-manual-page\n"
+            "[  121s] Running lintian --fail-on error\n"
+        )
+        metrics = parse_obs_build_log(desktop_log)
+        self.assertEqual(metrics.ctest_ran, 6)
+        self.assertEqual(metrics.ctest_failed, 0)
+        self.assertEqual(metrics.lintian_errors, 0)
+        self.assertFalse(metrics.apk_verified)
+
+        failing_log = (
+            "83% tests passed, 1 tests failed out of 6\n"
+            "E: kdeconnect: arch-dependent-file-in-usr-share [usr/share/foo]\n"
+            "E: kdeconnect-libs: missing-dependency-on-libc\n"
+        )
+        fail_metrics = parse_obs_build_log(failing_log)
+        self.assertEqual(fail_metrics.ctest_ran, 6)
+        self.assertEqual(fail_metrics.ctest_failed, 1)
+        self.assertEqual(fail_metrics.lintian_errors, 2)
+
+        probe_log = (
+            "Verifies\n"
+            "Verified using v2 scheme (APK Signature Scheme v2): true\n"
+            "APK_VERIFIED=1\n"
+        )
+        probe_metrics = parse_obs_build_log(probe_log)
+        self.assertTrue(probe_metrics.apk_verified)
+        self.assertEqual(probe_metrics.lintian_errors, 0)
+
+    def test_parse_obs_result_states_tracks_dirty_and_status(self) -> None:
+        xml = (
+            '<resultlist state="00">\n'
+            '  <result project="home:dwolfF:kdeconnect:staging" repository="xUbuntu_26.04" '
+            'arch="x86_64" code="building" state="building" dirty="true">\n'
+            '    <status package="kdeconnect" code="succeeded"/>\n'
+            '  </result>\n'
+            '  <result project="home:dwolfF:kdeconnect:staging" repository="xUbuntu_26.04" '
+            'arch="x86_64" code="published" state="published">\n'
+            '    <status package="libei" code="succeeded"/>\n'
+            '  </result>\n'
+            '</resultlist>\n'
+        )
+        entries = parse_obs_result_states(xml)
+        self.assertEqual(entries[0]["package"], "kdeconnect")
+        self.assertEqual(entries[0]["code"], "succeeded")
+        self.assertTrue(entries[0]["dirty"])
+        self.assertEqual(entries[1]["package"], "libei")
+        self.assertFalse(entries[1]["dirty"])
 
     def test_public_workspace_has_no_private_identifiers_or_secrets(self) -> None:
         issues = scan_repository(ROOT, staged_only=False, skip_state_dir=True)

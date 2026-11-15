@@ -1,0 +1,4 @@
+# SPDX-FileCopyrightText: 2022-2024 Debian Qt/KDE Maintainers <debian-qt-kde@lists.debian.org>
+# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
+# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+rm_conffile /etc/xdg/autostart/kdeconnectd.desktop 20.04.2~

@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
+# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+
+Source: kdeconnect-android-probe
+Section: devel
+Priority: optional
+Maintainer: Dmitriy Volkov <dennshield@duck.com>
+Build-Depends: debhelper-compat (= 13),
+               lintian,
+               openjdk-21-jdk-headless,
+               zip,
+Standards-Version: 4.7.2
+Rules-Requires-Root: no
+
+Package: kdeconnect-android-probe
+Architecture: amd64
+Depends: ${misc:Depends},
+Description: Diagnostic Android capture probe APK built on OBS
+ Standalone Android diagnostic package verifying MediaProjection and
+ AudioPlaybackCapture permissions and lifecycle behavior for KDE Connect
+ screenstream development. Contains an unsigned/debug-signed APK archive for
+ manual ADB installation onto authorized test devices.

@@ -45,4 +45,4 @@ Treat these revisions strictly as point-in-time snapshots, not guarantees of cur
 
 ## Next Engineering Milestone
 
-After live probe verification, design authenticated peer-to-peer framing over KDE Connect's paired TLS transport, bounded frame/audio queues, coordinate/rotation negotiation, and connection-tied session lifecycle in `docs/plugins/screen-stream/spec.md`.
+After live probe verification, authenticated peer-to-peer framing over KDE Connect's paired TLS transport, bounded frame/audio queues, coordinate/rotation negotiation, and connection-tied session lifecycle are specified in `docs/plugins/screenstream/spec.md`.

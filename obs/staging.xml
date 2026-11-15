@@ -1,0 +1,17 @@
+<!-- SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com> -->
+<!-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL -->
+<project name="home:dwolfF:kdeconnect:staging">
+  <title>KDE Connect Ubuntu 26.04 staging</title>
+  <description>Protected KDE Connect staging builds requiring ctest, lintian, and .deb verification before promotion.</description>
+  <person userid="dwolfF" role="maintainer"/>
+  <publish>
+    <disable/>
+  </publish>
+  <repository name="xUbuntu_26.04">
+    <releasetarget project="home:dwolfF:kdeconnect" repository="xUbuntu_26.04" trigger="manual"/>
+    <path project="Ubuntu:26.04" repository="standard"/>
+    <path project="Ubuntu:26.04" repository="universe"/>
+    <path project="Ubuntu:26.04" repository="universe-update"/>
+    <arch>x86_64</arch>
+  </repository>
+</project>

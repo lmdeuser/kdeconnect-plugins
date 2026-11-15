@@ -14,6 +14,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.ServiceInfo;
 import android.graphics.PixelFormat;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
@@ -25,6 +26,7 @@ import android.media.Image;
 import android.media.ImageReader;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
@@ -71,11 +73,15 @@ public final class CaptureService extends Service {
 
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (started) return START_NOT_STICKY;
-        started = true;
-        startForeground(NOTIFICATION, notification("Starting capture"));
         if (intent == null) { stopSelf(); return START_NOT_STICKY; }
         Intent consent = intent.getParcelableExtra("consent");
         if (consent == null) { stopSelf(); return START_NOT_STICKY; }
+        started = true;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(NOTIFICATION, notification("Starting capture"), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+        } else {
+            startForeground(NOTIFICATION, notification("Starting capture"));
+        }
         try {
             projection = getSystemService(MediaProjectionManager.class)
                     .getMediaProjection(intent.getIntExtra("result", 0), consent);
