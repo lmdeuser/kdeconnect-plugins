@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
+# SPDX-License-Identifier: CC0-1.0
+
+# Local state, upstream clones, and agent memory
+.state/
+worktrees/
+upstreams/
+.agents/memory/
+.agents/*_chats/
+
+# Secrets, keys, and OBS state
+.env
+.env.*
+*.pem
+*.key
+*.keystore
+*.jks
+.osc*
+_osc*
+
+# Build artifacts, packages, and archives
+*.deb
+*.ddeb
+*.udeb
+*.dsc
+*.changes
+*.buildinfo
+*.tar.*
+*.tgz
+*.zip
+*.apk
+*.aab
+
+# Python caches and environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+
+# Gradle, IDE, and OS files
+build/
+out/
+.gradle/
+local.properties
+.idea/
+.vscode/
+.DS_Store
+.directory
