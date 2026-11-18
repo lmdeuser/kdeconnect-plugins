@@ -2,13 +2,19 @@
 # SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 
 import getpass
+import json
+import os
 import re
 import socket
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import tools.obs_controller as obs_controller
 from tools.check_public_tree import _iter_worktree_entries, scan_repository
 from tools.install_cron import BEGIN, END, job, merge, remove_block
 from tools.obs_controller import (
@@ -17,6 +23,7 @@ from tools.obs_controller import (
     evaluate_promotion_readiness,
     parse_obs_build_log,
     parse_obs_result_states,
+    prune_old_artifacts,
     verify_controller_environment,
 )
 from tools.obs_packaging import strip_spdx_comments
@@ -278,6 +285,152 @@ class RunnerTests(unittest.TestCase):
                     rf"\b{re.escape(token)}\b",
                     f"{rel} leaked local runtime identifier",
                 )
+
+    def test_promote_toctou_srcmd5_guard_and_prune_old_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            bin_root = state / "binaries" / "kdeconnect"
+            logs_root = state / "logs"
+            bin_root.mkdir(parents=True)
+            logs_root.mkdir(parents=True)
+
+            hashes = [f"{i:032x}" for i in range(1, 6)]
+            for idx, h in enumerate(hashes):
+                d = bin_root / h
+                d.mkdir()
+                log_f = logs_root / f"kdeconnect-{h}.log"
+                log_f.write_text("log", encoding="utf-8")
+                mtime = 1000 + idx * 10
+                os.utime(d, (mtime, mtime))
+                os.utime(log_f, (mtime, mtime))
+
+            verified_hash = hashes[4]
+            other_hash = hashes[0]
+            latest_meta = {
+                "srcmd5": verified_hash,
+                "code": "succeeded",
+                "ctest_ran": 8,
+                "ctest_failed": 0,
+                "lintian_errors": 0,
+                "binaries": [],
+            }
+            (bin_root / "latest.json").write_text(json.dumps(latest_meta), encoding="utf-8")
+
+            with mock.patch.object(obs_controller, "STATE", state):
+                # Expect TOCTOU rejection when expected_srcmd5 differs from latest.json.
+                rc = obs_controller._cmd_promote(
+                    "staging",
+                    "stable",
+                    "kdeconnect",
+                    "xUbuntu_26.04",
+                    "x86_64",
+                    deb_verified=True,
+                    wait=False,
+                    timeout_sec=10,
+                    expected_srcmd5=other_hash,
+                )
+                self.assertEqual(rc, 1)
+
+                # Expect TOCTOU rejection when live OBS source differs from verified srcmd5.
+                with mock.patch.object(
+                    obs_controller,
+                    "_osc_api",
+                    return_value=f'<directory srcmd5="{other_hash}"/>',
+                ):
+                    rc_live = obs_controller._cmd_promote(
+                        "staging",
+                        "stable",
+                        "kdeconnect",
+                        "xUbuntu_26.04",
+                        "x86_64",
+                        deb_verified=True,
+                        wait=False,
+                        timeout_sec=10,
+                        expected_srcmd5=verified_hash,
+                    )
+                    self.assertEqual(rc_live, 1)
+
+            # Protect promoted hash even if older, keep fresh temp file, sweep stale temp/bundles.
+            prom_dir = state / "promotions"
+            prom_dir.mkdir()
+            (prom_dir / "kdeconnect.json").write_text(json.dumps({"srcmd5": other_hash}), encoding="utf-8")
+
+            tmp_dir = state / "tmp"
+            bundles_dir = state / "bundles"
+            tmp_dir.mkdir()
+            bundles_dir.mkdir()
+            stale_tmp = tmp_dir / "old-scratch"
+            fresh_tmp = tmp_dir / "active-scratch"
+            stale_bundle = bundles_dir / "old.tar.xz"
+            stale_tmp.mkdir()
+            fresh_tmp.mkdir()
+            stale_bundle.write_text("stale", encoding="utf-8")
+            old_ts = time.time() - 10000
+            os.utime(stale_tmp, (old_ts, old_ts))
+            os.utime(stale_bundle, (old_ts, old_ts))
+
+            res = prune_old_artifacts("kdeconnect", keep=2, state_dir=state, sweep_tmp_age_sec=3600)
+            self.assertEqual(set(res["removed_dirs"]), {hashes[1], hashes[2]})
+            self.assertEqual(set(res["removed_logs"]), {f"kdeconnect-{hashes[1]}.log", f"kdeconnect-{hashes[2]}.log"})
+            self.assertEqual(set(res["removed_tmp"]), {"tmp/old-scratch", "bundles/old.tar.xz"})
+            self.assertTrue((bin_root / other_hash).is_dir())
+            self.assertTrue((bin_root / verified_hash).is_dir())
+            self.assertTrue((bin_root / hashes[3]).is_dir())
+            self.assertTrue(fresh_tmp.is_dir())
+
+    def test_cycle_idempotent_noop_and_circuit_breaker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hub"
+            state = root / ".state"
+            repo = state / "repos" / "kdeconnect-kde"
+            overlay = root / "obs" / "kdeconnect" / "debian"
+            (state / "sync").mkdir(parents=True)
+            overlay.mkdir(parents=True)
+            (overlay / "control").write_text("Source: kdeconnect\n", encoding="utf-8")
+            (repo / ".git").mkdir(parents=True)
+            upstream_sha = "a" * 40
+            plugin_sha = "b" * 40
+            base_sha = "c" * 40
+            (state / "sync" / "plugin_base.txt").write_text(base_sha + "\n", encoding="utf-8")
+
+            from tools.upstream_sync import compute_cycle_fingerprint, compute_overlay_sha256
+
+            fp = compute_cycle_fingerprint(upstream_sha, plugin_sha, compute_overlay_sha256(overlay))
+
+            def fake_git(_repo: Path | None, *args: str, **_kwargs: object) -> subprocess.CompletedProcess:
+                if args == ("remote", "get-url", "origin"):
+                    return subprocess.CompletedProcess([], 0, stdout="https://invent.kde.org/network/kdeconnect-kde.git\n")
+                if args == ("fetch", "origin", "master"):
+                    return subprocess.CompletedProcess([], 0, stdout="")
+                if args == ("rev-parse", "refs/remotes/origin/master"):
+                    return subprocess.CompletedProcess([], 0, stdout=upstream_sha + "\n")
+                if args == ("rev-parse", "refs/heads/plugin/screenstream"):
+                    return subprocess.CompletedProcess([], 0, stdout=plugin_sha + "\n")
+                raise AssertionError(f"Unexpected git call: {args}")
+
+            with (
+                mock.patch.object(obs_controller, "ROOT", root),
+                mock.patch.object(obs_controller, "STATE", state),
+                mock.patch.object(obs_controller, "_cmd_verify_env", return_value=0),
+                mock.patch.object(obs_controller, "check_android_upstream_drift", return_value={"status": "ok"}),
+                mock.patch.object(obs_controller, "run_git_hardened", side_effect=fake_git),
+                mock.patch.object(obs_controller, "synthesize_plugin_branch") as synth_mock,
+            ):
+                # 1. Idempotent no-op when promoted_fingerprint matches.
+                (state / "sync" / "kdeconnect.json").write_text(
+                    json.dumps({"promoted_fingerprint": fp}),
+                    encoding="utf-8",
+                )
+                self.assertEqual(obs_controller._cmd_cycle(wait_sec=0), 0)
+                synth_mock.assert_not_called()
+
+                # 2. Circuit breaker skips previously failed_gate candidate with same fingerprint.
+                (state / "sync" / "kdeconnect.json").write_text(
+                    json.dumps({"active_candidate": {"fingerprint": fp, "stage": "failed_gate"}}),
+                    encoding="utf-8",
+                )
+                self.assertEqual(obs_controller._cmd_cycle(wait_sec=0), 0)
+                synth_mock.assert_not_called()
 
 
 if __name__ == "__main__":

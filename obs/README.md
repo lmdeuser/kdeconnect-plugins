@@ -1,35 +1,41 @@
 <!-- SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com> -->
 <!-- SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL -->
 
-# Open Build Service (OBS) Packaging Architecture
+# Open Build Service (OBS) Runner & Packaging Guide
 
-Desktop KDE Connect builds, prerequisite backports, and remote Android verification APKs targeting Ubuntu 26.04 (`xUbuntu_26.04`, `x86_64`) use a strict two-contour OBS pipeline without local compilation or GitHub Actions.
+Desktop builds for Ubuntu 26.04 (`xUbuntu_26.04`, `x86_64`) use a two-project OBS pipeline driven from a dedicated runner host (`~/runners/kdeconnect-plugins`), with no local C++/Qt compilation and no GitHub Actions.
 
-## OBS Projects and Packages
+## 1. Two-Contour OBS Setup
 
-| Role | OBS Project | Packages | Configuration Invariants |
+| Contour | OBS Project | Packages | Role |
 | --- | --- | --- | --- |
-| Staging | `home:dwolfF:kdeconnect:staging` | `libei`, `kdeconnect`, `kdeconnect-android-probe` | Project publishing disabled (`obs/staging.xml`); Ubuntu 26.04 solver preferences and `PublishFlags: nofailedpackages` (`obs/staging.prjconf`); package `<sourceaccess><disable/></sourceaccess>` (`obs/packages/*.xml`); builds with `ctest` / `apksigner verify` and `lintian`. |
-| Stable | `home:dwolfF:kdeconnect` | `libei`, `kdeconnect` | Direct builds disabled (`obs/project.xml`); `PublishFlags: nofailedpackages` (`obs/stable.prjconf`); receives binary promotion only after staging builds, tests, `lintian`, and isolated `.deb` checks pass. `kdeconnect-android-probe` stays staging-only. |
+| Staging | `home:dwolfF:kdeconnect:staging` | `libei`, `kdeconnect`, `kdeconnect-android-probe` | Builds from uploaded `3.0 (quilt)` bundles (`obs/staging.xml`, `obs/staging.prjconf`), runs `ctest` (`xvfb-run` + `dbus-run-session`), and fails on any `lintian` error. Publishing is disabled here. |
+| Stable | `home:dwolfF:kdeconnect` | `libei`, `kdeconnect` | Direct builds disabled (`obs/project.xml`, `obs/stable.prjconf`). Receives binaries only when promoted after staging + offline Docker verification pass. Publishes the public Ubuntu APT repository. |
 
-## Packaging Overlays and Bundle Generator
+## 2. How Packaging Works
 
-- `obs/kdeconnect/debian/` -- Debian packaging overlay for upstream `kdeconnect-kde` (`master`), adapted from Ubuntu `25.12.3-0ubuntu1` with strict `BUILD_TESTING=ON`, non-ignored `ctest` execution under `xvfb-run` + `dbus-run-session`, `libei-dev (>= 1.6.0~)`, and `lintian --fail-on error`.
-- `obs/android-probe/debian/` -- Offline Debian/APK build overlay for `prototype/android-probe/` using `openjdk-21-jdk-headless` and `.orig-sdk.tar.xz` (`aapt2`, `javac`, `d8`, `zipalign`, `apksigner`).
-- `tools/obs_packaging.py` -- Builds deterministic `3.0 (quilt)` source bundles (`build-libei`, `build-kdeconnect`, `build-android-probe`) with `manifest.json` SHA-256 verification.
+- `obs/kdeconnect/debian/` -- Debian packaging overlay for upstream `kdeconnect-kde` (`master`) with `BUILD_TESTING=ON`, GStreamer video/audio runtime recommendations, `libei-dev (>= 1.6.0~)`, and `lintian --fail-on error`. Never committed into upstream Git branches.
+- `obs/android-probe/debian/` -- Diagnostic Android probe packaging for OBS staging (`kdeconnect-android-probe`, never promoted to stable).
+- `obs/verifier.Dockerfile` -- Builds the clean `kdeconnect-verifier:26.04` Rootless Docker image with Ubuntu runtime dependencies pre-installed so `.deb` tests run offline (`--network none`).
+- `tools/obs_packaging.py` -- Packs deterministic `.orig.tar.xz` (excluding any top-level `debian/` dir) and `.debian.tar.xz` bundles with SHA-256 `manifest.json` verification and monotonic UTC Git version stamps (`+gitYYYYMMDDHHMMSS.<sha12>`).
 
-## Controller Layout (`~/runners/kdeconnect-plugins`)
+## 3. Runner Commands & Hardening
 
-- Runs host Python and `osc` directly via `tools/run-controller.sh` and `tools/cron-cycle.sh` without a controller Docker wrapper.
-- Enforces a disk-backed `TMPDIR` (`.state/tmp`, rejecting `tmpfs`) and readable `OSC_CONFIG`.
-- Controller commands: `verify-env`, `ensure-projects`, `upload-bundle`, `inspect-build`, `status`, and `cycle`.
-- Uses managed cron slot `# BEGIN KDECONNECT OBS` (`47 * * * *`) via `tools/install_cron.py`, keeping unrelated cron jobs untouched.
+All commands run directly on the runner host via `tools/run-controller.sh` (which enforces a disk-backed `TMPDIR` on `.state/tmp` and isolates `OSC_CONFIG` and cookie jars):
 
-## Promotion Gate Invariants
+- `verify-env` -- Verify disk-backed `TMPDIR`, `osc` binary, and readable `OSC_CONFIG`.
+- `ensure-projects` -- Sync `obs/*.xml` and `obs/*.prjconf` metadata to OBS.
+- `cycle [--wait-sec N] [--no-promote] [--dry-run]` -- Full automated loop:
+  1. Checks `kdeconnect-android` `origin/master` drift and saves `.state/sync/android.json` (informational; warns if Android local rebuild is needed).
+  2. Fetches `https://invent.kde.org/network/kdeconnect-kde.git` `master` using hardened Git (`core.hooksPath=/dev/null`, `core.symlinks=false`, `submodule.recurse=false`, `protocol.ext.allow=never`, `fsckObjects=true`, scrubbed credentials).
+  3. Computes a composite fingerprint (`upstream_sha + plugin_sha + overlay_sha`). Exits immediately if already promoted (`Up to date`) or tripped by an earlier failure for the exact same fingerprint.
+  4. Cherry-picks `plugin/screenstream` onto `obs/kdeconnect-staging` cleanly, checks tree cleanliness and `check_kde_compliance.py`, builds the OBS bundle, and uploads it to `home:dwolfF:kdeconnect:staging`.
+  5. Waits for OBS staging, downloads logs/binaries (`inspect-build`), and checks `ctest > 0`, `ctest_failed == 0`, and `lintian_errors == 0`.
+  6. Runs `tools/verify-deb.sh`: static `dpkg-deb` path/mode/SUID/control checks on host + `--network none --cap-drop=ALL --security-opt=no-new-privileges:true` Rootless Docker install/purge + `readelf -d` (no `ldd`) + `gst-inspect-1.0`.
+  7. Promotes to `home:dwolfF:kdeconnect` with an `expected_srcmd5` TOCTOU lock check right before `osc release`.
+- `cleanup [--keep 2] [--tmp-age-sec 7200]` -- Prunes older binary directories and build logs (always keeping the latest `keep` plus active promoted revisions), sweeps stale `.state/{tmp,bundles,incoming}` entries, and runs `git gc --auto`. Runs automatically at the end of every `cycle`.
+- `upload-bundle`, `inspect-build`, `promote`, `status` -- Lower-level manual commands for individual pipeline stages.
 
-`tools/obs_controller.py::evaluate_promotion_readiness` blocks promotion from `home:dwolfF:kdeconnect:staging` to `home:dwolfF:kdeconnect` unless:
+## 4. Cron Schedule
 
-1. Staging build state for the exact source revision is `succeeded`.
-2. `ctest` actually executed > 0 test cases (`ctest_ran > 0`) and reported 0 failures (`ctest_failed == 0`).
-3. `lintian` reported 0 errors (`lintian_errors == 0`).
-4. Isolated `.deb` inspection and install/remove verification passed.
+Run `python3 tools/install_cron.py` on the runner host to install only the managed hourly slot (`# BEGIN KDECONNECT OBS` at `47 * * * *` via `tools/cron-cycle.sh` with `flock -n` locking and `controller.log` rotation). Existing unrelated cron blocks remain untouched. Use `--remove` to uninstall only this runner's cron block.

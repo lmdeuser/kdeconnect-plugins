@@ -198,8 +198,10 @@ def _write_directory_tar_xz(
     mtime: int,
     include_paths: list[Path] | None = None,
     executable_relpaths: set[str] | None = None,
+    exclude_top_dirs: set[str] | None = None,
 ) -> None:
     exec_set = executable_relpaths or set()
+    excluded_top = exclude_top_dirs or set()
     if include_paths is None:
         candidates = sorted(src_dir.rglob("*"), key=lambda p: p.relative_to(src_dir).as_posix())
     else:
@@ -210,6 +212,8 @@ def _write_directory_tar_xz(
             rel = path.relative_to(src_dir).as_posix()
             parts = path.relative_to(src_dir).parts
             if ".git" in parts or "__pycache__" in parts or path.suffix in (".pyc", ".pyo"):
+                continue
+            if parts and parts[0] in excluded_top:
                 continue
             if path.is_dir() and not path.is_symlink():
                 continue
@@ -466,8 +470,9 @@ def build_kdeconnect_bundle(
     """Create the OBS 3.0 (quilt) source bundle for kdeconnect-kde."""
     desktop_src = desktop_src.resolve()
     release_ver = _read_kdeconnect_version(desktop_src)
-    commit = subprocess.check_output(["git", "-C", str(desktop_src), "rev-parse", "HEAD"], text=True).strip()
-    mtime = int(subprocess.check_output(["git", "-C", str(desktop_src), "show", "-s", "--format=%ct", "HEAD"], text=True))
+    git_cmd = ["git", "-C", str(desktop_src), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+    commit = subprocess.check_output([*git_cmd, "rev-parse", "HEAD"], text=True).strip()
+    mtime = int(subprocess.check_output([*git_cmd, "show", "-s", "--format=%ct", "HEAD"], text=True))
     date_stamp = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y%m%d%H%M%S")
 
     upstream_version = f"{release_ver}+git{date_stamp}.{commit[:12]}"
@@ -480,6 +485,7 @@ def build_kdeconnect_bundle(
         dest_path=orig_path,
         top_dir=f"kdeconnect-{upstream_version}",
         mtime=mtime,
+        exclude_top_dirs={"debian"},
     )
 
     deb_path = output_dir / f"kdeconnect_{pkg_version}.debian.tar.xz"
