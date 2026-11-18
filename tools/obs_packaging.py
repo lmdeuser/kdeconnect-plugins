@@ -468,9 +468,9 @@ def build_kdeconnect_bundle(
     release_ver = _read_kdeconnect_version(desktop_src)
     commit = subprocess.check_output(["git", "-C", str(desktop_src), "rev-parse", "HEAD"], text=True).strip()
     mtime = int(subprocess.check_output(["git", "-C", str(desktop_src), "show", "-s", "--format=%ct", "HEAD"], text=True))
-    date_ymd = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y%m%d")
+    date_stamp = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y%m%d%H%M%S")
 
-    upstream_version = f"{release_ver}+git{date_ymd}.{commit[:12]}"
+    upstream_version = f"{release_ver}+git{date_stamp}.{commit[:12]}"
     pkg_version = f"{upstream_version}-0ubuntu1~obs{obs_rev}"
     output_dir.mkdir(parents=True, exist_ok=True)
 

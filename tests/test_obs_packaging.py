@@ -3,6 +3,8 @@
 
 import io
 import json
+import re
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -133,6 +135,19 @@ class ObsPackagingTests(unittest.TestCase):
                 changelog = tf.extractfile("debian/changelog").read().decode("utf-8")
                 self.assertIn(") resolute; urgency=medium", changelog)
             self.assertEqual(result["package"], "kdeconnect")
+            self.assertRegex(result["version"], r"^\d+\.\d+\.\d+\+git\d{14}\.[0-9a-f]{12}-0ubuntu1~obs1$")
+            if shutil.which("dpkg"):
+                cmp_proc = subprocess.run(
+                    [
+                        "dpkg",
+                        "--compare-versions",
+                        result["version"],
+                        "gt",
+                        "27.03.70+git20261118.824418214dab-0ubuntu1~obs2",
+                    ],
+                    check=False,
+                )
+                self.assertEqual(cmp_proc.returncode, 0)
 
     def test_build_android_probe_bundle_packs_sdk_slice_and_validates_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
