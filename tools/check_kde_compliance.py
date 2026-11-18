@@ -109,7 +109,7 @@ def _iter_repo_files(root: Path) -> list[Path]:
         if not path.is_file():
             continue
         parts = path.relative_to(root).parts
-        if ".git" in parts or ".state" in parts or "__pycache__" in parts:
+        if any(p in parts for p in (".git", ".state", "upstreams", "worktrees", "__pycache__")):
             continue
         if path.suffix in (".pyc", ".pyo"):
             continue

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tools.check_public_tree import scan_repository
+from tools.check_public_tree import _iter_worktree_entries, scan_repository
 from tools.install_cron import BEGIN, END, job, merge, remove_block
 from tools.obs_controller import (
     build_osc_command,
@@ -217,13 +217,8 @@ class RunnerTests(unittest.TestCase):
             for token in (getpass.getuser(), socket.gethostname().split(".", 1)[0])
             if len(token) >= 4 and token not in generic_tokens
         }
-        for path in sorted(ROOT.rglob("*")):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(ROOT).as_posix()
-            if rel.startswith((".git/", ".state/", "LICENSES/")) or "__pycache__" in path.parts or path.suffix == ".pyc":
-                continue
-            text = path.read_text(encoding="utf-8")
+        for rel, data in _iter_worktree_entries(ROOT, skip_state_dir=True):
+            text = data.decode("utf-8")
             for token in runtime_tokens:
                 self.assertNotRegex(
                     text,

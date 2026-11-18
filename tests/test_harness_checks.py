@@ -88,6 +88,27 @@ class PublicTreeCheckTests(unittest.TestCase):
                     f"Expected {filename} to be flagged; got {issues}",
                 )
 
+    def test_worktree_scan_skips_upstreams_and_worktrees_only_when_skip_state_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_clean_repo(root)
+            sample_files = {
+                "upstreams/kdeconnect-android/local.properties": "sdk.dir=" + "/" + "home/" + "alice/Android/Sdk\n",
+                "upstreams/kdeconnect-android/res/values-ru/strings.xml": "<resources><string name=\"t\">\u0422\u0435\u0441\u0442</string></resources>\n",
+                "upstreams/kdeconnect-android/build/debug.apk": "placeholder\n",
+                "worktrees/exp/probe.deb": "placeholder\n",
+            }
+            for rel, content in sample_files.items():
+                target = root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+
+            self.assertEqual(scan_repository(root, staged_only=False, skip_state_dir=True), [])
+
+            strict_issues = scan_repository(root, staged_only=False, skip_state_dir=False)
+            self.assertTrue(any(item.startswith("upstreams/") for item in strict_issues), strict_issues)
+            self.assertTrue(any(item.startswith("worktrees/") for item in strict_issues), strict_issues)
+
 
 class KdeComplianceTests(unittest.TestCase):
     def _populate_licenses(self, root: Path) -> None:

@@ -8,6 +8,7 @@ Cyrillic text, paid CI workflows, or binary artifacts from entering the public t
 
 import argparse
 import ipaddress
+import os
 import re
 import subprocess
 import sys
@@ -64,16 +65,23 @@ def _iter_staged_entries(root: Path) -> list[tuple[str, bytes]]:
 
 def _iter_worktree_entries(root: Path, skip_state_dir: bool) -> list[tuple[str, bytes]]:
     entries: list[tuple[str, bytes]] = []
-    for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        rel = path.relative_to(root).as_posix()
-        parts = path.relative_to(root).parts
-        if ".git" in parts or "__pycache__" in parts or path.suffix in (".pyc", ".pyo"):
-            continue
-        if skip_state_dir and (parts[0] in (".state", "LICENSES") or rel == "LICENSES"):
-            continue
-        entries.append((rel, path.read_bytes()))
+    for dirpath, dirs, files in os.walk(root):
+        current = Path(dirpath)
+        skipped_dirs = {".git", "__pycache__"}
+        if current == root and skip_state_dir:
+            skipped_dirs.update({".state", "upstreams", "worktrees", "LICENSES"})
+        dirs[:] = sorted(d for d in dirs if d not in skipped_dirs)
+        for name in sorted(files):
+            if current == root and skip_state_dir and name == "LICENSES":
+                continue
+            if name.endswith((".pyc", ".pyo")):
+                continue
+            path = current / name
+            if not path.is_file():
+                continue
+            rel = path.relative_to(root).as_posix()
+            entries.append((rel, path.read_bytes()))
+    entries.sort(key=lambda item: item[0])
     return entries
 
 
@@ -81,8 +89,11 @@ def _check_path_policy(rel: str, skip_state_dir: bool) -> str | None:
     lower = rel.lower()
     if rel == ".github/workflows" or rel.startswith(".github/workflows/"):
         return f"{rel}: GitHub Actions workflows are prohibited (paid runners)"
-    if not skip_state_dir and (rel == ".state" or rel.startswith(".state/")):
-        return f"{rel}: untracked .state files must not be published"
+    if not skip_state_dir and (
+        rel in (".state", "upstreams", "worktrees")
+        or rel.startswith((".state/", "upstreams/", "worktrees/"))
+    ):
+        return f"{rel}: untracked .state/upstreams/worktrees files must not be published"
     if rel.endswith(FORBIDDEN_SUFFIXES) or lower.endswith(FORBIDDEN_SUFFIXES):
         return f"{rel}: binary, package, archive, or key artifact is prohibited"
     name = Path(rel).name
