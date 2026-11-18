@@ -5,3 +5,4 @@ PublishFlags: nofailedpackages
 Prefer: gpg
 Prefer: libavcodec62
 Prefer: libavformat62
+Prefer: libavfilter11

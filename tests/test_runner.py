@@ -204,6 +204,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("Prefer: gpg", staging_conf)
         self.assertIn("Prefer: libavcodec62", staging_conf)
         self.assertIn("Prefer: libavformat62", staging_conf)
+        self.assertIn("Prefer: libavfilter11", staging_conf)
         self.assertIn("PublishFlags: nofailedpackages", stable_conf)
 
     def test_public_workspace_has_no_private_identifiers_or_secrets(self) -> None:
