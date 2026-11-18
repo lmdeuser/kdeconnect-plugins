@@ -45,7 +45,7 @@
   - Clipboard & file transfer: `ClipboardPlugin` (`org.kde.kdeconnect.device.clipboard::sendClipboard()`) and `SharePlugin` (`org.kde.kdeconnect.device.share::shareUrls(QStringList)`), preserving Android 10+ manual send flow when `READ_LOGS` is unavailable.
 - **New plugin components:**
   - **Desktop (`kdeconnect-kde`, branch `work/screenstream`):**
-    - `plugins/screenstream/` (`kdeconnect_screenstream.json`, `screenstreamplugin.{h,cpp}`, `CMakeLists.txt`): KdeConnectPlugin lifecycle, D-Bus methods (`startStream`, `stopStream`, `requestKeyframe`, `isStreaming`, `state`), stream socket bridging, and process supervision of `kdeconnect-screenstream-viewer` over an owner-only local socket / passed fd.
+    - `plugins/screenstream/` (`kdeconnect_screenstream.json`, `screenstreamplugin.{h,cpp}`, `CMakeLists.txt`): KdeConnectPlugin lifecycle, D-Bus methods (`startStream`, `stopStream`, `wakeScreen`, `requestKeyframe`, `isStreaming`, `state`), stream socket bridging, and process supervision of `kdeconnect-screenstream-viewer` over an owner-only local socket / passed fd.
     - `plugins/screenstream/viewer/` (`kdeconnect-screenstream-viewer`): dedicated Qt6 (`Quick`/`Gui`/Wayland) + GStreamer (`appsrc ! h264parse ! avdec_h264/vaapi ! ...`) + `Qt6::Multimedia` (`QAudioSink` for `pcm_s16le` 48 kHz mono) helper process isolated from `kdeconnectd`, keeping decoder crashes from terminating the KDE Connect daemon.
     - Minimal integration edits outside `plugins/screenstream/`: `plugins/CMakeLists.txt`, `dbusinterfaces/CMakeLists.txt` (`geninterface`), and `app/qml/DevicePage.qml` (launch/stop action).
   - **Android (`kdeconnect-android`, branch `work/screenstream`):**
@@ -66,6 +66,7 @@
   - `kdeconnect.screenstream.request` (Desktop -> Android):
     - `{"action": "query_state"}`
     - `{"action": "start", "maxWidth": int [320..3840], "maxHeight": int [320..3840], "maxFps": int [5..60], "maxBitrateKbps": int [500..20000], "requestAudio": bool}`
+    - `{"action": "wake"}`
     - `{"action": "request_keyframe"}`
     - `{"action": "stop", "explicitStop": bool}`
   - `kdeconnect.screenstream` (Android -> Desktop):
@@ -93,6 +94,7 @@
 - **Permissions and consent:**
   - Android runtime permissions: `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_MEDIA_PROJECTION`, `POST_NOTIFICATIONS` (API 33+, degraded gracefully if denied while keeping capture controls), `RECORD_AUDIO` (optional; denial disables audio only with visible banner/state reason).
   - Android 14/15 ordering invariant verified against `prototype/android-probe`: validate user `MediaProjection` consent intent first, call `startForeground(..., ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)` only after consent is present, and immediately call `getMediaProjection(...)`.
+  - On Android 14+ (API 34+), `ScreenStreamPermissionActivity` passes `MediaProjectionConfig.createConfigForDefaultDisplay()` so the system dialog defaults to capturing the entire screen rather than a single app. Incoming `start` and `wake` control requests pulse a bounded screen-wake lock (1.5 s auto-release, 3 s max timeout) to wake the display without flashing or ringing, and active streaming optionally holds a bounded keep-screen-awake lock (default enabled, 4 h safety cap, released immediately on stop, consent revocation, or service destruction).
 
 ## 5. Acceptance Evidence and Test Plan
 
