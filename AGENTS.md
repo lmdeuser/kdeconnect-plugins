@@ -26,7 +26,8 @@ This repository (`lmdeuser/kdeconnect-plugins`) is the public engineering harnes
 
 ## 3. Build, Runner, and CI Boundaries
 
-- **No local compilation or C++/Gradle test execution**: Do not install desktop/Android build toolchains or run local `cmake`, `ninja`, `make`, `ctest`, or `gradle` builds on workstations or runners.
+- **No local desktop C++ compilation or runner builds**: Do not install desktop KDE/Qt C++ build toolchains or run local `cmake`, `ninja`, `make`, or `ctest` builds on workstations or OBS runner hosts.
+- **Bounded local Android Studio / Gradle verification**: Android verification (`./gradlew` and Android Studio) may run locally on developer workstations under strict resource discipline: reuse the workstation's existing `GRADLE_USER_HOME`, `ANDROID_SDK_ROOT`, bundled Android Studio JBR, and a disk-backed `TMPDIR` (never `/tmp` or duplicate offline caches), without altering global user Gradle config files, with `--no-daemon --max-workers=2`, bounded JVM heap (`-Xmx2048m -XX:MaxMetaspaceSize=640m -Dkotlin.compiler.execution.strategy=in-process`), and lowered CPU/I/O priority (`nice -n 10 ionice -c 2 -n 7`).
 - **No GitHub Actions**: Never add `.github/workflows/` or use GitHub-hosted/self-hosted GitHub runners (paid).
 - **Explicit disk-backed `TMPDIR`**: Export a disk-backed `TMPDIR` (never `/tmp` or `tmpfs`) before running tools, tests, or controllers.
 - **Self-hosted OBS controller (`~/runners/kdeconnect-plugins`)**:
@@ -36,7 +37,7 @@ This repository (`lmdeuser/kdeconnect-plugins`) is the public engineering harnes
 - **OBS two-contour targets (`xUbuntu_26.04`, `x86_64`)**:
   - **Staging (`home:dwolfF:kdeconnect:staging`)**: `sourceaccess=disable`, publishing disabled; performs CMake compilation, `ctest`, and `lintian`.
   - **Stable (`home:dwolfF:kdeconnect`)**: receives binary promotion only after staging build `succeeded`, `ctest` executes > 0 tests with 0 failures, `lintian` reports 0 errors, and isolated `.deb` checks pass.
-- **Android remote builds**: Desktop OBS builds never verify Android. Determine and authorize a compatible remote Android build route before implementing Android production code.
+- **Android verification targets**: Desktop OBS builds never verify `kdeconnect-android`. Verify Android changes via local resource-bounded `./gradlew assembleDebug lintDebug testDebugUnitTest` + `apksigner verify` against the target SDK platform (and Android Studio inspections/IDE sync), plus optional diagnostic `kdeconnect-android-probe` builds in OBS staging.
 
 ## 4. Construction and Security Standards
 

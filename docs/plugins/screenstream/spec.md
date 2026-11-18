@@ -15,7 +15,7 @@
 - **Human owner / maintainer:** `Dmitriy Volkov <dennshield@duck.com>`
 - **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (base branch `master`, verified snapshot SHA `1d05b8e07804066b20ba32dbc7cec875188008c0`)
 - **Android target:** `https://invent.kde.org/network/kdeconnect-android.git` (base branch `master`, verified snapshot SHA `d0534acc70cd9403fb56d78f645f228e21097492`)
-- **Authorized Android remote build route:** Offline OBS build in `home:dwolfF:kdeconnect:staging` (`xUbuntu_26.04`, `x86_64`, `<sourceaccess><disable/></sourceaccess>`, `<publish><disable/></publish>`) using `openjdk-21-jdk-headless` and `.orig-sdk.tar.xz` (`aapt2`/`javac`/`d8`/`zipalign`/`apksigner` for zero-dependency `kdeconnect-android-probe`, and pre-staged offline Gradle + Maven caches for `kdeconnect-android`). No local Java, Gradle, C++, or CMake compilation on workstations or runners.
+- **Authorized Android build and verification route:** Local Android Studio (bundled JBR) and resource-bounded `./gradlew assembleDebug lintDebug testDebugUnitTest` against Android SDK Platform 37 (`--no-daemon --max-workers=2`, `-Xmx2048m -XX:MaxMetaspaceSize=640m`, disk-backed `TMPDIR` and `GRADLE_USER_HOME`, no duplicate caches), supplemented by zero-dependency OBS `kdeconnect-android-probe` diagnostic APK builds. Zero local desktop C++/CMake compilation on workstations or runners.
 - **OBS packaging targets:** `home:dwolfF:kdeconnect:staging` -> `home:dwolfF:kdeconnect` (`xUbuntu_26.04`, `x86_64`)
 - **Observed reference test hardware (2026-11-15):** DOOGEE V Max Play, Android 15 (API 35), ADB over USB; Ubuntu 26.04.1 LTS desktop on Wayland, `x86_64`. Establishes one device/OS baseline only.
 
@@ -101,7 +101,7 @@
     - Frame mux/demux parser unit tests: valid SPS/PPS/IDR/PCM frames, truncated header, invalid magic, oversized `payload_length > 4 MiB` video / `> 64 KiB` audio, unknown `kind`, integer overflow boundaries.
     - Coordinate mapper unit tests: portrait, landscape, 90/180/270 rotations, letterbox/pillarbox scaling, `(0, 0)` clamped to `(1, 1)` and `(maxW, maxH)` clamped to `(width - 1, height - 1)`.
     - Session state machine unit tests: explicit stop persistence across disconnect/reconnect, bounded reconnect suppression when `explicitStop == true`, input-gate blocking outside `STREAMING`.
-  - Android unit tests (JUnit/Robolectric via remote Android build): packet validation, queue drop/IDR recovery behavior, `explicitStop` state persistence.
+  - Android verification (`./gradlew assembleDebug lintDebug testDebugUnitTest` + `apksigner verify`): JUnit 4 packet validation, bounded queue drop/IDR recovery, `explicitStop` state persistence, and zero `screenstream` Android Lint errors/warnings.
 - **Upstream pre-discussion gate (`AGENTS.md` Section 6):**
   - Before proposing `work/screenstream` upstream, maintainer verifies whether a new protocol family (`kdeconnect.screenstream`) + desktop helper binary requires pre-discussion on KDE Invent / KDE Connect mailing list.
 - **OBS package checks (Gates 2 & 3):**
