@@ -90,7 +90,7 @@ test -n "$so_path"
 test -x /usr/bin/kdeconnect-screenstream-viewer
 test -f /usr/share/kdeconnect/kdeconnect_screenstream_config.qml
 
-needed=$(readelf -d /usr/bin/kdeconnect-screenstream-viewer | awk "/NEEDED/ {print $NF}")
+needed=$(LC_ALL=C readelf -d /usr/bin/kdeconnect-screenstream-viewer | grep "(NEEDED)")
 echo "$needed"
 if echo "$needed" | grep -qi "Qt6Multimedia"; then
     echo "ERROR: Qt6Multimedia must not be linked" >&2
