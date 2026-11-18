@@ -13,6 +13,7 @@ from tools.check_public_tree import _iter_worktree_entries, scan_repository
 from tools.install_cron import BEGIN, END, job, merge, remove_block
 from tools.obs_controller import (
     build_osc_command,
+    evaluate_package_promotion_readiness,
     evaluate_promotion_readiness,
     parse_obs_build_log,
     parse_obs_result_states,
@@ -139,6 +140,58 @@ class RunnerTests(unittest.TestCase):
                 ctest_failed=0,
                 lintian_errors=0,
                 deb_verified=True,
+            ).ready
+        )
+
+    def test_package_promotion_gate_handles_kdeconnect_and_libei(self) -> None:
+        self.assertFalse(
+            evaluate_package_promotion_readiness(
+                package="kdeconnect",
+                staging_state="succeeded",
+                ctest_ran=0,
+                ctest_failed=0,
+                lintian_errors=0,
+                deb_verified=True,
+            ).ready
+        )
+        self.assertTrue(
+            evaluate_package_promotion_readiness(
+                package="libei",
+                staging_state="succeeded",
+                ctest_ran=0,
+                ctest_failed=0,
+                lintian_errors=0,
+                deb_verified=True,
+            ).ready
+        )
+        self.assertFalse(
+            evaluate_package_promotion_readiness(
+                package="libei",
+                staging_state="succeeded",
+                ctest_ran=0,
+                ctest_failed=0,
+                lintian_errors=1,
+                deb_verified=True,
+            ).ready
+        )
+        self.assertFalse(
+            evaluate_package_promotion_readiness(
+                package="libei",
+                staging_state="failed",
+                ctest_ran=0,
+                ctest_failed=0,
+                lintian_errors=0,
+                deb_verified=True,
+            ).ready
+        )
+        self.assertFalse(
+            evaluate_package_promotion_readiness(
+                package="libei",
+                staging_state="succeeded",
+                ctest_ran=0,
+                ctest_failed=0,
+                lintian_errors=0,
+                deb_verified=False,
             ).ready
         )
 

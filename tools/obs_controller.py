@@ -185,12 +185,13 @@ def evaluate_promotion_readiness(
     ctest_failed: int,
     lintian_errors: int,
     deb_verified: bool,
+    require_ctest: bool = True,
 ) -> PromotionDecision:
     """Enforce mandatory Gate 2 and Gate 3 evidence before promoting staging to stable."""
     reasons: list[str] = []
     if staging_state != "succeeded":
         reasons.append(f"OBS staging build state is '{staging_state}', expected 'succeeded'")
-    if ctest_ran <= 0:
+    if require_ctest and ctest_ran <= 0:
         reasons.append("No ctest test cases executed in OBS staging build log")
     if ctest_failed != 0:
         reasons.append(f"ctest reported {ctest_failed} failing test(s)")
@@ -199,6 +200,25 @@ def evaluate_promotion_readiness(
     if not deb_verified:
         reasons.append("Isolated .deb install/contents check has not passed")
     return PromotionDecision(ready=not reasons, reasons=reasons)
+
+
+def evaluate_package_promotion_readiness(
+    package: str,
+    staging_state: str,
+    ctest_ran: int,
+    ctest_failed: int,
+    lintian_errors: int,
+    deb_verified: bool,
+) -> PromotionDecision:
+    """Enforce Gate 2 and Gate 3 readiness rules for a named OBS package."""
+    return evaluate_promotion_readiness(
+        staging_state=staging_state,
+        ctest_ran=ctest_ran,
+        ctest_failed=ctest_failed,
+        lintian_errors=lintian_errors,
+        deb_verified=deb_verified,
+        require_ctest=(package == "kdeconnect"),
+    )
 
 
 def _ensure_state_tmp() -> Path:
@@ -433,6 +453,86 @@ def _cmd_inspect_build(
     return 0 if passed else 1
 
 
+def _cmd_promote(
+    staging: str,
+    stable: str,
+    package: str,
+    distro: str,
+    arch: str,
+    deb_verified: bool,
+    wait: bool,
+    timeout_sec: int,
+) -> int:
+    summary_path = STATE / "binaries" / package / "latest.json"
+    if not summary_path.is_file():
+        print(f"ERROR: Missing staging inspection summary: {summary_path}", file=sys.stderr)
+        return 1
+
+    latest = json.loads(summary_path.read_text(encoding="utf-8"))
+    decision = evaluate_package_promotion_readiness(
+        package=package,
+        staging_state=str(latest.get("code", "unknown")),
+        ctest_ran=int(latest.get("ctest_ran", 0)),
+        ctest_failed=int(latest.get("ctest_failed", 0)),
+        lintian_errors=int(latest.get("lintian_errors", 0)),
+        deb_verified=deb_verified,
+    )
+    if not decision.ready:
+        print(f"ERROR: Promotion blocked for {package}:", file=sys.stderr)
+        for reason in decision.reasons:
+            print(f"  - {reason}", file=sys.stderr)
+        return 1
+
+    _run_osc(
+        "release",
+        staging,
+        package,
+        "-r",
+        distro,
+        "-a",
+        arch,
+        "--target-project",
+        stable,
+        "--target-repository",
+        distro,
+        "--no-delay",
+    )
+
+    deadline = time.monotonic() + timeout_sec
+    state_row = _lookup_package_state(stable, package, distro, arch)
+    while wait:
+        if state_row and not state_row["dirty"] and state_row["repo_code"] == "published":
+            break
+        if time.monotonic() >= deadline:
+            print(f"ERROR: Timed out waiting for {stable}/{package} repository publish", file=sys.stderr)
+            return 1
+        repo_code = state_row["repo_code"] if state_row else "pending"
+        dirty = state_row["dirty"] if state_row else True
+        print(
+            f"Waiting for {stable}/{package} ({distro}/{arch}): repo_code={repo_code} dirty={dirty}",
+            flush=True,
+        )
+        time.sleep(5)
+        state_row = _lookup_package_state(stable, package, distro, arch)
+
+    record = {
+        "staging": staging,
+        "stable": stable,
+        "package": package,
+        "distro": distro,
+        "arch": arch,
+        "srcmd5": latest.get("srcmd5", "unknown"),
+        "promoted_at": int(time.time()),
+        "repo_code": state_row["repo_code"] if state_row else "unknown",
+        "dirty": state_row["dirty"] if state_row else True,
+        "package_code": state_row["code"] if state_row else "unknown",
+        "binaries": [item.get("filename") for item in latest.get("binaries", [])],
+    }
+    _save_json(STATE / "promotions" / f"{package}.json", record)
+    print(json.dumps(record, indent=2, sort_keys=True))
+    return 0
+
+
 def _cmd_status(project: str, package: str | None) -> int:
     if not package:
         print(
@@ -469,6 +569,16 @@ def main() -> int:
     inspect_p.add_argument("--wait", action="store_true")
     inspect_p.add_argument("--timeout-sec", type=int, default=2400)
 
+    promote_p = sub.add_parser("promote", help="Promote verified staging binaries to stable repository")
+    promote_p.add_argument("--staging", default=DEFAULT_STAGING_PROJECT)
+    promote_p.add_argument("--stable", default=DEFAULT_STABLE_PROJECT)
+    promote_p.add_argument("--package", required=True)
+    promote_p.add_argument("--distro", default=DEFAULT_DISTRO)
+    promote_p.add_argument("--arch", default=DEFAULT_ARCH)
+    promote_p.add_argument("--deb-verified", action="store_true")
+    promote_p.add_argument("--wait", action="store_true")
+    promote_p.add_argument("--timeout-sec", type=int, default=600)
+
     status_p = sub.add_parser("status", help="Show OBS configuration or query package results")
     status_p.add_argument("--project", default=DEFAULT_STAGING_PROJECT)
     status_p.add_argument("--package", default=None)
@@ -488,6 +598,17 @@ def main() -> int:
             args.package,
             args.distro,
             args.arch,
+            args.wait,
+            args.timeout_sec,
+        )
+    if args.command == "promote":
+        return _cmd_promote(
+            args.staging,
+            args.stable,
+            args.package,
+            args.distro,
+            args.arch,
+            args.deb_verified,
             args.wait,
             args.timeout_sec,
         )
