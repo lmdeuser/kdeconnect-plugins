@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Fri, 20 Nov 2026 00:59:30 +0500
-Subject: [PATCH 10/10] screenstream: auto-suspend A2DP and enable HFP gateway
+Subject: [PATCH 10/11] screenstream: auto-suspend A2DP and enable HFP gateway
  for zero-config calls
 
 

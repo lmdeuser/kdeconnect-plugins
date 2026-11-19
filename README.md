@@ -27,7 +27,7 @@ Streams an Android 11+ display over [H.264](https://www.itu.int/rec/T-REC-H.264)
 - **Input & sharing:** Reuses KDE Connect's mouse, long-press, scroll, keyboard, clipboard, drag-and-drop file sharing (up to 32 files via `SharePlugin`), and "Open on Phone Screen" notification action.
 - **Wayland window clamping:** Keeps the viewer within monitor work-area bounds across portrait/landscape phone rotations via [KWin Scripting](https://develop.kde.org/docs/plasma/kwin/api/) on Plasma Wayland.
 - **Privacy controls:** Honors [`FLAG_SECURE`](https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE) windows, requires Android's system capture consent per session, and remembers an explicit stop across reconnects.
-- **Zero-config Bluetooth & call handoff:** Switches seamlessly between `Audio: Screencast` and `Audio: Bluetooth` without restarting video, automatically discovers the paired phone across BlueZ `/org/bluez/hci*` adapters to suspend A2DP (`0000110a`) while screencast audio is active, pauses screencast audio during phone/VoIP calls (`audioReason = "call_active"`) while activating the PC's PipeWire `audio-gateway` (HFP-AG `0000111f`) profile for two-way headset calls, and restores Bluetooth on stop.
+- **Zero-config Bluetooth & call handoff:** Switches seamlessly between `Audio: Screencast` and `Audio: Bluetooth` without restarting video. In `Audio: Screencast`, the desktop auto-discovers the paired phone across BlueZ `/org/bluez/hci*` adapters, keeps Bluetooth A2DP (`0000110a`) connected (so Android keeps the phone's loudspeaker silent), and mutes only the PC's PipeWire `bluez_input.<MAC>*` A2DP stream so 48 kHz stereo Wi-Fi audio plays cleanly without doubling or phone-speaker leak. During active phone/VoIP calls (`audioReason = "call_active"`), screencast audio pauses and desktop restores `bluez_input` + `audio-gateway` (HFP-AG `0000111f`) so your PC wired headset mic/earpieces handle the call, resuming Wi-Fi stereo automatically when the call ends and restoring unmuted Bluetooth on stop.
 
 ### Continuity Camera (`continuity_camera`)
 
@@ -154,7 +154,7 @@ Because of the `.debug` suffix, `Debug KDE Connect` installs alongside the Googl
 3. Switch audio routing live without stopping video or re-prompting capture consent:
    - **Desktop viewer toolbar:** toggle between **`Audio: Screencast`** and **`Audio: Bluetooth`**.
    - **Android Screen stream plugin:** tap **`Route audio to Bluetooth`** or **`Route audio to PC screencast`**.
-   - **Automatic Bluetooth & call handoff:** zero-config discovery suspends phone-to-PC A2DP (`0000110a`) during 48 kHz stereo screencast, pauses screencast audio during active phone/VoIP calls (`audioReason = "call_active"`) while activating the PC's PipeWire `audio-gateway` (HFP-AG `0000111f`) profile for two-way calls, restores Bluetooth automatically on stop, and coordinates [`AudioDeviceCallback`](https://developer.android.com/reference/android/media/AudioDeviceCallback) and `BtAudioSwitchPlugin` so playback never plays on both routes at once.
+   - **Automatic Bluetooth & call handoff:** zero-config discovery keeps phone-to-PC A2DP (`0000110a`) connected (silencing the phone's internal loudspeaker) while muting the PC's PipeWire `bluez_input.<MAC>*` loopback stream during 48 kHz stereo `Audio: Screencast`; during active phone/VoIP calls (`audioReason = "call_active"`), screencast audio pauses and desktop unmutes `bluez_input` + ensures PipeWire `audio-gateway` (HFP-AG `0000111f`) is active so PC headset microphones and headphones work cleanly for calls; toggling to `Audio: Bluetooth`, closing the viewer, or stopping restores unmuted Bluetooth automatically. Coordinates [`AudioDeviceCallback`](https://developer.android.com/reference/android/media/AudioDeviceCallback) and `BtAudioSwitchPlugin` so playback never plays on both routes at once.
 
 ### Phone webcam and document scanner (`Continuity Camera`)
 
@@ -173,6 +173,62 @@ Because of the `.debug` suffix, `Debug KDE Connect` installs alongside the Googl
 - **OTP auto-copy:** non-silent 2FA notifications (and fresh Android 15 inbox SMS messages containing OTP keywords) are copied to the Wayland clipboard with `x-kde-passwordManagerHint=secret` and cleared automatically after 60 s if unchanged.
 - **Bluetooth audio handoff:** configure identical allowlisted headset MAC addresses in `bt_audio_switch` settings on desktop and phone to enable automatic/manual A2DP and HFP ownership transitions.
 - **Remote auth:** invoke `requestApproval` on `org.kde.kdeconnect.device.remoteauth` (or opt-in session unlock once `unlockAllowed` is enabled) to display a `BiometricPrompt` confirmation on the paired phone.
+
+## Complete UI Button and Control Reference
+
+Every interactive button, toggle, notification action, and plugin setting exposed on Ubuntu desktop and Android behaves as documented below.
+
+### Desktop Screen Stream Viewer (`kdeconnect-screenstream-viewer`)
+
+All toolbar buttons appear left-to-right in `ViewerWindow`:
+
+| Control | Icon / Shortcut | Exact Behavior |
+| --- | --- | --- |
+| **`Stop`** | Stop square (`media-playback-stop`) | Stops the local socket, invokes D-Bus `stopStream()` (persisting `explicitStop = true`), unmutes `bluez_input` and releases any claimed Bluetooth headsets, and closes the viewer window. |
+| **`Audio: Screencast`** / **`Audio: Bluetooth`** | Speaker (`audio-speakers`) / Bluetooth (`network-bluetooth`, checkable) | **Unchecked (`Audio: Screencast`):** streams 48 kHz stereo PCM over Wi-Fi (`AudioPlaybackCapture`), keeps the phone's BlueZ A2DP (`0000110a`) connected (so the phone loudspeaker stays silent), and mutes the PC's PipeWire `bluez_input.<MAC>*` A2DP stream so audio plays only via Wi-Fi on the PC. **Checked (`Audio: Bluetooth`):** stops Wi-Fi PCM playback (`PcmPlayer`), unmutes `bluez_input.<MAC>*`, restores `audio-gateway` (`0000110a` + `0000111f`), and releases claimed headsets so sound routes purely over Bluetooth (telephone speaker stays silent). **During a VoIP/phone call (`call_active`):** Wi-Fi screencast audio pauses automatically in both positions and your PC wired headset mic/headphones run over Bluetooth HFP-AG until the call ends. |
+| **`Mute Audio`** | Muted speaker (`audio-volume-muted`, checkable) | Mutes local `PcmPlayer` output inside the viewer window without stopping `AudioPlaybackCapture` or unmuting the phone loudspeaker. Disabled automatically while **`Audio: Bluetooth`** is active. |
+| **`Refresh Keyframe`** | Circular arrows (`view-refresh`) | Sends `requestKeyframe` (`action = "request_keyframe"`) to force immediate SPS/PPS + IDR recovery in Android `ScreenEncoder`. |
+| **`Wake Screen`** | Display (`preferences-desktop-display`) | Sends `wakeScreen` (`action = "wake"`) to pulse Android's wake lock (1.5 s) and reinitialize capture after display sleep. |
+| **`Fit Window`** | Fit to window (`zoom-fit-best`) | Resizes the window to match the current phone stream aspect ratio and clamps it inside the Wayland monitor work area. |
+| **`Send Clipboard`** | Paste (`edit-paste`) | Calls `ClipboardPlugin::sendClipboard()` to push desktop text or images to Android. |
+| **`Share File...`** | Document send (`document-send`) | Opens a file picker and transfers selected files to Android via `SharePlugin::shareUrls()` (also triggered by Drag & Drop onto the video canvas, up to 32 files). |
+| **`Back`** | Left arrow (`go-previous`) | Sends Android Back (`backclick`) via `RemoteControlPlugin`. Enabled only while streaming and Android `AccessibilityService` is active. |
+| **`Home`** | Home (`go-home`) | Sends Android Home (`middleclick`) via `RemoteControlPlugin`. |
+| **`Recents`** | Overview grid (`view-grid`) | Sends Android Recents (`forwardclick`) via `RemoteControlPlugin`. |
+
+Canvas interactions inside `ScreenCanvasWidget` (active only while streaming and `AccessibilityService` is enabled): left click sends mapped tap (`singleclick`); holding left mouse `>= 180 ms` or dragging `>= 8 px` sends `singlehold`, continuous pointer moves, and `singlerelease` (auto-released on window focus loss); right click sends Back; middle click sends Home; mouse wheel scrolls; typing sends `RemoteKeyboardPlugin::sendQKeyEvent`; dropping files calls `SharePlugin::shareUrls()`.
+
+### Desktop `kdeconnect-app`, Notifications, and Plugin Settings
+
+- **Device Page Actions (`app/qml/DevicePage.qml`):**
+  - **`View device screen` / `Stop screen stream`**: Starts or stops `screenstream` over D-Bus and surfaces any immediate startup error banner.
+  - **`Wake device screen`**: Wakes the paired Android display and forces encoder recovery.
+  - **`Use phone as webcam` / `Stop phone webcam`**: Starts or stops `continuity_camera` PipeWire streaming (`KDE Connect Camera (<Phone>)` / `KDE Connect Mic (<Phone>)`).
+  - **`Switch webcam to front camera` / `Switch webcam to rear camera`** (visible while webcam active): Switches active phone lens live via `ContinuityCameraPlugin::toggleLens()`.
+  - **`Take photo with phone`**: Triggers Android capture UI (`MODE_PHOTO`) to shoot and transfer a still JPEG.
+  - **`Scan document with phone`**: Triggers multi-page Android document scanner (`MODE_SCAN`) returning a consolidated PDF via `SharePlugin`.
+- **Plasma Notification Action:**
+  - **`Open on Phone Screen`** (shown on synced Android notifications with `hasContentIntent == true`): Triggers the phone's `contentIntent` and either wakes an active `screenstream` session or launches the viewer.
+- **Screen Stream Plugin Settings (`kdeconnect_screenstream_config.qml`):**
+  - **`Auto-start screen streaming when this device connects`** (`autoStart`, default `false`): Auto-starts streaming on connect (clears `explicitStop` when enabled).
+  - **`Stream playback audio when supported`** (`requestAudio`, default `true`): Requests playback audio capture alongside video.
+  - **`Automatically switch audio from Bluetooth to screencast`** (`autoRouteAudio`, default `true`): Keeps phone A2DP silent on PC via `bluez_input` mute during `Audio: Screencast` and restores unmuted Bluetooth on stop/call.
+  - **`Maximum frame rate (FPS)`** (`maxFps`, range `5..60`, default `60`) & **`Maximum video bitrate (kbps)`** (`maxBitrateKbps`, range `500..20000`, step `500`, default `8000`).
+
+### Android `Debug KDE Connect` Buttons, Activities, and Settings
+
+- **Screen Stream (`ScreenStreamPlugin`):**
+  - Device buttons: **`Start screen stream`** (launches `ScreenStreamPermissionActivity` `MediaProjection` consent), **`Stop screen stream`** (stops capture, releases BlueZ/headset claim, persists `explicitStop = true`), and live toggle **`Route audio to Bluetooth`** / **`Route audio to PC screencast`**.
+  - Notifications: ongoing foreground notification exposes **`Stop screen stream`**; background request notification opens system capture consent.
+  - Settings (`screenstreamplugin_preferences.xml`): **`Auto-start when connected`** (`false`), **`Include playback audio`** (`true`), **`Auto-switch Bluetooth audio to screencast`** (`true`), **`Keep screen awake while streaming`** (`true`, 4 h safety cap).
+- **Continuity Camera (`ContinuityCameraPlugin` & `ContinuityCameraCaptureActivity`):**
+  - Device buttons: **`Start webcam stream`** (`1280x720@30fps` + `MIC` audio), **`Stop camera stream`**, **`Switch camera lens`** (toggles front/back live), **`Capture photo / scan`**, **`Scan document (PDF)`**.
+  - Capture screen (`ContinuityCameraCaptureActivity`): **`Capture Photo`** (photo mode), **`Add Scan Page (%d)`** & **`Send PDF (%d)`** (scan mode), and **`Cancel`** (closes activity without sending).
+- **Bluetooth Audio Switch (`BtAudioSwitchPlugin`):**
+  - Device button: **`Claim headset audio`** (requests local headset ownership for connected allowlisted headsets, honoring 3000 ms hysteresis).
+  - Settings (`btaudioswitchplugin_preferences.xml`): **`Allowlisted headset MAC addresses`** (`allowedHeadsetMacs`, comma-separated `AA:BB:CC:DD:EE:FF`).
+- **Clipboard (`ClipboardPlugin`):**
+  - Device button: **`Send clipboard`** (when background clipboard access is restricted on Android 10+, reads text or image URI from clipboard and pushes text or `kdeconnect.clipboard.file` up to 20 MiB to desktop).
 
 ## Automated OBS pipeline and self-hosted runner
 

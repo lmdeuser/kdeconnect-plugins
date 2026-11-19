@@ -4,64 +4,69 @@
     "desktop": {
       "upstream_url": "https://invent.kde.org/network/kdeconnect-kde.git",
       "base_sha": "69ce9c5c49ce209600873bf10ddf61bfe4dfab1c",
-      "expected_tree_sha": "f5904c3eb640d3dc69c6f304ff2953dcc11b45f7",
-      "expected_head_sha": "ba315238cf79beaa10219bf140b713b79a380898",
+      "expected_tree_sha": "bbd5be1c642138d7b5e9da7645f4f699b82d714c",
+      "expected_head_sha": "0c8af24677a1e29d5239df41c1e31abe696c7051",
       "plugins": [
         {
           "id": "screenstream",
           "branch": "work/screenstream",
-          "expected_tree_sha": "83d59dbc3222c1d9036dc8a717adbd6512947ac1",
-          "expected_head_sha": "d870ead16d460dae80644c347917e707865518b5",
+          "expected_tree_sha": "725a383f376942dc9ebe8b8cf896263d78181a88",
+          "expected_head_sha": "b8c7537c6ea83efcba305e446cf6209956ba5774",
           "patches": [
             {
               "path": "patches/desktop/screenstream/0001-Add-screenstream-plugin-and-Wayland-viewer-helper.patch",
-              "sha256": "7c806b599188c061f712fa7602c1097c937de931f1ac8eb5ad05337c122e5e8c",
+              "sha256": "28b7ab97777155b7e67967bc94d351877daff57a7ecc51169bf25f6860e8dc6b",
               "bytes": 123768
             },
             {
               "path": "patches/desktop/screenstream/0002-feat-screenstream-add-Wake-Screen-action-and-fix-vie.patch",
-              "sha256": "40e0e4761ef2ced68ed84837819e0eb1488cd42dca91528788be8d2e61caad98",
+              "sha256": "3a3470125f65bb0352c968ae58bceecad5b935c94f4abd50ed2daeffc2b3c6ea",
               "bytes": 15284
             },
             {
               "path": "patches/desktop/screenstream/0003-feat-screenstream-support-stationary-left-button-lon.patch",
-              "sha256": "ecb7a65dd821580d8ca2c44f9c968e5b97be938682ac45e88b0e8138245c13e5",
+              "sha256": "e45b411b06a98ad6e6b6fa7356f76eb1a21b3da6696a519b2193fb6a3412086e",
               "bytes": 6279
             },
             {
               "path": "patches/desktop/screenstream/0004-screenstream-forward-viewer-logs-and-repeat-H.264-SP.patch",
-              "sha256": "7c70fba17a4fd4d6fefb20f9ca14e593b8660992d74cd5f906b235e948a64589",
+              "sha256": "bf8a9545462737e5840eeef3a83c227e51e24271344bcb9cb0d8977a1a8ef86e",
               "bytes": 1572
             },
             {
               "path": "patches/desktop/screenstream/0005-screenstream-add-Drag-Drop-file-share-and-Open-on-Ph.patch",
-              "sha256": "90ec160a252e1e424fe4b8be75bdd8af29f3b34d193b7d9d46b5342845f6728e",
+              "sha256": "3ace3e6f75e4e31ad7ffed3c857473014d9bb2325708c80ce74d3e4aa76be257",
               "bytes": 9189
             },
             {
               "path": "patches/desktop/screenstream/0006-screenstream-fix-geometry-scaling-D-Bus-deadlock-Gst.patch",
-              "sha256": "bbd86d02604aa62addbaa62f8b649ba95ab9717b70ec99c170c4fc8a7ad1396a",
+              "sha256": "741d2ee099eb79efc68ce2ddfae5207f80b2b5f7060780c211755c28a4050fba",
               "bytes": 29403
             },
             {
               "path": "patches/desktop/screenstream/0007-screenstream-clamp-viewer-window-within-monitor-boun.patch",
-              "sha256": "e98445f3b45ad2e32279d8395019484efde37a3ad8010927dcb731b75f97c284",
+              "sha256": "699b017908f66c3df64b7674b8715218b9407a47221d06ecaac70ea81247e75e",
               "bytes": 20161
             },
             {
               "path": "patches/desktop/screenstream/0008-screenstream-add-mutually-exclusive-screencast-Bluet.patch",
-              "sha256": "3d5bd6efdb024f476ef1a21072833e2bd1e8a6a5705bb952ae4300763fc1a6e7",
+              "sha256": "f09a9064889b5addb445b5c2d4a765fc4e1c85a41cf70be96216e44d2c62bfae",
               "bytes": 21020
             },
             {
               "path": "patches/desktop/screenstream/0009-screenstream-support-48-kHz-stereo-audio-sample-PTS-.patch",
-              "sha256": "52c7f70cde3783dd9ac638f0c7330a8d15c2e38416636c025b527e12f4d146f1",
+              "sha256": "f51cec94bfe9df6387ddf7e33b3ce3aeaaa3ee6b7cdba839dc43837e4565c017",
               "bytes": 36161
             },
             {
               "path": "patches/desktop/screenstream/0010-screenstream-auto-suspend-A2DP-and-enable-HFP-gatewa.patch",
-              "sha256": "bee5cc64c1c3152fe49f938d79a03b8ae61c5743a5d3048972b3d233c64fa481",
+              "sha256": "836ccde8c3bc284c0549a2077a0e20a7fe916dfe932da5bbc87f5ed208adb11e",
               "bytes": 12996
+            },
+            {
+              "path": "patches/desktop/screenstream/0011-screenstream-keep-phone-A2DP-connected-and-mute-PC-l.patch",
+              "sha256": "bf5953bc7cd9cc26916107898487389994878dabf1ecb655471873b8a2729090",
+              "bytes": 8044
             }
           ]
         },

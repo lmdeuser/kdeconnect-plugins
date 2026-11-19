@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 20:52:13 +0500
-Subject: [PATCH 08/10] screenstream: add mutually exclusive
+Subject: [PATCH 08/11] screenstream: add mutually exclusive
  screencast/Bluetooth audio toggle
 
 

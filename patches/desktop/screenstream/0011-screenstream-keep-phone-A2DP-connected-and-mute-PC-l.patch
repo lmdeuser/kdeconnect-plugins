@@ -1,0 +1,178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 02:14:04 +0500
+Subject: [PATCH 11/11] screenstream: keep phone A2DP connected and mute PC
+ loopback during screencast
+
+
+diff --git a/plugins/screenstream/screenstreamplugin.cpp b/plugins/screenstream/screenstreamplugin.cpp
+index a910a26f8ae0eeef32a781f5df66b1d2e27b5190..7d1b244ef6b44e9eb984f1d48e056b5cfd550d52 100644
+--- a/plugins/screenstream/screenstreamplugin.cpp
++++ b/plugins/screenstream/screenstreamplugin.cpp
+@@ -25,6 +25,7 @@
+ #include <QLocalServer>
+ #include <QLocalSocket>
+ #include <QProcess>
++#include <QProcessEnvironment>
+ #include <QStandardPaths>
+ #include <QTimer>
+ #include <QUuid>
+@@ -392,6 +393,9 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+             activatePhoneBluetoothCallGateway();
+         } else if (m_audioAvailable && prevAudioReason == QLatin1String("call_active") && m_autoRouteAudio && m_sessionAudioEnabled) {
+             claimBluetoothForScreencast(false);
++        } else if (m_audioAvailable && m_sessionAudioEnabled && !m_suspendedPhoneBluezPath.isEmpty()
++                   && m_audioReason != QLatin1String("call_active")) {
++            setPhoneBluezA2dpInputMuted(m_suspendedPhoneBluezPath, true);
+         }
+         m_accessibilityEnabled = np.get<bool>(QStringLiteral("accessibilityEnabled"), false);
+         const int dw = np.get<int>(QStringLiteral("displayWidth"), 0);
+@@ -528,6 +532,10 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+         if (m_sessionAudioEnabled && m_autoRouteAudio && m_claimedBtMacs.isEmpty()) {
+             claimBluetoothForScreencast(false);
+         }
++        if (m_audioAvailable && m_sessionAudioEnabled && !m_suspendedPhoneBluezPath.isEmpty()
++            && m_audioReason != QLatin1String("call_active")) {
++            setPhoneBluezA2dpInputMuted(m_suspendedPhoneBluezPath, true);
++        }
+ 
+         if (!ensureLocalServer() || !launchViewer()) {
+             m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error, false);
+@@ -966,16 +974,30 @@ void ScreenStreamPlugin::claimBluetoothForScreencast(bool forceManual)
+         }
+     }
+ 
+-    const QString phonePath = discoverPairedPhoneBluezPath();
++    const QString phonePath = !m_suspendedPhoneBluezPath.isEmpty()
++        ? m_suspendedPhoneBluezPath
++        : discoverPairedPhoneBluezPath();
+     if (!phonePath.isEmpty()) {
+         m_suspendedPhoneBluezPath = phonePath;
+-        QDBusMessage discA2dp = QDBusMessage::createMethodCall(
++        setPhoneBluezCardProfile(phonePath, true);
++        QDBusMessage connA2dp = QDBusMessage::createMethodCall(
+             QStringLiteral("org.bluez"),
+             phonePath,
+             QStringLiteral("org.bluez.Device1"),
+-            QStringLiteral("DisconnectProfile"));
+-        discA2dp << a2dpSourceUuid();
+-        QDBusConnection::systemBus().asyncCall(discA2dp);
++            QStringLiteral("ConnectProfile"));
++        connA2dp << a2dpSourceUuid();
++        QDBusConnection::systemBus().asyncCall(connA2dp);
++
++        // Keep A2DP linked so Android silences its speaker, while muting PC A2DP loopback
++        // in PipeWire so only the 48 kHz stereo Wi-Fi screencast plays on desktop.
++        setPhoneBluezA2dpInputMuted(phonePath, true);
++        for (const int delayMs : {500, 1500}) {
++            QTimer::singleShot(delayMs, this, [this]() {
++                if (!m_suspendedPhoneBluezPath.isEmpty() && m_sessionAudioEnabled && m_audioReason != QLatin1String("call_active")) {
++                    setPhoneBluezA2dpInputMuted(m_suspendedPhoneBluezPath, true);
++                }
++            });
++        }
+     }
+ }
+ 
+@@ -1001,6 +1023,7 @@ void ScreenStreamPlugin::releaseClaimedBluetooth()
+         const QString phonePath = m_suspendedPhoneBluezPath;
+         m_suspendedPhoneBluezPath.clear();
+         setPhoneBluezCardProfile(phonePath, true);
++        setPhoneBluezA2dpInputMuted(phonePath, false);
+         QDBusMessage connA2dp = QDBusMessage::createMethodCall(
+             QStringLiteral("org.bluez"),
+             phonePath,
+@@ -1130,6 +1153,73 @@ void ScreenStreamPlugin::setPhoneBluezCardProfile(const QString &bluezDevPath, b
+     QProcess::startDetached(pactlExe, {QStringLiteral("set-card-profile"), cardName, profile});
+ }
+ 
++void ScreenStreamPlugin::setPhoneBluezA2dpInputMuted(const QString &bluezDevPath, bool muted) const
++{
++    const qsizetype devIdx = bluezDevPath.lastIndexOf(QLatin1String("/dev_"));
++    if (devIdx < 0) {
++        return;
++    }
++    const QString macUnderscored = bluezDevPath.mid(devIdx + 5);
++    if (macUnderscored.isEmpty()) {
++        return;
++    }
++    QString macColon = macUnderscored;
++    macColon.replace(QLatin1Char('_'), QLatin1Char(':'));
++
++    const QString pactlExe = QStandardPaths::findExecutable(QStringLiteral("pactl"));
++    if (pactlExe.isEmpty()) {
++        return;
++    }
++
++    QProcess listProc;
++    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
++    env.insert(QStringLiteral("LC_ALL"), QStringLiteral("C"));
++    listProc.setProcessEnvironment(env);
++    listProc.start(pactlExe, {QStringLiteral("list"), QStringLiteral("sink-inputs")});
++    if (!listProc.waitForFinished(500) || listProc.exitCode() != 0) {
++        return;
++    }
++
++    const QString inputPrefix = QStringLiteral("bluez_input.") + macUnderscored;
++    const QString addrTarget = QStringLiteral("api.bluez5.address = \"") + macColon + QLatin1Char('"');
++    const QString output = QString::fromUtf8(listProc.readAllStandardOutput());
++    const QStringList lines = output.split(QLatin1Char('\n'));
++
++    QString currentId;
++    bool matchesMac = false;
++    bool isA2dpSource = false;
++
++    auto flushBlock = [&]() {
++        if (!currentId.isEmpty() && matchesMac && isA2dpSource) {
++            QProcess::startDetached(
++                pactlExe,
++                {QStringLiteral("set-sink-input-mute"), currentId, muted ? QStringLiteral("1") : QStringLiteral("0")});
++        }
++    };
++
++    for (const QString &rawLine : lines) {
++        const QString line = rawLine.trimmed();
++        if (line.startsWith(QLatin1String("Sink Input #"))) {
++            flushBlock();
++            currentId = line.mid(12).trimmed();
++            matchesMac = false;
++            isA2dpSource = false;
++            continue;
++        }
++        if (currentId.isEmpty()) {
++            continue;
++        }
++        if (line.contains(inputPrefix, Qt::CaseInsensitive) || line.contains(addrTarget, Qt::CaseInsensitive)) {
++            matchesMac = true;
++        }
++        if (line.contains(QLatin1String("api.bluez5.profile = \"a2dp-source\""))
++            || line.contains(QLatin1String("api.bluez5.a2dp.source"))) {
++            isA2dpSource = true;
++        }
++    }
++    flushBlock();
++}
++
+ void ScreenStreamPlugin::activatePhoneBluetoothCallGateway()
+ {
+     const QString phonePath = !m_suspendedPhoneBluezPath.isEmpty()
+@@ -1139,6 +1229,7 @@ void ScreenStreamPlugin::activatePhoneBluetoothCallGateway()
+         return;
+     }
+     setPhoneBluezCardProfile(phonePath, true);
++    setPhoneBluezA2dpInputMuted(phonePath, false);
+     QDBusMessage connHfp = QDBusMessage::createMethodCall(
+         QStringLiteral("org.bluez"),
+         phonePath,
+diff --git a/plugins/screenstream/screenstreamplugin.h b/plugins/screenstream/screenstreamplugin.h
+index ab176d9b2661790ea02f80552e6fe9852144b12d..51ada8e39f43152425a0ddc55b153f48e957b837 100644
+--- a/plugins/screenstream/screenstreamplugin.h
++++ b/plugins/screenstream/screenstreamplugin.h
+@@ -108,6 +108,7 @@ private:
+     void releaseClaimedBluetooth();
+     QString discoverPairedPhoneBluezPath() const;
+     void setPhoneBluezCardProfile(const QString &bluezDevPath, bool enableAudioGateway) const;
++    void setPhoneBluezA2dpInputMuted(const QString &bluezDevPath, bool muted) const;
+     void activatePhoneBluetoothCallGateway();
+     static int audioChannelsForCodec(const QString &audioCodec);
+ 
