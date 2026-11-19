@@ -35,7 +35,7 @@ id = "otp_autofill"
 kind = "upstream_enhancement"
 status = "active"
 desktop_branch = "work/otp_autofill"
-android_branch = ""
+android_branch = "work/otp_autofill"
 spec = "docs/plugins/otp_autofill/spec.md"
 verify_so = ["kdeconnect_notifications.so"]
 
