@@ -36,6 +36,7 @@
   - Validate canonical uppercase/lowercase IEEE 802 MAC address regex (`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`).
   - Reject any `claim`/`release` request for a MAC address not explicitly present in the user's configured allowlist (`allowedHeadsetMacs`).
   - Enforce a `3000 ms` hysteresis cooldown window between ownership transitions to prevent A2DP/HFP connect/disconnect loops when simultaneous notifications occur.
+  - Android `BtAudioSwitchPlugin` honors the shared `<package>_audio_arbiter` flag (`screenstream_audio_active`): automatic `media` playback claims on the phone are suppressed while screencast audio is actively streaming to the PC, while `call` and explicit `manual` claims remain permitted; incoming `release` packets immediately abandon any transient yield audio focus.
 - **Permissions and consent:** Android runtime `BLUETOOTH_CONNECT` permission (API 31+, degraded cleanly to disabled state with clear explanation if denied); desktop uses unprivileged BlueZ session calls (user already authorized for desktop Bluetooth session control).
 
 ## 5. Acceptance Evidence and Test Plan
