@@ -13,7 +13,7 @@
   - Android foreground capture service: `org.kde.kdeconnect.plugins.screenstream.ScreenStreamService`
   - Android consent trampoline activity: `org.kde.kdeconnect.plugins.screenstream.ScreenStreamPermissionActivity`
 - **Human owner / maintainer:** `Dmitriy Volkov <dennshield@duck.com>`
-- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (base branch `master`, verified snapshot SHA `1d05b8e07804066b20ba32dbc7cec875188008c0`)
+- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (base branch `master`, verified snapshot SHA `69ce9c5c49ce209600873bf10ddf61bfe4dfab1c`)
 - **Android target:** `https://invent.kde.org/network/kdeconnect-android.git` (base branch `master`, verified snapshot SHA `d0534acc70cd9403fb56d78f645f228e21097492`)
 - **Authorized Android build and verification route:** Local Android Studio (bundled JBR) and resource-bounded `./gradlew assembleDebug lintDebug testDebugUnitTest` against Android SDK Platform 37 (`--no-daemon --max-workers=2`, `-Xmx2048m -XX:MaxMetaspaceSize=640m`, disk-backed `TMPDIR` and `GRADLE_USER_HOME`, no duplicate caches), supplemented by zero-dependency OBS `kdeconnect-android-probe` diagnostic APK builds. Zero local desktop C++/CMake compilation on workstations or runners.
 - **OBS packaging targets:** `home:dwolfF:kdeconnect:staging` -> `home:dwolfF:kdeconnect` (`xUbuntu_26.04`, `x86_64`)

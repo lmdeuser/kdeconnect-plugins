@@ -16,8 +16,9 @@ Use this skill only after Gate 2 and Gate 3 verify the exact installable artifac
 ## Preconditions
 
 1. Confirm explicit authorization before installing staged `.deb` packages or Android `.apk` builds (synthesized onto `work/continuity-stack` and installed strictly to `User 0`) on test devices.
-2. Record exact Ubuntu version/session (`Wayland`), desktop package revision, Android device model, Android API level, and installed APK revision.
-3. Do not treat single-device verification as proof of universal OEM or Android version compatibility.
+2. Execute live desktop package installs and system-level runtime checks (`remote_auth`, `continuity_camera`, `bt_audio_switch`, and Wave 1 continuity flows) inside an isolated Ubuntu 26.04 LTS libvirt/QEMU VM bridged on the LAN rather than on the primary host workstation, taking a libvirt snapshot before testing system-level changes and keeping any VM SSH alias strictly inside untracked `.state/local.env`.
+3. Record exact Ubuntu version/session (`Wayland`), desktop package revision, Android device model, Android API level, and installed APK revision.
+4. Do not treat single-device verification as proof of universal OEM or Android version compatibility.
 
 ## Verification Matrix
 

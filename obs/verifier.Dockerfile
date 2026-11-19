@@ -13,6 +13,7 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
       gstreamer1.0-plugins-base \
       gstreamer1.0-plugins-good \
       gstreamer1.0-plugins-bad \
-      gstreamer1.0-libav && \
+      gstreamer1.0-libav \
+      gstreamer1.0-pipewire && \
     dpkg --purge --force-depends kdeconnect kdeconnect-libs qml6-module-org-kde-kdeconnect libei1 && \
     rm -rf /var/lib/apt/lists/*

@@ -7,7 +7,7 @@
 
 - **Plugin ID:** `bt_audio_switch` (desktop `kdeconnect_btaudioswitch`, Android `BtAudioSwitchPlugin`)
 - **Human owner / maintainer:** `Dmitriy Volkov <dennshield@duck.com>`
-- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/bt_audio_switch`, base SHA `1d05b8e07804066b20ba32dbc7cec875188008c0`)
+- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/bt_audio_switch`, base SHA `69ce9c5c49ce209600873bf10ddf61bfe4dfab1c`)
 - **Android target:** `https://invent.kde.org/network/kdeconnect-android.git` (branch `work/bt_audio_switch`, base SHA `d0534acc70cd9403fb56d78f645f228e21097492`)
 - **Authorized Android build route:** Local bounded `./gradlew assembleDebug lintDebug testDebugUnitTest` + `apksigner verify`
 - **OBS packaging targets:** `home:dwolfF:kdeconnect:staging` -> `home:dwolfF:kdeconnect` (`xUbuntu_26.04`, `x86_64`)
@@ -45,4 +45,4 @@
   - Android JUnit: packet parsing, MAC canonicalization, and allowlist enforcement.
 - **OBS package checks:** `plugins.toml` verifies `kdeconnect_btaudioswitch.so` in staged `.deb`.
 - **Live device matrix:** Pair dual-connected Bluetooth headset to Ubuntu desktop and Android phone -> start media on phone while idle on PC -> verify audio routes cleanly without loop; receive call on phone while watching video on PC -> verify HFP call claim; verify permission-denied graceful disable.
-- **Open design questions:** Confirm whether single-point headsets (which drop one ACL before accepting another) need an explicit `300 ms` disconnect-before-connect yield on the releasing side before Wave 2 coding.
+- **Open design questions:** Resolved (single-point yield delay fixed at `300 ms` after remote disconnect before initiating BlueZ `Connect()`).

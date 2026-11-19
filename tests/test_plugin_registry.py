@@ -55,19 +55,43 @@ class PluginRegistryTests(unittest.TestCase):
 
         desktop_ids = [entry.id for entry in active_desktop_plugins(entries)]
         android_ids = [entry.id for entry in active_android_plugins(entries)]
-        self.assertEqual(desktop_ids, ["screenstream", "clipboard_images", "otp_autofill"])
-        self.assertEqual(android_ids, ["screenstream", "clipboard_images"])
+        self.assertEqual(
+            desktop_ids,
+            [
+                "screenstream",
+                "clipboard_images",
+                "otp_autofill",
+                "continuity_camera",
+                "remote_auth",
+                "bt_audio_switch",
+            ],
+        )
+        self.assertEqual(
+            android_ids,
+            [
+                "screenstream",
+                "clipboard_images",
+                "continuity_camera",
+                "remote_auth",
+                "bt_audio_switch",
+            ],
+        )
 
         script = build_deb_check_script(entries)
         self.assertIn("kdeconnect_screenstream.so", script)
         self.assertIn("kdeconnect_clipboard.so", script)
         self.assertIn("kdeconnect_notifications.so", script)
-        self.assertNotIn("kdeconnect_continuitycamera.so", script)
+        self.assertIn("kdeconnect_continuitycamera.so", script)
+        self.assertIn("kdeconnect_remoteauth.so", script)
+        self.assertIn("kdeconnect_btaudioswitch.so", script)
         self.assertIn("readelf -d /usr/bin/kdeconnect-screenstream-viewer", script)
+        self.assertIn("readelf -d /usr/bin/kdeconnect-continuitycamera-bridge", script)
         self.assertIn("libgstreamer-1.0.so.0", script)
         self.assertIn("libQt6Widgets.so.6", script)
+        self.assertIn("libQt6Network.so.6", script)
         self.assertIn("Qt6Multimedia", script)
         self.assertIn("gst-inspect-1.0 appsrc h264parse avdec_h264 audioconvert audioresample autoaudiosink", script)
+        self.assertIn("pipewiresink", script)
         self.assertNotIn("ldd ", script)
 
     def test_load_registry_rejects_invalid_entries(self) -> None:

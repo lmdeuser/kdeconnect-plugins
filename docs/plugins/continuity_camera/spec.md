@@ -7,7 +7,7 @@
 
 - **Plugin ID:** `continuity_camera` (desktop `kdeconnect_continuitycamera` + `kdeconnect-continuitycamera-bridge`)
 - **Human owner / maintainer:** `Dmitriy Volkov <dennshield@duck.com>`
-- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/continuity_camera`, base SHA `1d05b8e07804066b20ba32dbc7cec875188008c0`)
+- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/continuity_camera`, base SHA `69ce9c5c49ce209600873bf10ddf61bfe4dfab1c`)
 - **Android target:** `https://invent.kde.org/network/kdeconnect-android.git` (branch `work/continuity_camera`, base SHA `d0534acc70cd9403fb56d78f645f228e21097492`)
 - **Authorized Android build route:** Local bounded `./gradlew assembleDebug lintDebug testDebugUnitTest` + `apksigner verify`
 - **OBS packaging targets:** `home:dwolfF:kdeconnect:staging` -> `home:dwolfF:kdeconnect` (`xUbuntu_26.04`, `x86_64`)
@@ -39,4 +39,4 @@
 - **Build-time tests:** `ctest` unit tests for protocol state machine, resolution/fps clamping, binary frame parser bounds, and `plugins.toml` ELF/GStreamer checks (`pipewiresink`, `appsrc`, `h264parse`, `avdec_h264`); Android JUnit packet/capture-request validation.
 - **OBS package checks:** Verify `kdeconnect_continuitycamera.so`, `kdeconnect-continuitycamera-bridge`, and `gstreamer1.0-pipewire` runtime integration.
 - **Live device matrix:** Stream Android camera+mic into `firefox`/`obs`/`pw-top` on Ubuntu 26.04 Wayland, verify lens switch (front/rear), permission-denied fallback, photo capture import, and clean PipeWire teardown on stop/disconnect.
-- **Open design questions:** Upstream package dependency check in OBS `xUbuntu_26.04`: verify `gstreamer1.0-pipewire` is installed/recommended cleanly via `debian/control` before Wave 2 coding.
+- **Open design questions:** Resolved (`gstreamer1.0-pipewire` added to `obs/kdeconnect/debian/control` and `obs/verifier.Dockerfile`; `pipewiresink` uses `mode=2` (`provide`) with dynamic `stream-properties`).

@@ -42,7 +42,7 @@ verify_so = ["kdeconnect_notifications.so"]
 [[plugins]]
 id = "continuity_camera"
 kind = "new_plugin"
-status = "planned"
+status = "active"
 desktop_branch = "work/continuity_camera"
 android_branch = "work/continuity_camera"
 spec = "docs/plugins/continuity_camera/spec.md"
@@ -50,10 +50,13 @@ verify_so = ["kdeconnect_continuitycamera.so"]
 verify_bins = ["/usr/bin/kdeconnect-continuitycamera-bridge"]
 verify_gst_elements = ["appsrc", "h264parse", "avdec_h264", "pipewiresink"]
 
+[plugins.required_needed_libs]
+"/usr/bin/kdeconnect-continuitycamera-bridge" = ["libgstreamer-1.0.so.0", "libQt6Network.so.6"]
+
 [[plugins]]
 id = "remote_auth"
 kind = "new_plugin"
-status = "planned"
+status = "active"
 desktop_branch = "work/remote_auth"
 android_branch = "work/remote_auth"
 spec = "docs/plugins/remote_auth/spec.md"
@@ -62,7 +65,7 @@ verify_so = ["kdeconnect_remoteauth.so"]
 [[plugins]]
 id = "bt_audio_switch"
 kind = "new_plugin"
-status = "planned"
+status = "active"
 desktop_branch = "work/bt_audio_switch"
 android_branch = "work/bt_audio_switch"
 spec = "docs/plugins/bt_audio_switch/spec.md"

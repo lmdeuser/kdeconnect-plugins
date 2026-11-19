@@ -7,7 +7,7 @@
 
 - **Plugin ID:** `otp_autofill` (`upstream_enhancement` to desktop `kdeconnect_notifications`)
 - **Human owner / maintainer:** `Dmitriy Volkov <dennshield@duck.com>`
-- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/otp_autofill`, base SHA `1d05b8e07804066b20ba32dbc7cec875188008c0`)
+- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/otp_autofill`, base SHA `69ce9c5c49ce209600873bf10ddf61bfe4dfab1c`)
 - **Android target:** None required (reuses Android `NotificationsPlugin` notification forwarding without extra Android permissions such as `READ_SMS`).
 - **OBS packaging targets:** `home:dwolfF:kdeconnect:staging` -> `home:dwolfF:kdeconnect` (`xUbuntu_26.04`, `x86_64`)
 

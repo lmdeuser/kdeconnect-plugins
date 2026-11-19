@@ -7,7 +7,7 @@
 
 - **Plugin ID:** `remote_auth` (desktop `kdeconnect_remoteauth`, Android `RemoteAuthPlugin`)
 - **Human owner / maintainer:** `Dmitriy Volkov <dennshield@duck.com>`
-- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/remote_auth`, base SHA `1d05b8e07804066b20ba32dbc7cec875188008c0`)
+- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/remote_auth`, base SHA `69ce9c5c49ce209600873bf10ddf61bfe4dfab1c`)
 - **Android target:** `https://invent.kde.org/network/kdeconnect-android.git` (branch `work/remote_auth`, base SHA `d0534acc70cd9403fb56d78f645f228e21097492`)
 - **Authorized Android build route:** Local bounded `./gradlew assembleDebug lintDebug testDebugUnitTest` + `apksigner verify`
 - **OBS packaging targets:** `home:dwolfF:kdeconnect:staging` -> `home:dwolfF:kdeconnect` (`xUbuntu_26.04`, `x86_64`)
@@ -43,4 +43,4 @@
   - Android JUnit: challenge schema clamping and rejection of oversized/malformed summaries.
 - **OBS package checks:** `plugins.toml` verifies `kdeconnect_remoteauth.so` in staged `.deb`.
 - **Live device matrix:** Lock Ubuntu Wayland desktop -> trigger `BiometricPrompt` on paired Android 15 phone -> verify explicit approval unlocks session only when enabled, and verify denial/timeout leaves session locked.
-- **Open design questions:** Confirm `androidx.biometric:biometric` artifact availability in existing `/staging/gradle` cache or upstream `gradle/libs.versions.toml` before Wave 2 coding.
+- **Open design questions:** Resolved (uses platform API 30+ `android.hardware.biometrics.BiometricPrompt` directly without external Gradle dependencies).
