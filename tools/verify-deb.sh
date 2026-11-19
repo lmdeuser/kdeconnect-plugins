@@ -63,7 +63,7 @@ if [[ $rebuild_image -eq 1 ]]; then
       --tag "$image_tag" \
       --file "$project/obs/verifier.Dockerfile" "$project/obs"
     docker image prune -f >/dev/null 2>&1 || true
-    docker builder prune -f --filter "until=168h" >/dev/null 2>&1 || true
+    docker builder prune -af >/dev/null 2>&1 || true
 fi
 
 deb_checks=$(python3 "$project/tools/plugin_registry.py" deb-checks --registry "$project/plugins.toml")

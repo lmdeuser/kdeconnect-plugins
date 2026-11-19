@@ -592,7 +592,7 @@ def _ensure_state_permissions(state_dir: Path | None = None) -> None:
 
 def prune_old_artifacts(
     package: str,
-    keep: int = 2,
+    keep: int = 1,
     keep_srcmd5s: set[str] | None = None,
     state_dir: Path | None = None,
     sweep_tmp_age_sec: int = 7200,
@@ -666,7 +666,7 @@ def prune_old_artifacts(
     return {"removed_dirs": removed_dirs, "removed_logs": removed_logs, "removed_tmp": removed_tmp}
 
 
-def _cmd_cleanup(keep: int = 2, tmp_age_sec: int = 7200) -> int:
+def _cmd_cleanup(keep: int = 1, tmp_age_sec: int = 7200) -> int:
     _ensure_state_permissions(STATE)
     result = prune_old_artifacts("kdeconnect", keep=keep, state_dir=STATE, sweep_tmp_age_sec=tmp_age_sec)
     repo_dir = STATE / "repos" / "kdeconnect-kde"
@@ -1032,7 +1032,7 @@ def _execute_cycle_with_cleanup(
 
         return 0
     finally:
-        prune_old_artifacts("kdeconnect", keep=2, keep_srcmd5s=keep_hashes, state_dir=STATE)
+        prune_old_artifacts("kdeconnect", keep=1, keep_srcmd5s=keep_hashes, state_dir=STATE)
         if (repo_dir / ".git" / "HEAD").is_file():
             run_git_hardened(repo_dir, "gc", "--auto", check=False)
 
@@ -1061,7 +1061,7 @@ def main() -> int:
     cycle_p.add_argument("--dry-run", action="store_true")
 
     cleanup_p = sub.add_parser("cleanup", help="Prune old staged artifacts, temp scratch dirs, and run git gc")
-    cleanup_p.add_argument("--keep", type=int, default=2)
+    cleanup_p.add_argument("--keep", type=int, default=1)
     cleanup_p.add_argument("--tmp-age-sec", type=int, default=7200)
 
     ensure_p = sub.add_parser("ensure-projects", help="Ensure OBS staging/stable projects and package metadata")

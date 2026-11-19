@@ -253,7 +253,7 @@ class UpstreamSyncSecurityTests(unittest.TestCase):
         self.assertIn("--pids-limit=256", script)
         self.assertIn("docker image prune -f", script)
         self.assertNotIn("docker image prune -a", script)
-        self.assertIn('docker builder prune -f --filter "until=168h"', script)
+        self.assertIn("docker builder prune -af", script)
         self.assertIn("plugin_registry.py", script)
         self.assertIn("deb-checks", script)
         self.assertNotIn("ldd ", script)
