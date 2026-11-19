@@ -17,6 +17,8 @@ Every plugin developed under `lmdeuser/kdeconnect-plugins` moves sequentially th
 
 ## Gate Sequence
 
+Apply `/code-complete` construction, scientific debugging, and verification discipline across all six gates (with repository rules and upstream KDE Connect conventions taking precedence).
+
 1. **Gate 0 -- Design and Upstream Inspection** (`.agents/skills/plugin-design-gate/SKILL.md`):
    - Source `.state/local.env` and verify external upstream revisions.
    - Map reusable plugins (`mousereceiver`, `remotekeyboard`, `remotekeyboardime`, `clipboard`, `share`, `mousepad`, `notifications`).
@@ -38,10 +40,14 @@ Every plugin developed under `lmdeuser/kdeconnect-plugins` moves sequentially th
    - Inspect staged `.deb` file paths and ELF dependencies dynamically generated from `plugins.toml` (`tools/plugin_registry.py deb-checks` inside `tools/verify-deb.sh`).
    - Run isolated Rootless Docker install/uninstall/reinstall verification without network access.
    - Evaluate `evaluate_package_promotion_readiness(...)` / `evaluate_promotion_readiness(...)` before any promotion to `home:dwolfF:kdeconnect`.
-5. **Gate 4 -- Authorized Live Hardware Matrix** (`.agents/skills/live-acceptance-matrix/SKILL.md`):
-   - Synthesize active Android branches onto `work/continuity-stack` via `tools/synthesize_android_stack.py` without mutating individual `work/<plugin_id>` branches, run resource-bounded Gradle + `apksigner verify`, and install into Android `User 0`.
-   - Test on real Ubuntu 26.04 Wayland and Android 11+ hardware over Wi-Fi with explicit user authorization.
-   - Record device model, OS/API versions, negative cases (denied/revoked consent, protected content, disconnects), and regression checks on standalone plugins.
+5. **Gate 4 -- Virtual-First Acceptance, Post-Release Bug Hunt, and Live Hardware Matrix** (`.agents/skills/live-acceptance-matrix/SKILL.md`):
+   - **Gate 4a -- Virtual Environment Acceptance and Post-Release Bug Hunt (Mandatory Before Hardware)**:
+     - Synthesize active Android branches onto `work/continuity-stack` via `tools/synthesize_android_stack.py` without mutating individual `work/<plugin_id>` branches, and run resource-bounded Gradle + `apksigner verify`.
+     - Install the exact released OBS `.deb` inside a snapshotted Ubuntu 26.04 LTS libvirt/QEMU VM and the synthesized `.apk` onto an Android Virtual Device (AVD, API 35+), pair over LAN/IP, and execute all virtual-capable acceptance scenarios.
+     - Run a mandatory post-release bug-hunting pass (`bug-analysis-review` + `/code-complete` verification): static diff review for null/none dereferences, resource/handle leaks, concurrency/reconnect races, and boundary/malformed inputs, plus runtime inspection of VM `journalctl`/stderr/PipeWire and AVD `logcat` across negative paths. Any confirmed defect must be fixed at root cause with a regression test, rebuilt through OBS/Gradle, and re-verified in VM + AVD before authorizing physical hardware.
+   - **Gate 4b -- Authorized Real-Hardware Verification**:
+     - Run only after Gate 4a passes with zero open release-blocking defects and with explicit user authorization.
+     - Install the verified Android APK strictly to `User 0`, verify hardware-only paths (physical Bluetooth A2DP/HFP audio handoff, OEM camera/`MediaCodec`/`MediaProjection`/`FLAG_SECURE` quirks), and record device model, OS/API versions, negative cases, and regression checks on standalone plugins.
 6. **Gate 5 -- Upstream KDE Invent Readiness** (`.agents/skills/upstream-invent-handoff/SKILL.md`):
    - Rebase each individual `work/<plugin_id>` branch onto `origin/master` and pass `python3 tools/check_kde_compliance.py --upstream-repo <path> --base origin/master --ref work/<plugin_id>`.
    - Emit untracked `.state/dossiers/<plugin_id>.md` with factual verification records and human comprehension checkpoints.
@@ -55,5 +61,5 @@ Separate verified evidence across six explicit sections in every milestone or fi
 2. Static checks and Python unit suites run, with exact pass/fail counts.
 3. OBS staging source/build status, `ctest` count, `lintian`, and `.deb` inspection results.
 4. Remote Android build route status and artifact verification (if applicable).
-5. Authorized live desktop/Android behavior verified (with device/OS matrix).
+5. Virtual-environment (VM + AVD) acceptance and post-release bug-hunt findings, plus authorized real-hardware verification (with device/OS matrix) when executed.
 6. Remaining blockers, unverified behaviors, and next human decision required.

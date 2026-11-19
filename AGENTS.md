@@ -46,6 +46,8 @@ This repository (`lmdeuser/kdeconnect-plugins`) is the public engineering harnes
 - Reuse existing KDE Connect plugins (`mousereceiver`, `remotekeyboard`, `remotekeyboardime`, `clipboard`, `share`, `mousepad`) instead of building duplicate input, clipboard, or file-transfer stacks.
 - Treat paired and unpaired peer `NetworkPacket` payloads and pointer inputs as untrusted boundary data. Validate packet types, fields, sizes, permissions, and session consent at boundaries; handle legacy or disconnected peers safely.
 - Apply TDD for Python verification tools, runner scripts, and packaging code. Debug failures from reproducible evidence and falsifiable hypotheses without arbitrary sleeps or symptom-masking fallbacks.
+- Follow `/code-complete` construction and verification discipline across all design, implementation, refactoring, and debugging work (simplest cohesive design, explicit data flow, strict boundary validation, expected-error handling, scientific debugging with falsifiable hypotheses, end-to-end scenario verification where possible, and explicit reporting of unverified limitations; repository rules and upstream KDE Connect conventions take precedence).
+- Enforce the **Virtual-First Testing and Post-Release Bug-Hunt Gate**: after OBS/Gradle release artifacts are built or published, run live verification first in an isolated virtual environment (Ubuntu 26.04 LTS libvirt/QEMU VM with a pre-test snapshot plus an Android Virtual Device / AVD paired over LAN/IP), followed by a systematic post-release bug hunt (static review for null dereferences, resource leaks, concurrency/lifecycle races, and boundary edge cases, plus VM `journalctl`/PipeWire and AVD `logcat` runtime audit across negative paths) before installing onto physical hardware. Any confirmed bug requires a root-cause fix, regression test, rebuild, and virtual re-verification prior to hardware deployment.
 
 ## 5. Mandatory Six-Gate Lifecycle
 
@@ -55,7 +57,7 @@ This repository (`lmdeuser/kdeconnect-plugins`) is the public engineering harnes
 | **Gate 1** | Public tree hygiene, registry schema, REUSE 3.0 compliance, and Python controller/stack tests | `tools/plugin_registry.py`, `tools/check_public_tree.py`, `tools/check_kde_compliance.py`, `tests/` |
 | **Gate 2** | Multi-plugin `work/<plugin_id>` stack synthesis, OBS overlay, remote build, `ctest`, and `lintian` | [obs-staging-pipeline](.agents/skills/obs-staging-pipeline/SKILL.md) |
 | **Gate 3** | Registry-driven `.deb` inspection, isolated install/uninstall check, promotion readiness | [obs-staging-pipeline](.agents/skills/obs-staging-pipeline/SKILL.md), `tools/verify-deb.sh`, `tools/obs_controller.py` |
-| **Gate 4** | Authorized live Ubuntu 26.04 Wayland + Android 11+ device verification matrix | [live-acceptance-matrix](.agents/skills/live-acceptance-matrix/SKILL.md) |
+| **Gate 4** | Virtual-first (Ubuntu 26.04 VM + AVD) acceptance and post-release bug hunt before authorized real-hardware testing | [live-acceptance-matrix](.agents/skills/live-acceptance-matrix/SKILL.md) |
 | **Gate 5** | Rebased `work/<plugin_id>`, per-branch `check_kde_compliance.py --ref`, human dossier in `.state/dossiers/` | [upstream-invent-handoff](.agents/skills/upstream-invent-handoff/SKILL.md) |
 
 Detailed gate criteria and reporting templates live in [docs/WORKFLOW.md](docs/WORKFLOW.md).
