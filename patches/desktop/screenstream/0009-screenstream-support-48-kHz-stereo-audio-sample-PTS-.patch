@@ -1,0 +1,851 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 00:12:36 +0500
+Subject: [PATCH 09/10] screenstream: support 48 kHz stereo audio, sample PTS
+ pacing, and daemon-managed BT auto-routing
+
+
+diff --git a/plugins/screenstream/kdeconnect_screenstream_config.qml b/plugins/screenstream/kdeconnect_screenstream_config.qml
+index 25e045a5a5d7da481f4207fb19ea1680219853e2..c15a2cf06e75633c03f53586eabbd008172fd169 100644
+--- a/plugins/screenstream/kdeconnect_screenstream_config.qml
++++ b/plugins/screenstream/kdeconnect_screenstream_config.qml
+@@ -18,6 +18,7 @@ Kirigami.ScrollablePage {
+     Component.onCompleted: {
+         autoStartCheck.checked = config.getBool("autoStart", false)
+         requestAudioCheck.checked = config.getBool("requestAudio", true)
++        autoRouteAudioCheck.checked = config.getBool("autoRouteAudio", true)
+         maxFpsSpin.value = config.getInt("maxFps", 60)
+         maxBitrateSpin.value = config.getInt("maxBitrateKbps", 8000)
+     }
+@@ -46,6 +47,12 @@ Kirigami.ScrollablePage {
+             onClicked: config.set("requestAudio", checked)
+         }
+ 
++        QQC2.CheckBox {
++            id: autoRouteAudioCheck
++            text: i18nd("kdeconnect-plugins", "Automatically switch audio from Bluetooth to screencast")
++            onClicked: config.set("autoRouteAudio", checked)
++        }
++
+         QQC2.SpinBox {
+             id: maxFpsSpin
+             Kirigami.FormData.label: i18nd("kdeconnect-plugins", "Maximum frame rate (FPS):")
+diff --git a/plugins/screenstream/screenstreamplugin.cpp b/plugins/screenstream/screenstreamplugin.cpp
+index b6fb90545d60216e529e667a1b92f6da30ff2585..1014c01cd689cbab3d560e647378a7c4d92384f9 100644
+--- a/plugins/screenstream/screenstreamplugin.cpp
++++ b/plugins/screenstream/screenstreamplugin.cpp
+@@ -13,6 +13,8 @@
+ 
+ #include <QAbstractSocket>
+ #include <QCoreApplication>
++#include <QDBusConnection>
++#include <QDBusInterface>
+ #include <QDir>
+ #include <QFile>
+ #include <QFileInfo>
+@@ -45,6 +47,15 @@ ScreenStreamPlugin::ScreenStreamPlugin(QObject *parent, const QVariantList &args
+     m_reconnectTimer->setSingleShot(true);
+     connect(m_reconnectTimer, &QTimer::timeout, this, &ScreenStreamPlugin::onReconnectTimeout);
+     connect(config(), &KdeConnectPluginConfig::configChanged, this, &ScreenStreamPlugin::onConfigChanged);
++    if (device()) {
++        QDBusConnection::sessionBus().connect(
++            QStringLiteral("org.kde.kdeconnect"),
++            QStringLiteral("/modules/kdeconnect/devices/%1/btaudioswitch").arg(device()->id()),
++            QStringLiteral("org.kde.kdeconnect.device.btaudioswitch"),
++            QStringLiteral("headsetOwnerChanged"),
++            this,
++            SLOT(onBtHeadsetOwnerChanged(QString,QString,QString)));
++    }
+     onConfigChanged();
+ }
+ 
+@@ -95,6 +106,11 @@ bool ScreenStreamPlugin::audioEnabled() const
+     return m_sessionAudioEnabled;
+ }
+ 
++int ScreenStreamPlugin::audioChannels() const
++{
++    return m_audioChannels;
++}
++
+ bool ScreenStreamPlugin::accessibilityEnabled() const
+ {
+     return m_accessibilityEnabled;
+@@ -135,6 +151,7 @@ void ScreenStreamPlugin::onConfigChanged()
+     m_explicitStop = config()->getBool(QStringLiteral("explicitStop"), false);
+     m_autoStart = config()->getBool(QStringLiteral("autoStart"), false);
+     m_requestAudio = config()->getBool(QStringLiteral("requestAudio"), true);
++    m_autoRouteAudio = config()->getBool(QStringLiteral("autoRouteAudio"), true);
+     if (!active()) {
+         m_sessionAudioEnabled = m_requestAudio;
+     }
+@@ -199,6 +216,7 @@ bool ScreenStreamPlugin::startStream()
+         return false;
+     }
+ 
++    claimBluetoothForScreencast(false);
+     syncStateSignals(wasActive, wasStreaming);
+     Q_EMIT stateChanged();
+     return true;
+@@ -206,7 +224,8 @@ bool ScreenStreamPlugin::startStream()
+ 
+ bool ScreenStreamPlugin::sendStartPacket()
+ {
+-    const QVariantMap body = ScreenStreamProtocol::buildStartRequestBody(m_maxWidth, m_maxHeight, m_maxFps, m_maxBitrateKbps, m_sessionAudioEnabled);
++    const QVariantMap body = ScreenStreamProtocol::buildStartRequestBody(
++        m_maxWidth, m_maxHeight, m_maxFps, m_maxBitrateKbps, m_sessionAudioEnabled, m_autoRouteAudio);
+     NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST, body);
+     return sendPacket(np);
+ }
+@@ -252,6 +271,12 @@ void ScreenStreamPlugin::setAudioEnabled(bool enabled)
+         Q_EMIT audioEnabledChanged(enabled);
+     }
+ 
++    if (enabled) {
++        claimBluetoothForScreencast(true);
++    } else {
++        releaseClaimedBluetooth();
++    }
++
+     if (peerSupportsScreenStream() && active()) {
+         NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST, ScreenStreamProtocol::buildSetAudioEnabledRequestBody(enabled));
+         sendPacket(np);
+@@ -330,11 +355,20 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+ 
+         m_audioAvailable = np.get<bool>(QStringLiteral("audioAvailable"), false);
+         m_audioReason = np.get<QString>(QStringLiteral("audioReason"));
+-        const bool nextAudioEnabled = m_audioAvailable
+-            ? true
+-            : ((m_audioReason == QLatin1String("bluetooth_routed") || m_audioReason == QLatin1String("disabled_by_user"))
+-                   ? false
+-                   : m_sessionAudioEnabled);
++        const QString stateAudioCodec = np.get<QString>(QStringLiteral("audioCodec"));
++        if (stateAudioCodec == QLatin1String("pcm_s16le_48000_mono")
++            || stateAudioCodec == QLatin1String("pcm_s16le_48000_stereo")) {
++            m_audioChannels = audioChannelsForCodec(stateAudioCodec);
++        }
++        bool nextAudioEnabled = m_sessionAudioEnabled;
++        if (m_audioAvailable) {
++            nextAudioEnabled = true;
++        } else if (m_audioReason == QLatin1String("bluetooth_routed") || m_audioReason == QLatin1String("disabled_by_user")) {
++            nextAudioEnabled = false;
++        } else if (m_audioReason == QLatin1String("call_active")) {
++            // Keep session audio intent true so capture resumes automatically once the call ends.
++            nextAudioEnabled = m_sessionAudioEnabled;
++        }
+         if (nextAudioEnabled != m_sessionAudioEnabled) {
+             m_sessionAudioEnabled = nextAudioEnabled;
+             Q_EMIT audioEnabledChanged(m_sessionAudioEnabled);
+@@ -444,7 +478,7 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+             return;
+         }
+ 
+-        teardownSession(true);
++        teardownSession(true, false);
+         m_stopping = false;
+         m_reconnectTimer->stop();
+         m_parser.reset();
+@@ -464,11 +498,17 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+         }
+         m_rotation = rot;
+         m_fps = std::clamp(fps, 1, 120);
+-        m_audioAvailable = (audioCodec == QLatin1String("pcm_s16le_48000_mono"));
++        m_audioAvailable = (audioCodec == QLatin1String("pcm_s16le_48000_stereo")
++                            || audioCodec == QLatin1String("pcm_s16le_48000_mono"));
++        m_audioChannels = audioChannelsForCodec(audioCodec);
+         if (!m_audioAvailable && m_audioReason.isEmpty()) {
+             m_audioReason = (audioCodec == QLatin1String("none")) ? i18n("Audio disabled for this session") : audioCodec;
+         }
+ 
++        if (m_sessionAudioEnabled && m_autoRouteAudio && m_claimedBtMacs.isEmpty()) {
++            claimBluetoothForScreencast(false);
++        }
++
+         if (!ensureLocalServer() || !launchViewer()) {
+             m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error, false);
+             if (np.payload()) {
+@@ -585,6 +625,8 @@ bool ScreenStreamPlugin::launchViewer()
+         QString::number(m_streamHeight),
+         QStringLiteral("--rotation"),
+         QString::number(m_rotation),
++        QStringLiteral("--audio-channels"),
++        QString::number(m_audioChannels),
+     });
+ 
+     connect(process, &QProcess::finished, this, &ScreenStreamPlugin::onViewerFinished);
+@@ -795,8 +837,11 @@ void ScreenStreamPlugin::onReconnectTimeout()
+     Q_EMIT stateChanged();
+ }
+ 
+-void ScreenStreamPlugin::teardownSession(bool terminateViewer)
++void ScreenStreamPlugin::teardownSession(bool terminateViewer, bool releaseBluetooth)
+ {
++    if (releaseBluetooth) {
++        releaseClaimedBluetooth();
++    }
+     ScreenStreamProtocol::releaseStreamPayloadSafely(m_payload, this);
+     if (m_viewerSocket) {
+         disconnect(m_viewerSocket.data(), nullptr, this, nullptr);
+@@ -864,5 +909,72 @@ void ScreenStreamPlugin::syncStateSignals(bool wasActive, bool wasStreaming)
+     }
+ }
+ 
++void ScreenStreamPlugin::onBtHeadsetOwnerChanged(const QString &mac, const QString &owner, const QString &reason)
++{
++    if (owner == QLatin1String("remote")) {
++        m_claimedBtMacs.removeAll(mac);
++        if (reason != QLatin1String("call") && active() && m_sessionAudioEnabled) {
++            setAudioEnabled(false);
++        }
++    }
++}
++
++void ScreenStreamPlugin::claimBluetoothForScreencast(bool forceManual)
++{
++    if (!forceManual && (!m_autoRouteAudio || !m_sessionAudioEnabled)) {
++        return;
++    }
++    if (!device()) {
++        return;
++    }
++    const QString path = QStringLiteral("/modules/kdeconnect/devices/%1/btaudioswitch").arg(device()->id());
++    QDBusInterface btIface(
++        QStringLiteral("org.kde.kdeconnect"),
++        path,
++        QStringLiteral("org.kde.kdeconnect.device.btaudioswitch"),
++        QDBusConnection::sessionBus());
++    if (!btIface.isValid()) {
++        return;
++    }
++    const QStringList macs = btIface.property("allowedHeadsetMacs").toStringList();
++    for (const QString &mac : macs) {
++        if (mac.isEmpty()) {
++            continue;
++        }
++        btIface.asyncCall(QStringLiteral("claimHeadset"), mac, QStringLiteral("manual"));
++        if (!m_claimedBtMacs.contains(mac)) {
++            m_claimedBtMacs.append(mac);
++        }
++    }
++}
++
++void ScreenStreamPlugin::releaseClaimedBluetooth()
++{
++    if (m_claimedBtMacs.isEmpty() || !device()) {
++        return;
++    }
++    const QStringList toRelease = m_claimedBtMacs;
++    m_claimedBtMacs.clear();
++    const QString path = QStringLiteral("/modules/kdeconnect/devices/%1/btaudioswitch").arg(device()->id());
++    QDBusInterface btIface(
++        QStringLiteral("org.kde.kdeconnect"),
++        path,
++        QStringLiteral("org.kde.kdeconnect.device.btaudioswitch"),
++        QDBusConnection::sessionBus());
++    if (btIface.isValid()) {
++        for (const QString &mac : toRelease) {
++            btIface.call(QDBus::NoBlock, QStringLiteral("releaseHeadset"), mac);
++        }
++    }
++}
++
++int ScreenStreamPlugin::audioChannelsForCodec(const QString &audioCodec)
++{
++    if (audioCodec == QLatin1String("pcm_s16le_48000_mono")) {
++        return 1;
++    }
++    return 2;
++}
++
+ #include "moc_screenstreamplugin.cpp"
+ #include "screenstreamplugin.moc"
+diff --git a/plugins/screenstream/screenstreamplugin.h b/plugins/screenstream/screenstreamplugin.h
+index 0c8459c9a40a584d38909ae76fe2a5c316043cd3..b231d0e4ecd0512011ebc40164ea189235d400e9 100644
+--- a/plugins/screenstream/screenstreamplugin.h
++++ b/plugins/screenstream/screenstreamplugin.h
+@@ -36,6 +36,7 @@ class ScreenStreamPlugin : public KdeConnectPlugin
+     Q_PROPERTY(bool audioAvailable READ audioAvailable NOTIFY audioStatusChanged)
+     Q_PROPERTY(QString audioReason READ audioReason NOTIFY audioStatusChanged)
+     Q_PROPERTY(bool audioEnabled READ audioEnabled NOTIFY audioEnabledChanged)
++    Q_PROPERTY(int audioChannels READ audioChannels NOTIFY audioStatusChanged)
+     Q_PROPERTY(bool accessibilityEnabled READ accessibilityEnabled NOTIFY stateChanged)
+     Q_PROPERTY(int displayWidth READ displayWidth NOTIFY geometryChanged)
+     Q_PROPERTY(int displayHeight READ displayHeight NOTIFY geometryChanged)
+@@ -54,6 +55,7 @@ public:
+     bool audioAvailable() const;
+     QString audioReason() const;
+     bool audioEnabled() const;
++    int audioChannels() const;
+     bool accessibilityEnabled() const;
+     int displayWidth() const;
+     int displayHeight() const;
+@@ -88,12 +90,13 @@ private Q_SLOTS:
+     void onViewerSocketDisconnected();
+     void onViewerFinished();
+     void onReconnectTimeout();
++    void onBtHeadsetOwnerChanged(const QString &mac, const QString &owner, const QString &reason);
+ 
+ private:
+     bool peerSupportsScreenStream() const;
+     bool ensureLocalServer();
+     bool launchViewer();
+-    void teardownSession(bool terminateViewer);
++    void teardownSession(bool terminateViewer, bool releaseBluetooth = true);
+     void removeSocketFile();
+     void setLastError(const QString &error);
+     void syncStateSignals(bool wasActive, bool wasStreaming);
+@@ -101,6 +104,9 @@ private:
+     bool sendStartPacket();
+     void enqueueOrSendFrame(const ScreenStreamProtocol::ScreenStreamFrame &frame);
+     void flushPendingFrames();
++    void claimBluetoothForScreencast(bool forceManual = false);
++    void releaseClaimedBluetooth();
++    static int audioChannelsForCodec(const QString &audioCodec);
+ 
+     ScreenStreamProtocol::ScreenStreamSessionMachine m_session;
+     ScreenStreamProtocol::ScreenStreamFrameParser m_parser;
+@@ -120,9 +126,11 @@ private:
+     bool m_explicitStop = false;
+     bool m_autoStart = false;
+     bool m_requestAudio = true;
++    bool m_autoRouteAudio = true;
+     bool m_sessionAudioEnabled = true;
+     bool m_stopping = false;
+ 
++    int m_audioChannels = 2;
+     int m_displayWidth = 0;
+     int m_displayHeight = 0;
+     int m_streamWidth = 0;
+@@ -136,4 +144,5 @@ private:
+ 
+     QByteArray m_cachedCodecConfig;
+     QList<QByteArray> m_pendingViewerFrames;
++    QStringList m_claimedBtMacs;
+ };
+diff --git a/plugins/screenstream/screenstreamprotocol.cpp b/plugins/screenstream/screenstreamprotocol.cpp
+index 3f3a7499539fbf53068b047754485599158bf8c9..f878ce08707431324b7a2a2e2933d2396dc84a37 100644
+--- a/plugins/screenstream/screenstreamprotocol.cpp
++++ b/plugins/screenstream/screenstreamprotocol.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <limits>
+ #include <utility>
+ 
+ namespace ScreenStreamProtocol
+@@ -403,7 +404,7 @@ bool ScreenStreamSessionMachine::canForwardInput() const
+     return m_state == State::Streaming && m_remoteControlAllowed;
+ }
+ 
+-QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int maxBitrateKbps, bool requestAudio)
++QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int maxBitrateKbps, bool requestAudio, bool autoRouteAudio)
+ {
+     return QVariantMap{
+         {QStringLiteral("action"), QStringLiteral("start")},
+@@ -412,9 +413,67 @@ QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int m
+         {QStringLiteral("maxFps"), std::clamp(maxFps, 5, 60)},
+         {QStringLiteral("maxBitrateKbps"), std::clamp(maxBitrateKbps, 500, 20000)},
+         {QStringLiteral("requestAudio"), requestAudio},
++        {QStringLiteral("autoRouteAudio"), autoRouteAudio},
+     };
+ }
+ 
++PcmTimestampTracker::PcmTimestampTracker(int sampleRate, int channels)
++{
++    setFormat(sampleRate, channels);
++}
++
++void PcmTimestampTracker::setFormat(int sampleRate, int channels)
++{
++    const int safeRate = std::clamp(sampleRate, 8000, 96000);
++    const int safeChannels = std::clamp(channels, 1, 2);
++    if (safeRate != m_sampleRate || safeChannels != m_channels) {
++        m_sampleRate = safeRate;
++        m_channels = safeChannels;
++        reset();
++    }
++}
++
++void PcmTimestampTracker::reset()
++{
++    m_initialized = false;
++    m_nextPtsNs = 0;
++}
++
++PcmTimestampTracker::BufferTiming PcmTimestampTracker::nextBuffer(qsizetype payloadBytes, quint64 pipelineRunningTimeNs)
++{
++    constexpr quint64 kMaxDriftNs = 160000000ULL;
++    constexpr quint64 kInvalidClock = std::numeric_limits<quint64>::max();
++
++    BufferTiming out;
++    const qsizetype frameBytes = static_cast<qsizetype>(m_channels) * 2;
++    if (payloadBytes < frameBytes || frameBytes <= 0) {
++        return out;
++    }
++
++    const quint64 numFrames = static_cast<quint64>(payloadBytes / frameBytes);
++    const quint64 durationNs = (numFrames * 1000000000ULL) / static_cast<quint64>(m_sampleRate);
++    const bool hasClock = (pipelineRunningTimeNs != kInvalidClock);
++
++    bool needResync = !m_initialized;
++    if (!needResync && hasClock) {
++        const quint64 diff = (pipelineRunningTimeNs >= m_nextPtsNs) ? (pipelineRunningTimeNs - m_nextPtsNs) : (m_nextPtsNs - pipelineRunningTimeNs);
++        if (diff > kMaxDriftNs) {
++            needResync = true;
++        }
++    }
++
++    if (needResync) {
++        m_nextPtsNs = hasClock ? pipelineRunningTimeNs : 0ULL;
++        m_initialized = true;
++        out.discont = true;
++    }
++
++    out.ptsNs = m_nextPtsNs;
++    out.durationNs = durationNs;
++    m_nextPtsNs += durationNs;
++    return out;
++}
++
+ QVariantMap buildWakeRequestBody()
+ {
+     return QVariantMap{
+diff --git a/plugins/screenstream/screenstreamprotocol.h b/plugins/screenstream/screenstreamprotocol.h
+index fd6241ddf82f6072054721cc5a1bdba6f30456e9..cde9ab98ca9333ddfb33366439744df361854ab9 100644
+--- a/plugins/screenstream/screenstreamprotocol.h
++++ b/plugins/screenstream/screenstreamprotocol.h
+@@ -158,10 +158,42 @@ private:
+     int m_reconnectAttempt = 0;
+ };
+ 
+-QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int maxBitrateKbps, bool requestAudio);
++QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int maxBitrateKbps, bool requestAudio, bool autoRouteAudio = true);
+ QVariantMap buildWakeRequestBody();
+ QVariantMap buildSetAudioEnabledRequestBody(bool requestAudio);
+ bool isValidRotation(int rotation);
+ void releaseStreamPayloadSafely(QSharedPointer<QIODevice> &payload, QObject *receiver = nullptr);
+ 
++class PcmTimestampTracker
++{
++public:
++    struct BufferTiming {
++        quint64 ptsNs = 0;
++        quint64 durationNs = 0;
++        bool discont = false;
++    };
++
++    explicit PcmTimestampTracker(int sampleRate = 48000, int channels = 2);
++
++    void setFormat(int sampleRate, int channels);
++    void reset();
++    BufferTiming nextBuffer(qsizetype payloadBytes, quint64 pipelineRunningTimeNs);
++
++    int sampleRate() const
++    {
++        return m_sampleRate;
++    }
++
++    int channels() const
++    {
++        return m_channels;
++    }
++
++private:
++    int m_sampleRate = 48000;
++    int m_channels = 2;
++    bool m_initialized = false;
++    quint64 m_nextPtsNs = 0;
++};
++
+ } // namespace ScreenStreamProtocol
+diff --git a/plugins/screenstream/viewer/main.cpp b/plugins/screenstream/viewer/main.cpp
+index 6b6d685f2f097eb33b72e0b7c2a34bce304326b9..e7b6d96d9cf6c95c261c91ae0a787e10c1ad2755 100644
+--- a/plugins/screenstream/viewer/main.cpp
++++ b/plugins/screenstream/viewer/main.cpp
+@@ -14,6 +14,7 @@
+ #include <QCommandLineParser>
+ #include <QCoreApplication>
+ 
++#include <algorithm>
+ #include <iostream>
+ #include <memory>
+ 
+@@ -60,8 +61,9 @@ int main(int argc, char **argv)
+     QCommandLineOption swOpt(QStringLiteral("stream-width"), i18n("Stream width"), QStringLiteral("px"), QStringLiteral("0"));
+     QCommandLineOption shOpt(QStringLiteral("stream-height"), i18n("Stream height"), QStringLiteral("px"), QStringLiteral("0"));
+     QCommandLineOption rotOpt(QStringLiteral("rotation"), i18n("Display rotation"), QStringLiteral("deg"), QStringLiteral("0"));
++    QCommandLineOption audioChOpt(QStringLiteral("audio-channels"), i18n("Audio channel count"), QStringLiteral("channels"), QStringLiteral("2"));
+ 
+-    parser.addOptions({deviceOpt, nameOpt, socketOpt, dwOpt, dhOpt, swOpt, shOpt, rotOpt});
++    parser.addOptions({deviceOpt, nameOpt, socketOpt, dwOpt, dhOpt, swOpt, shOpt, rotOpt, audioChOpt});
+     parser.process(*app);
+ 
+     ViewerLaunchConfig config;
+@@ -73,6 +75,7 @@ int main(int argc, char **argv)
+     config.streamWidth = parser.value(swOpt).toInt();
+     config.streamHeight = parser.value(shOpt).toInt();
+     config.rotation = parser.value(rotOpt).toInt();
++    config.audioChannels = std::clamp(parser.value(audioChOpt).toInt(), 1, 2);
+ 
+     if (config.deviceId.isEmpty() || config.socketPath.isEmpty()) {
+         std::cerr << "Both --device and --socket are required" << std::endl;
+diff --git a/plugins/screenstream/viewer/pcmplayer.cpp b/plugins/screenstream/viewer/pcmplayer.cpp
+index 486074eff2663be73c3bfb2c554f66f6933b8abd..7a51ece133c085197e268164c554f3650e917646 100644
+--- a/plugins/screenstream/viewer/pcmplayer.cpp
++++ b/plugins/screenstream/viewer/pcmplayer.cpp
+@@ -6,19 +6,35 @@
+ 
+ #include "pcmplayer.h"
+ 
++#include "../screenstreamprotocol.h"
++
++#include <algorithm>
+ #include <cstring>
++#include <limits>
+ 
+ #include <gst/app/gstappsrc.h>
+ #include <gst/gst.h>
+ 
+ namespace
+ {
+-inline constexpr qsizetype kMaxBufferBytes = 7680; // 80 ms of 48 kHz mono s16le
++inline constexpr qsizetype kMaxBufferBytes = 30720; // 160 ms of 48 kHz stereo s16le
++inline constexpr guint64 kMaxQueueTimeNs = 160000000ULL;
++inline constexpr guint64 kMinThresholdTimeNs = 40000000ULL;
++
++void setInt64PropertyIfPresent(GstElement *elem, const char *name, gint64 value)
++{
++    if (elem && g_object_class_find_property(G_OBJECT_GET_CLASS(elem), name)) {
++        g_object_set(elem, name, value, nullptr);
++    }
++}
+ } // namespace
+ 
+ struct PcmPlayer::Private {
+     GstElement *pipeline = nullptr;
+     GstElement *appsrc = nullptr;
++    int sampleRate = 48000;
++    int channels = 2;
++    ScreenStreamProtocol::PcmTimestampTracker ptsTracker{48000, 2};
+     bool muted = false;
+     bool unavailable = false;
+ };
+@@ -34,6 +50,22 @@ PcmPlayer::~PcmPlayer()
+     stop();
+ }
+ 
++void PcmPlayer::setAudioFormat(int sampleRate, int channels)
++{
++    const int safeRate = std::clamp(sampleRate, 8000, 96000);
++    const int safeChannels = std::clamp(channels, 1, 2);
++    if (d->sampleRate == safeRate && d->channels == safeChannels) {
++        return;
++    }
++    d->sampleRate = safeRate;
++    d->channels = safeChannels;
++    d->ptsTracker.setFormat(safeRate, safeChannels);
++    d->unavailable = false;
++    if (d->pipeline) {
++        stop();
++    }
++}
++
+ bool PcmPlayer::ensureStarted()
+ {
+     if (d->unavailable) {
+@@ -50,12 +82,17 @@ bool PcmPlayer::ensureStarted()
+ 
+     GstElement *pipeline = gst_pipeline_new("screenstream-audio");
+     GstElement *appsrc = gst_element_factory_make("appsrc", "audio_src");
++    GstElement *queue = gst_element_factory_make("queue", "audio_queue");
+     GstElement *convert = gst_element_factory_make("audioconvert", "audio_convert");
+     GstElement *resample = gst_element_factory_make("audioresample", "audio_resample");
+-    GstElement *sink = gst_element_factory_make("autoaudiosink", "audio_sink");
++    GstElement *sink = gst_element_factory_make("pulsesink", "audio_sink");
++    if (!sink) {
++        sink = gst_element_factory_make("autoaudiosink", "audio_sink");
++    }
+ 
+-    if (!pipeline || !appsrc || !convert || !resample || !sink) {
++    if (!pipeline || !appsrc || !queue || !convert || !resample || !sink) {
+         if (appsrc) gst_object_unref(appsrc);
++        if (queue) gst_object_unref(queue);
+         if (convert) gst_object_unref(convert);
+         if (resample) gst_object_unref(resample);
+         if (sink) gst_object_unref(sink);
+@@ -64,14 +101,19 @@ bool PcmPlayer::ensureStarted()
+         return false;
+     }
+ 
+-    GstCaps *caps = gst_caps_from_string("audio/x-raw,format=(string)S16LE,layout=(string)interleaved,rate=(int)48000,channels=(int)1");
++    const QByteArray capsStr = QStringLiteral(
++                                   "audio/x-raw,format=(string)S16LE,layout=(string)interleaved,rate=(int)%1,channels=(int)%2")
++                                   .arg(d->sampleRate)
++                                   .arg(d->channels)
++                                   .toUtf8();
++    GstCaps *caps = gst_caps_from_string(capsStr.constData());
+     g_object_set(appsrc,
+                  "is-live",
+                  TRUE,
+                  "format",
+                  GST_FORMAT_TIME,
+                  "do-timestamp",
+-                 TRUE,
++                 FALSE,
+                  "stream-type",
+                  GST_APP_STREAM_TYPE_STREAM,
+                  "block",
+@@ -85,13 +127,31 @@ bool PcmPlayer::ensureStarted()
+                  nullptr);
+     gst_caps_unref(caps);
+ 
+-    gst_bin_add_many(GST_BIN(pipeline), appsrc, convert, resample, sink, nullptr);
+-    if (!gst_element_link_many(appsrc, convert, resample, sink, nullptr)) {
++    g_object_set(queue,
++                 "max-size-buffers",
++                 static_cast<guint>(0),
++                 "max-size-bytes",
++                 static_cast<guint>(0),
++                 "max-size-time",
++                 static_cast<guint64>(kMaxQueueTimeNs),
++                 "min-threshold-time",
++                 static_cast<guint64>(kMinThresholdTimeNs),
++                 "leaky",
++                 2,
++                 nullptr);
++
++    setInt64PropertyIfPresent(sink, "buffer-time", static_cast<gint64>(120000));
++    setInt64PropertyIfPresent(sink, "latency-time", static_cast<gint64>(20000));
++    setInt64PropertyIfPresent(sink, "drift-tolerance", static_cast<gint64>(40000));
++
++    gst_bin_add_many(GST_BIN(pipeline), appsrc, queue, convert, resample, sink, nullptr);
++    if (!gst_element_link_many(appsrc, queue, convert, resample, sink, nullptr)) {
+         gst_object_unref(pipeline);
+         d->unavailable = true;
+         return false;
+     }
+ 
++    d->ptsTracker.reset();
+     if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+         gst_element_set_state(pipeline, GST_STATE_NULL);
+         gst_object_unref(pipeline);
+@@ -106,7 +166,8 @@ bool PcmPlayer::ensureStarted()
+ 
+ void PcmPlayer::writePcm(const QByteArray &pcmBytes)
+ {
+-    const qsizetype aligned = pcmBytes.size() - (pcmBytes.size() % 2);
++    const qsizetype frameBytes = static_cast<qsizetype>(d->channels) * 2;
++    const qsizetype aligned = (frameBytes > 0) ? (pcmBytes.size() - (pcmBytes.size() % frameBytes)) : 0;
+     if (d->muted || aligned <= 0 || !ensureStarted()) {
+         return;
+     }
+@@ -124,6 +185,17 @@ void PcmPlayer::writePcm(const QByteArray &pcmBytes)
+     std::memcpy(map.data, pcmBytes.constData(), static_cast<size_t>(aligned));
+     gst_buffer_unmap(buf, &map);
+ 
++    const GstClockTime rawRunning = gst_element_get_current_running_time(d->pipeline);
++    const quint64 runningNs = GST_CLOCK_TIME_IS_VALID(rawRunning)
++        ? static_cast<quint64>(rawRunning)
++        : std::numeric_limits<quint64>::max();
++    const ScreenStreamProtocol::PcmTimestampTracker::BufferTiming timing = d->ptsTracker.nextBuffer(aligned, runningNs);
++    GST_BUFFER_PTS(buf) = static_cast<GstClockTime>(timing.ptsNs);
++    GST_BUFFER_DURATION(buf) = static_cast<GstClockTime>(timing.durationNs);
++    if (timing.discont) {
++        GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_DISCONT);
++    }
++
+     gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), buf);
+ }
+ 
+@@ -148,4 +220,5 @@ void PcmPlayer::stop()
+         d->pipeline = nullptr;
+         d->appsrc = nullptr;
+     }
++    d->ptsTracker.reset();
+ }
+diff --git a/plugins/screenstream/viewer/pcmplayer.h b/plugins/screenstream/viewer/pcmplayer.h
+index a10df6f35c0aca006329e3d70ec9ea3af4f0390b..9649a1544bc3928b7582a902e55bcdcb75c61953 100644
+--- a/plugins/screenstream/viewer/pcmplayer.h
++++ b/plugins/screenstream/viewer/pcmplayer.h
+@@ -19,6 +19,7 @@ public:
+     explicit PcmPlayer(QObject *parent = nullptr);
+     ~PcmPlayer() override;
+ 
++    void setAudioFormat(int sampleRate, int channels);
+     void writePcm(const QByteArray &pcmBytes);
+     void setMuted(bool muted);
+     bool isMuted() const;
+diff --git a/plugins/screenstream/viewer/viewerwindow.cpp b/plugins/screenstream/viewer/viewerwindow.cpp
+index 935d2257f6b4ec3bb9728e3cdbab8dee2d7944d9..3ee237acc64999a81222f389658a19394192ff88 100644
+--- a/plugins/screenstream/viewer/viewerwindow.cpp
++++ b/plugins/screenstream/viewer/viewerwindow.cpp
+@@ -267,6 +267,9 @@ ViewerWindow::ViewerWindow(const ViewerLaunchConfig &config, QWidget *parent)
+     if (m_config.streamWidth > 1 && m_config.streamHeight > 1) {
+         m_streamSize = QSize(m_config.streamWidth, m_config.streamHeight);
+     }
++    if (m_audioPlayer) {
++        m_audioPlayer->setAudioFormat(48000, std::clamp(m_config.audioChannels, 1, 2));
++    }
+ 
+     setupUi();
+     setupDbus();
+@@ -483,6 +486,12 @@ void ViewerWindow::refreshDbusProperties()
+     m_accessibilityEnabled = m_screenstreamIface->property("accessibilityEnabled").toBool();
+     m_audioAvailable = m_screenstreamIface->property("audioAvailable").toBool();
+     m_audioReason = m_screenstreamIface->property("audioReason").toString();
++    if (m_audioPlayer) {
++        const QVariant chVar = m_screenstreamIface->property("audioChannels");
++        if (chVar.isValid()) {
++            m_audioPlayer->setAudioFormat(48000, std::clamp(chVar.toInt(), 1, 2));
++        }
++    }
+     if (!m_audioAvailable && m_audioReason == QLatin1String("bluetooth_routed")) {
+         m_bluetoothAudioMode = true;
+         if (m_audioRouteAction) {
+@@ -570,7 +579,9 @@ void ViewerWindow::updateBannerAndInputGate()
+     if (m_protectedContentActive) {
+         notices << i18n("Protected content is currently displayed on Android and masked from capture.");
+     }
+-    if (!m_audioAvailable && !m_audioReason.isEmpty() && !m_bluetoothAudioMode && m_audioReason != QLatin1String("bluetooth_routed")) {
++    if (!m_audioAvailable && m_audioReason == QLatin1String("call_active")) {
++        notices << i18n("Screencast audio paused while a phone or VoIP call is active.");
++    } else if (!m_audioAvailable && !m_audioReason.isEmpty() && !m_bluetoothAudioMode && m_audioReason != QLatin1String("bluetooth_routed")) {
+         notices << i18n("Audio unavailable: %1", m_audioReason);
+     }
+     if (!allowInput && m_sessionActive) {
+@@ -913,33 +924,14 @@ void ViewerWindow::onAudioRouteToggled(bool bluetoothMode)
+     updateAudioRouteUi();
+     updateBannerAndInputGate();
+ 
+-    if (bluetoothMode) {
+-        if (m_audioPlayer) {
+-            m_audioPlayer->setMuted(true);
++    if (m_audioPlayer) {
++        m_audioPlayer->setMuted(bluetoothMode || (m_muteAction && m_muteAction->isChecked()));
++        if (bluetoothMode) {
+             m_audioPlayer->stop();
+         }
+-        if (m_screenstreamIface && m_screenstreamIface->isValid()) {
+-            m_screenstreamIface->asyncCall(QStringLiteral("setAudioEnabled"), false);
+-        }
+-        if (m_btAudioSwitchIface && m_btAudioSwitchIface->isValid()) {
+-            const QStringList macs = m_btAudioSwitchIface->property("allowedHeadsetMacs").toStringList();
+-            for (const QString &mac : macs) {
+-                m_btAudioSwitchIface->asyncCall(QStringLiteral("releaseHeadset"), mac);
+-            }
+-        }
+-    } else {
+-        if (m_audioPlayer) {
+-            m_audioPlayer->setMuted(m_muteAction && m_muteAction->isChecked());
+-        }
+-        if (m_btAudioSwitchIface && m_btAudioSwitchIface->isValid()) {
+-            const QStringList macs = m_btAudioSwitchIface->property("allowedHeadsetMacs").toStringList();
+-            for (const QString &mac : macs) {
+-                m_btAudioSwitchIface->asyncCall(QStringLiteral("claimHeadset"), mac, QStringLiteral("manual"));
+-            }
+-        }
+-        if (m_screenstreamIface && m_screenstreamIface->isValid()) {
+-            m_screenstreamIface->asyncCall(QStringLiteral("setAudioEnabled"), true);
+-        }
++    }
++    if (m_screenstreamIface && m_screenstreamIface->isValid()) {
++        m_screenstreamIface->asyncCall(QStringLiteral("setAudioEnabled"), !bluetoothMode);
+     }
+ }
+ 
+@@ -1031,6 +1023,12 @@ void ViewerWindow::onDbusAudioStatusChanged(bool available, const QString &reaso
+     }
+     m_audioAvailable = available;
+     m_audioReason = reason;
++    if (m_screenstreamIface && m_screenstreamIface->isValid() && m_audioPlayer) {
++        const QVariant chVar = m_screenstreamIface->property("audioChannels");
++        if (chVar.isValid()) {
++            m_audioPlayer->setAudioFormat(48000, std::clamp(chVar.toInt(), 1, 2));
++        }
++    }
+     if (!available && reason == QLatin1String("bluetooth_routed")) {
+         m_bluetoothAudioMode = true;
+         if (m_audioRouteAction) {
+@@ -1059,11 +1057,10 @@ void ViewerWindow::onDbusAudioStatusChanged(bool available, const QString &reaso
+ void ViewerWindow::onDbusHeadsetOwnerChanged(const QString &mac, const QString &owner, const QString &reason)
+ {
+     Q_UNUSED(mac)
+-    Q_UNUSED(reason)
+     if (m_closing) {
+         return;
+     }
+-    if (owner == QLatin1String("remote") && !m_bluetoothAudioMode) {
++    if (owner == QLatin1String("remote") && reason != QLatin1String("call") && !m_bluetoothAudioMode) {
+         m_bluetoothAudioMode = true;
+         if (m_audioRouteAction) {
+             const QSignalBlocker blocker(m_audioRouteAction);
+@@ -1073,9 +1070,6 @@ void ViewerWindow::onDbusHeadsetOwnerChanged(const QString &mac, const QString &
+             m_audioPlayer->setMuted(true);
+             m_audioPlayer->stop();
+         }
+-        if (m_screenstreamIface && m_screenstreamIface->isValid()) {
+-            m_screenstreamIface->asyncCall(QStringLiteral("setAudioEnabled"), false);
+-        }
+         updateAudioRouteUi();
+         updateBannerAndInputGate();
+     }
+diff --git a/plugins/screenstream/viewer/viewerwindow.h b/plugins/screenstream/viewer/viewerwindow.h
+index d2120ee5500175874ecb7bf5262baf190abd2cfc..6941cab1fbd6d99c1e9010d0052086f32bb22a1c 100644
+--- a/plugins/screenstream/viewer/viewerwindow.h
++++ b/plugins/screenstream/viewer/viewerwindow.h
+@@ -44,6 +44,7 @@ struct ViewerLaunchConfig {
+     int streamWidth = 0;
+     int streamHeight = 0;
+     int rotation = 0;
++    int audioChannels = 2;
+ };
+ 
+ class ScreenCanvasWidget : public QWidget
+diff --git a/tests/screenstreamtest.cpp b/tests/screenstreamtest.cpp
+index 6e9ba96ac77a026deba5789e2316a20d3678c984..33836253640b054d1c860d8997a939e214708f32 100644
+--- a/tests/screenstreamtest.cpp
++++ b/tests/screenstreamtest.cpp
+@@ -381,6 +381,42 @@ private Q_SLOTS:
+         QCOMPARE(unmutedBody.value(QStringLiteral("requestAudio")).toBool(), true);
+     }
+ 
++    void testStartRequestBodyAndPcmTimestampTracker()
++    {
++        const QVariantMap defaultStart = buildStartRequestBody(1920, 1920, 60, 8000, true);
++        QCOMPARE(defaultStart.value(QStringLiteral("autoRouteAudio")).toBool(), true);
++        QCOMPARE(defaultStart.value(QStringLiteral("requestAudio")).toBool(), true);
++
++        const QVariantMap manualStart = buildStartRequestBody(1280, 720, 30, 4000, true, false);
++        QCOMPARE(manualStart.value(QStringLiteral("autoRouteAudio")).toBool(), false);
++
++        // 48 kHz stereo: 960 frames = 3840 bytes = 20 ms
++        PcmTimestampTracker stereoTracker(48000, 2);
++        const auto first = stereoTracker.nextBuffer(3840, 100000000ULL);
++        QVERIFY(first.discont);
++        QCOMPARE(first.ptsNs, quint64(100000000ULL));
++        QCOMPARE(first.durationNs, quint64(20000000ULL));
++
++        // Within 160 ms drift tolerance: continuous sample-clock PTS without discont.
++        const auto second = stereoTracker.nextBuffer(3840, 125000000ULL);
++        QVERIFY(!second.discont);
++        QCOMPARE(second.ptsNs, quint64(120000000ULL));
++        QCOMPARE(second.durationNs, quint64(20000000ULL));
++
++        // Gap > 160 ms triggers resync + DISCONT flag.
++        const auto resynced = stereoTracker.nextBuffer(3840, 500000000ULL);
++        QVERIFY(resynced.discont);
++        QCOMPARE(resynced.ptsNs, quint64(500000000ULL));
++        QCOMPARE(resynced.durationNs, quint64(20000000ULL));
++
++        // Switching to mono: 960 frames = 1920 bytes = 20 ms and resets state.
++        stereoTracker.setFormat(48000, 1);
++        const auto monoFirst = stereoTracker.nextBuffer(1920, 700000000ULL);
++        QVERIFY(monoFirst.discont);
++        QCOMPARE(monoFirst.ptsNs, quint64(700000000ULL));
++        QCOMPARE(monoFirst.durationNs, quint64(20000000ULL));
++    }
++
+     void testPluginMetadataDiscovery()
+     {
+         const QList<KPluginMetaData> plugins = KPluginMetaData::findPlugins(QStringLiteral("kdeconnect"));

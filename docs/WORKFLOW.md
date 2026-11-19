@@ -9,7 +9,7 @@ Every plugin developed under `lmdeuser/kdeconnect-plugins` moves sequentially th
 
 | Contour | Location | Purpose | Allowed Contents |
 | --- | --- | --- | --- |
-| Public Hub | `lmdeuser/kdeconnect-plugins` (`main`) | Engineering harness, `plugins.toml` registry, specs, probes, OBS overlay, Python gate checks | `AGENTS.md`, `plugins.toml`, `.agents/skills/`, `docs/`, `prototype/`, `obs/`, `tools/`, `tests/`, `LICENSES/` |
+| Public Hub | `lmdeuser/kdeconnect-plugins` (`main`) | Engineering harness, `plugins.toml` registry, specs, patches, lockfile, OBS overlay, Python gate checks | `AGENTS.md`, `README.md`, `plugins.toml`, `stack.lock.json`, `patches/`, `.agents/skills/`, `docs/`, `prototype/`, `obs/`, `tools/`, `tests/`, `LICENSES/` |
 | Desktop Upstream | External `kdeconnect-kde` checkout (`work/<plugin_id>`) | Independent upstream C++/Qt/QML branches for `invent.kde.org` | Plugin code, CMake integration, Qt tests, REUSE headers; zero packaging/harness files |
 | Android Upstream | External `kdeconnect-android` checkout (`work/<plugin_id>`) | Independent upstream Kotlin/Android branches; ephemeral `work/continuity-stack` for APK testing | Android plugin code, manifest/permissions, unit tests, REUSE headers |
 | OBS Staging | `home:dwolfF:kdeconnect:staging` (`xUbuntu_26.04`, `x86_64`) | Synthesized `obs/kdeconnect-staging` build, `ctest`, `lintian`, `sourceaccess=disable`, publish disabled | Rebased active `work/<plugin_id>` stack + Debian/OBS overlay |
@@ -23,7 +23,12 @@ Apply `/code-complete` construction, scientific debugging, and verification disc
    - Source `.state/local.env` and verify external upstream revisions.
    - Map reusable plugins (`mousereceiver`, `remotekeyboard`, `remotekeyboardime`, `clipboard`, `share`, `mousepad`, `notifications`).
    - Register the plugin in `plugins.toml` (`status = "planned"` during Gate 0, promoted to `"active"` when ready for integration), finalize `docs/plugins/<plugin_id>/spec.md`, threat/consent model, and authorized Android build route.
-2. **Gate 1 -- Static and Harness Verification**:
+2. **Gate 1 -- Static and Harness Verification (and Public GitHub Sync)**:
+   - Whenever upstream `work/<plugin_id>` branches or specs change, export deterministic patches and update `stack.lock.json`, keeping `README.md` and `docs/plugins/<plugin_id>/spec.md` synchronized:
+     ```bash
+     python3 tools/export_stack_patches.py
+     python3 tools/reproduce_stack.py verify-lock
+     ```
    - Execute with disk-backed `TMPDIR`:
      ```bash
      python3 tools/plugin_registry.py validate
@@ -32,6 +37,7 @@ Apply `/code-complete` construction, scientific debugging, and verification disc
      python3 -m unittest discover -s tests -v
      ```
    - Dry-run multi-branch stack synthesis (`tools/synthesize_android_stack.py --dry-run` / `--desktop --dry-run`) before tagging or syncing revisions.
+   - Commit the verified `lmdeuser/kdeconnect-plugins` changes (`README.md`, `docs/`, `patches/`, `stack.lock.json`, tooling) with author `Dmitriy Volkov <dennshield@duck.com>` and push to `origin/main` on GitHub (`https://github.com/lmdeuser/kdeconnect-plugins.git`), while keeping `invent.kde.org` strictly manual per Gate 5.
 3. **Gate 2 -- Remote OBS Staging Build and Tests** (`.agents/skills/obs-staging-pipeline/SKILL.md`):
    - Sync active desktop branches from `plugins.toml` via `tools/sync-runner.sh` to `~/runners/kdeconnect-plugins` and confirm `tools/run-controller.sh verify-env` passes.
    - Synthesize active `work/<plugin_id>` branches cleanly onto `obs/kdeconnect-staging`, apply the packaging overlay (`obs/` and `debian/`), and upload to `home:dwolfF:kdeconnect:staging`.

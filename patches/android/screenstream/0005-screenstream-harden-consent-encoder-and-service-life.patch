@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 16:20:47 +0500
-Subject: [PATCH 5/6] screenstream: harden consent, encoder, and service
+Subject: [PATCH 5/8] screenstream: harden consent, encoder, and service
  lifecycle guards
 
 

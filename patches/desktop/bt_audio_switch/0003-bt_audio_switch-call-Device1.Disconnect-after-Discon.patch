@@ -1,0 +1,22 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 00:12:54 +0500
+Subject: [PATCH 3/4] bt_audio_switch: call Device1.Disconnect after
+ DisconnectProfile for single-point headsets
+
+
+diff --git a/plugins/bt_audio_switch/btaudioswitchplugin.cpp b/plugins/bt_audio_switch/btaudioswitchplugin.cpp
+index 9636331030ed9812f84f0ce7fda7adacd392c0d3..c1821931cecbe1584e0a7ac3d62d261ab62c9cd0 100644
+--- a/plugins/bt_audio_switch/btaudioswitchplugin.cpp
++++ b/plugins/bt_audio_switch/btaudioswitchplugin.cpp
+@@ -224,6 +224,10 @@ void BtAudioSwitchPlugin::disconnectBluezProfiles(const QString &canonicalMac)
+         QStringLiteral("org.bluez"), devPath, QStringLiteral("org.bluez.Device1"), QStringLiteral("DisconnectProfile"));
+     discHfp << BtAudioSwitch::hfpUuid();
+     QDBusConnection::systemBus().asyncCall(discHfp);
++
++    QDBusMessage discDev = QDBusMessage::createMethodCall(
++        QStringLiteral("org.bluez"), devPath, QStringLiteral("org.bluez.Device1"), QStringLiteral("Disconnect"));
++    QDBusConnection::systemBus().asyncCall(discDev);
+ }
+ 
+ void BtAudioSwitchPlugin::connectDesktopHeadset(const QString &canonicalMac, const QString &reason, quint64 transitionGen)

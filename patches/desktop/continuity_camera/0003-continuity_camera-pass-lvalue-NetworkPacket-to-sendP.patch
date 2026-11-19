@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 16:45:40 +0500
-Subject: [PATCH 3/4] continuity_camera: pass lvalue NetworkPacket to
+Subject: [PATCH 3/6] continuity_camera: pass lvalue NetworkPacket to
  sendPacket
 
 

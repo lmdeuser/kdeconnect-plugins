@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 00:55:52 +0500
+Subject: [PATCH 8/8] screenstream: route active calls to Bluetooth HFP without
+ clearing communication device
+
+
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+index 5a68c53f7af2e6ae7fd2d051ba318abae2573592..7669b9ac351c0dcc364317b275142994dfc79829 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+@@ -845,11 +845,31 @@ class ScreenStreamService : Service() {
+         modeChangedListener = null
+     }
+ 
++    private fun routeCallToBluetoothIfAvailable() {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
++            return
++        }
++        val am = audioManager ?: return
++        try {
++            val btComm = am.availableCommunicationDevices.firstOrNull { info ->
++                info.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
++                    info.type == AudioDeviceInfo.TYPE_BLE_HEADSET
++            } ?: return
++            if (am.communicationDevice?.id != btComm.id) {
++                am.setCommunicationDevice(btComm)
++                Log.i(TAG, "Routed active voice call to Bluetooth communication device")
++            }
++        } catch (e: RuntimeException) {
++            Log.w(TAG, "Unable to route call to Bluetooth communication device: ${e.message}")
++        }
++    }
++
+     private fun handleCallStateChanged() {
+         if (stopping.get() || mediaProjection == null) {
+             return
+         }
+         if (isVoiceCallActive()) {
++            routeCallToBluetoothIfAvailable()
+             if (audioCapturer != null) {
+                 Log.i(TAG, "Voice/VoIP call active; pausing screencast audio capture")
+                 applyAudioEnabledState(
+@@ -906,6 +926,7 @@ class ScreenStreamService : Service() {
+         }
+ 
+         if (isVoiceCallActive()) {
++            routeCallToBluetoothIfAvailable()
+             audioCapturer?.stop()
+             audioCapturer = null
+             activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+@@ -931,13 +952,6 @@ class ScreenStreamService : Service() {
+             return AudioPlaybackCapturer.StartResult(false, AUDIO_REASON_BLUETOOTH_ROUTED)
+         }
+ 
+-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && forceOverrideBluetooth && !isVoiceCallActive()) {
+-            try {
+-                audioManager?.clearCommunicationDevice()
+-            } catch (_: RuntimeException) {
+-            }
+-        }
+-
+         val existing = audioCapturer
+         if (existing != null) {
+             setArbiterScreencastAudioActive(true)

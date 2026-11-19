@@ -17,8 +17,9 @@ This repository (`lmdeuser/kdeconnect-plugins`) is the public engineering harnes
 ## 2. Two-Contour Repository Architecture
 
 1. **Public Harness and Packaging Hub (`lmdeuser/kdeconnect-plugins`)**:
-   - Owns `AGENTS.md`, `plugins.toml`, `.agents/skills/`, `docs/`, `prototype/`, `obs/`, `tools/`, and `tests/`.
+   - Owns `AGENTS.md`, `README.md`, `plugins.toml`, `stack.lock.json`, `patches/`, `.agents/skills/`, `docs/`, `prototype/`, `obs/`, `tools/`, and `tests/`.
    - `plugins.toml` defines every registered plugin/enhancement (`id`, `kind`, `status`, `desktop_branch`, `android_branch`, `spec`, and `.deb` verification metadata).
+   - Whenever `work/<plugin_id>` branches or specs change, run `tools/export_stack_patches.py` and `tools/reproduce_stack.py verify-lock`, keep `README.md` and `docs/plugins/<plugin_id>/spec.md` synchronized, verify Gate 1 hygiene checks, and commit + push the public harness (`README.md`, `docs/`, `patches/`, `stack.lock.json`, tooling) to `origin/main` on GitHub (`https://github.com/lmdeuser/kdeconnect-plugins.git`). Note: pushing to `origin` (`lmdeuser/kdeconnect-plugins`) is separate from upstream `invent.kde.org`, which must never be pushed automatically.
 2. **External Upstream KDE Connect Checkouts (configured in `.state/local.env`)**:
    - Desktop upstream: `https://invent.kde.org/network/kdeconnect-kde.git`
    - Android upstream: `https://invent.kde.org/network/kdeconnect-android.git`

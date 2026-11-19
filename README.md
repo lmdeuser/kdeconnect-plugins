@@ -22,25 +22,25 @@ Six active features defined in [plugins.toml](plugins.toml) make up the continui
 
 ### Screen Stream (`screenstream`)
 
-Streams an Android 11+ display over [H.264](https://www.itu.int/rec/T-REC-H.264) ([MediaProjection](https://developer.android.com/media/grow/media-projection) + [MediaCodec](https://developer.android.com/reference/android/media/MediaCodec)) and eligible playback audio (`pcm_s16le` 48 kHz mono via [AudioPlaybackCapture](https://developer.android.com/media/platform/av-capture)) to an isolated [Qt 6 Widgets](https://doc.qt.io/qt-6/qtwidgets-index.html) and [GStreamer](https://gstreamer.freedesktop.org/) viewer (`kdeconnect-screenstream-viewer`).
+Streams an Android 11+ display over [H.264](https://www.itu.int/rec/T-REC-H.264) ([MediaProjection](https://developer.android.com/media/grow/media-projection) + [MediaCodec](https://developer.android.com/reference/android/media/MediaCodec)) and eligible playback audio (`pcm_s16le_48000_stereo` 48 kHz stereo with automatic mono fallback via [AudioPlaybackCapture](https://developer.android.com/media/platform/av-capture), prioritized audio muxing, and a continuous sample-clock PTS GStreamer jitter queue) to an isolated [Qt 6 Widgets](https://doc.qt.io/qt-6/qtwidgets-index.html) and [GStreamer](https://gstreamer.freedesktop.org/) viewer (`kdeconnect-screenstream-viewer`).
 
 - **Input & sharing:** Reuses KDE Connect's mouse, long-press, scroll, keyboard, clipboard, drag-and-drop file sharing (up to 32 files via `SharePlugin`), and "Open on Phone Screen" notification action.
 - **Wayland window clamping:** Keeps the viewer within monitor work-area bounds across portrait/landscape phone rotations via [KWin Scripting](https://develop.kde.org/docs/plasma/kwin/api/) on Plasma Wayland.
 - **Privacy controls:** Honors [`FLAG_SECURE`](https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE) windows, requires Android's system capture consent per session, and remembers an explicit stop across reconnects.
-- **Live audio toggle:** Switches seamlessly between `Audio: Screencast` and `Audio: Bluetooth` via [`AudioDeviceCallback`](https://developer.android.com/reference/android/media/AudioDeviceCallback) without restarting video.
+- **Zero-config Bluetooth & call handoff:** Switches seamlessly between `Audio: Screencast` and `Audio: Bluetooth` without restarting video, automatically discovers the paired phone across BlueZ `/org/bluez/hci*` adapters to suspend A2DP (`0000110a`) while screencast audio is active, pauses screencast audio during phone/VoIP calls (`audioReason = "call_active"`) while activating the PC's PipeWire `audio-gateway` (HFP-AG `0000111f`) profile for two-way headset calls, and restores Bluetooth on stop.
 
 ### Continuity Camera (`continuity_camera`)
 
 Exposes the paired phone's camera and microphone to Linux desktop apps over Wi-Fi, alongside on-demand photo capture and multi-page document scanning.
 
-- **Userspace PipeWire webcam & mic:** `kdeconnect-continuitycamera-bridge` publishes [PipeWire](https://pipewire.org/) [`pipewiresink`](https://gitlab.freedesktop.org/pipewire/pipewire/-/tree/master/src/gst) sources (`kdeconnect_continuity_camera` and `kdeconnect_continuity_mic`) without requiring a [`v4l2loopback`](https://github.com/v4l2loopback/v4l2loopback) kernel module.
+- **Userspace PipeWire webcam & mic:** `kdeconnect-continuitycamera-bridge` normalizes H.264 video to `video/x-raw,format=I420,framerate=30/1` with `node.driver=true` so WebRTC PipeWire clients (Telegram Desktop, Chrome, Firefox, Zoom, OBS) enumerate `KDE Connect Camera (<Phone>)` natively, automatically tees `YUY2` into any writable [`v4l2loopback`](https://github.com/v4l2loopback/v4l2loopback) `/dev/videoN` device for legacy V4L2 apps when present (falling back cleanly to userspace PipeWire-only), and buffers 48 kHz 20 ms `MIC` audio through a sample-clock PTS PipeWire jitter queue (`node.latency = 960/48000`).
 - **Camera2 & PDF capture:** Streams [Camera2](https://developer.android.com/media/camera/camera2) video and optional [AudioRecord](https://developer.android.com/reference/android/media/AudioRecord) audio with front/rear lens switching, or builds multi-page scanned PDFs with Android [`PdfDocument`](https://developer.android.com/reference/android/graphics/pdf/PdfDocument).
 
 ### Bluetooth Audio Switch (`bt_audio_switch`)
 
 Coordinates [Bluetooth A2DP and HFP](https://www.bluetooth.com/specifications/specs/) headset ownership between Ubuntu and Android for explicitly allowlisted MAC addresses.
 
-- **Handoff with hysteresis:** Uses [BlueZ (`org.bluez.Device1`)](https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc/org.bluez.Device.rst) with PipeWire sink routing on Ubuntu and Android Bluetooth profile proxies, guarded by a 3000 ms cooldown against ping-pong reconnects.
+- **Handoff with hysteresis:** Uses [BlueZ (`org.bluez.Device1`)](https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc/org.bluez.Device.rst) with automatic BlueZ device path resolution across `/org/bluez/hci*` adapters, `DisconnectProfile` + full link `Disconnect()` on release so single-point headsets reconnect to the phone, and PipeWire sink routing on Ubuntu alongside Android Bluetooth profile proxies, guarded by a 3000 ms cooldown against ping-pong reconnects.
 - **Screencast audio arbitration:** Suppresses automatic phone `media` headset claims while Screen Stream audio is active on the PC so sound never plays on both routes at once.
 
 ### Image Clipboard (`clipboard_images`)
@@ -154,7 +154,7 @@ Because of the `.debug` suffix, `Debug KDE Connect` installs alongside the Googl
 3. Switch audio routing live without stopping video or re-prompting capture consent:
    - **Desktop viewer toolbar:** toggle between **`Audio: Screencast`** and **`Audio: Bluetooth`**.
    - **Android Screen stream plugin:** tap **`Route audio to Bluetooth`** or **`Route audio to PC screencast`**.
-   - **Automatic Bluetooth handoff:** connecting or routing to a Bluetooth audio device switches `ScreenStreamService` to `bluetooth_routed` via [`AudioDeviceCallback`](https://developer.android.com/reference/android/media/AudioDeviceCallback); while PC screencast audio is active, `BtAudioSwitchPlugin` suppresses automatic `media` claims so playback never plays on both routes at once.
+   - **Automatic Bluetooth & call handoff:** zero-config discovery suspends phone-to-PC A2DP (`0000110a`) during 48 kHz stereo screencast, pauses screencast audio during active phone/VoIP calls (`audioReason = "call_active"`) while activating the PC's PipeWire `audio-gateway` (HFP-AG `0000111f`) profile for two-way calls, restores Bluetooth automatically on stop, and coordinates [`AudioDeviceCallback`](https://developer.android.com/reference/android/media/AudioDeviceCallback) and `BtAudioSwitchPlugin` so playback never plays on both routes at once.
 
 ### Phone webcam and document scanner (`Continuity Camera`)
 

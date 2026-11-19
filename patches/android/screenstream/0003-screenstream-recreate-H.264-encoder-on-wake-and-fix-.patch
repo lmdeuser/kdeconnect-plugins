@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 13:47:02 +0500
-Subject: [PATCH 3/6] screenstream: recreate H.264 encoder on wake and fix
+Subject: [PATCH 3/8] screenstream: recreate H.264 encoder on wake and fix
  monotonic clock base
 
 

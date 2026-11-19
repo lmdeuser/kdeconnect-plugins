@@ -1,0 +1,1055 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 00:08:56 +0500
+Subject: [PATCH 7/8] screenstream: switch to 48 kHz stereo audio, priority
+ queue, and call-safe BT auto-routing
+
+
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt
+index dbfb3069bd6c73edf39deacdeb4d59cec63aea3c..b6c1f5c55f78b0fe273e539a455d6051b2b1c252 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt
+@@ -16,6 +16,7 @@ import android.media.AudioPlaybackCaptureConfiguration
+ import android.media.AudioRecord
+ import android.media.projection.MediaProjection
+ import android.os.Build
++import android.os.Process
+ import android.util.Log
+ import androidx.annotation.RequiresApi
+ import androidx.core.content.ContextCompat
+@@ -34,6 +35,13 @@ class AudioPlaybackCapturer(
+     data class StartResult(
+         val available: Boolean,
+         val reason: String,
++        val codec: String = ScreenStreamProtocol.AUDIO_CODEC_NONE,
++    )
++
++    private data class RecorderSetup(
++        val recorder: AudioRecord,
++        val chunkSamples: Int,
++        val codec: String,
+     )
+ 
+     private var audioRecord: AudioRecord? = null
+@@ -47,47 +55,25 @@ class AudioPlaybackCapturer(
+         }
+ 
+         return try {
+-            val minBytes = AudioRecord.getMinBufferSize(
+-                SAMPLE_RATE_HZ,
+-                AudioFormat.CHANNEL_IN_MONO,
+-                AudioFormat.ENCODING_PCM_16BIT,
+-            )
+-            if (minBytes <= 0) {
+-                return StartResult(available = false, reason = "Incompatible audio capture buffer on device")
+-            }
+-
+             val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                 .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                 .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                 .build()
+ 
+-            val format = AudioFormat.Builder()
+-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+-                .setSampleRate(SAMPLE_RATE_HZ)
+-                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
+-                .build()
+-
+-            val recorder = AudioRecord.Builder()
+-                .setAudioFormat(format)
+-                .setBufferSizeInBytes(max(minBytes, CHUNK_BYTES * 4))
+-                .setAudioPlaybackCaptureConfig(captureConfig)
+-                .build()
+-
+-            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+-                recorder.release()
+-                return StartResult(available = false, reason = "AudioRecord failed to initialize")
+-            }
++            val setup = createRecorder(captureConfig, AudioFormat.CHANNEL_IN_STEREO, 2, ScreenStreamProtocol.AUDIO_CODEC_PCM_S16LE_STEREO)
++                ?: createRecorder(captureConfig, AudioFormat.CHANNEL_IN_MONO, 1, ScreenStreamProtocol.AUDIO_CODEC_PCM_S16LE_MONO)
++                ?: return StartResult(available = false, reason = "AudioRecord failed to initialize")
+ 
+-            audioRecord = recorder
++            audioRecord = setup.recorder
+             running.set(true)
+-            recorder.startRecording()
++            setup.recorder.startRecording()
+ 
+-            val thread = Thread({ readLoop(recorder) }, "ScreenStreamAudio")
++            val thread = Thread({ readLoop(setup.recorder, setup.chunkSamples) }, "ScreenStreamAudio")
+             workerThread = thread
+             thread.start()
+ 
+-            StartResult(available = true, reason = "")
++            StartResult(available = true, reason = "", codec = setup.codec)
+         } catch (e: SecurityException) {
+             Log.w(TAG, "Audio capture permission error", e)
+             stop()
+@@ -99,6 +85,50 @@ class AudioPlaybackCapturer(
+         }
+     }
+ 
++    @SuppressLint("MissingPermission")
++    private fun createRecorder(
++        captureConfig: AudioPlaybackCaptureConfiguration,
++        channelMask: Int,
++        channels: Int,
++        codec: String,
++    ): RecorderSetup? {
++        val minBytes = AudioRecord.getMinBufferSize(
++            SAMPLE_RATE_HZ,
++            channelMask,
++            AudioFormat.ENCODING_PCM_16BIT,
++        )
++        if (minBytes <= 0) {
++            return null
++        }
++
++        val chunkSamples = CHUNK_FRAMES * channels
++        val chunkBytes = chunkSamples * 2
++        val format = AudioFormat.Builder()
++            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++            .setSampleRate(SAMPLE_RATE_HZ)
++            .setChannelMask(channelMask)
++            .build()
++
++        val recorder = try {
++            AudioRecord.Builder()
++                .setAudioFormat(format)
++                .setBufferSizeInBytes(max(minBytes * 2, chunkBytes * 6))
++                .setAudioPlaybackCaptureConfig(captureConfig)
++                .build()
++        } catch (e: SecurityException) {
++            throw e
++        } catch (e: RuntimeException) {
++            Log.w(TAG, "AudioRecord init failed for $codec: ${e.message}")
++            return null
++        }
++
++        if (recorder.state != AudioRecord.STATE_INITIALIZED) {
++            recorder.release()
++            return null
++        }
++        return RecorderSetup(recorder = recorder, chunkSamples = chunkSamples, codec = codec)
++    }
++
+     fun stop() {
+         running.set(false)
+         val recorder = audioRecord
+@@ -121,9 +151,13 @@ class AudioPlaybackCapturer(
+         recorder?.release()
+     }
+ 
+-    private fun readLoop(recorder: AudioRecord) {
+-        val samples = ShortArray(CHUNK_SAMPLES)
+-        val pcmBytes = ByteArray(CHUNK_BYTES)
++    private fun readLoop(recorder: AudioRecord, chunkSamples: Int) {
++        try {
++            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
++        } catch (_: Throwable) {
++        }
++        val samples = ShortArray(chunkSamples)
++        val pcmBytes = ByteArray(chunkSamples * 2)
+         try {
+             while (running.get() && !muxerQueue.isClosed) {
+                 val readCount = recorder.read(samples, 0, samples.size)
+@@ -166,7 +200,6 @@ class AudioPlaybackCapturer(
+     companion object {
+         private const val TAG = "AudioPlaybackCapturer"
+         const val SAMPLE_RATE_HZ = 48000
+-        private const val CHUNK_SAMPLES = 960
+-        private const val CHUNK_BYTES = CHUNK_SAMPLES * 2
++        private const val CHUNK_FRAMES = 960
+     }
+ }
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt
+index 14021b7aaa35a328ada03815921993900bb69b27..7f73cf38b3c9954b83cde76d9e25a71446a6ab59 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt
+@@ -27,6 +27,7 @@ class ScreenStreamPermissionActivity : AppCompatActivity() {
+     private var maxFps: Int = ScreenStreamProtocol.DEFAULT_MAX_FPS
+     private var maxBitrateKbps: Int = ScreenStreamProtocol.DEFAULT_BITRATE_KBPS
+     private var requestAudio: Boolean = true
++    private var autoRouteAudio: Boolean = true
+     private var keepScreenOn: Boolean = true
+     private var handledResult = false
+ 
+@@ -48,6 +49,7 @@ class ScreenStreamPermissionActivity : AppCompatActivity() {
+                     maxFps = maxFps,
+                     maxBitrateKbps = maxBitrateKbps,
+                     requestAudio = requestAudio,
++                    autoRouteAudio = autoRouteAudio,
+                 ),
+                 keepScreenOn = keepScreenOn,
+             )
+@@ -70,6 +72,7 @@ class ScreenStreamPermissionActivity : AppCompatActivity() {
+         maxFps = intent.getIntExtra(EXTRA_MAX_FPS, ScreenStreamProtocol.DEFAULT_MAX_FPS)
+         maxBitrateKbps = intent.getIntExtra(EXTRA_MAX_BITRATE_KBPS, ScreenStreamProtocol.DEFAULT_BITRATE_KBPS)
+         requestAudio = intent.getBooleanExtra(EXTRA_REQUEST_AUDIO, true)
++        autoRouteAudio = intent.getBooleanExtra(EXTRA_AUTO_ROUTE_AUDIO, true)
+         keepScreenOn = intent.getBooleanExtra(EXTRA_KEEP_SCREEN_ON, true)
+ 
+         if (deviceId.isNullOrEmpty()) {
+@@ -118,6 +121,7 @@ class ScreenStreamPermissionActivity : AppCompatActivity() {
+         const val EXTRA_MAX_FPS = "screenstream_max_fps"
+         const val EXTRA_MAX_BITRATE_KBPS = "screenstream_max_bitrate_kbps"
+         const val EXTRA_REQUEST_AUDIO = "screenstream_request_audio"
++        const val EXTRA_AUTO_ROUTE_AUDIO = "screenstream_auto_route_audio"
+         const val EXTRA_KEEP_SCREEN_ON = "screenstream_keep_screen_on"
+ 
+         fun createIntent(
+@@ -133,6 +137,7 @@ class ScreenStreamPermissionActivity : AppCompatActivity() {
+                 putExtra(EXTRA_MAX_FPS, params.maxFps)
+                 putExtra(EXTRA_MAX_BITRATE_KBPS, params.maxBitrateKbps)
+                 putExtra(EXTRA_REQUEST_AUDIO, params.requestAudio)
++                putExtra(EXTRA_AUTO_ROUTE_AUDIO, params.autoRouteAudio)
+                 putExtra(EXTRA_KEEP_SCREEN_ON, keepScreenOn)
+             }
+         }
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
+index 9302ba02447899b11e951e794808f0fafc714e7d..93fa6808198d75e376c865f8c8913c7aba152372 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
+@@ -61,6 +61,7 @@ class ScreenStreamPlugin : Plugin() {
+ 
+     private var audioAvailable: Boolean = false
+     private var audioReason: String = ""
++    private var activeAudioCodec: String = ScreenStreamProtocol.AUDIO_CODEC_NONE
+     private var lastDisplayWidth: Int = 0
+     private var lastDisplayHeight: Int = 0
+     private var lastRotationDegrees: Int = 0
+@@ -169,7 +170,10 @@ class ScreenStreamPlugin : Plugin() {
+         } else if (autoStart) {
+             val audioWanted = isAudioEnabledInSettings()
+             initiateCapture(
+-                params = ScreenStreamProtocol.StartParams(requestAudio = audioWanted),
++                params = ScreenStreamProtocol.StartParams(
++                    requestAudio = audioWanted,
++                    autoRouteAudio = isAutoRouteAudioEnabledInSettings(),
++                ),
+                 uiActivity = null,
+                 isReconnectAttempt = false,
+             )
+@@ -203,6 +207,7 @@ class ScreenStreamPlugin : Plugin() {
+             maxFps = np.getIntOrNull("maxFps"),
+             maxBitrateKbps = np.getIntOrNull("maxBitrateKbps"),
+             requestAudio = if (np.has("requestAudio")) np.getBoolean("requestAudio", true) else null,
++            autoRouteAudio = if (np.has("autoRouteAudio")) np.getBoolean("autoRouteAudio", true) else null,
+             explicitStop = if (np.has("explicitStop")) np.getBoolean("explicitStop", true) else null,
+         ) ?: return false
+ 
+@@ -242,6 +247,7 @@ class ScreenStreamPlugin : Plugin() {
+                     synchronized(stateLock) {
+                         audioAvailable = false
+                         audioReason = if (request.enabled) "" else "bluetooth_routed"
++                        activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+                     }
+                     sendStatePacket()
+                 }
+@@ -249,7 +255,11 @@ class ScreenStreamPlugin : Plugin() {
+             is ScreenStreamProtocol.ControlRequest.Start -> {
+                 wakeDeviceScreen()
+                 val effectiveAudio = request.params.requestAudio && isAudioEnabledInSettings()
+-                val effectiveParams = request.params.copy(requestAudio = effectiveAudio)
++                val effectiveAutoRoute = request.params.autoRouteAudio && isAutoRouteAudioEnabledInSettings()
++                val effectiveParams = request.params.copy(
++                    requestAudio = effectiveAudio,
++                    autoRouteAudio = effectiveAutoRoute,
++                )
+                 initiateCapture(params = effectiveParams, uiActivity = null)
+             }
+             is ScreenStreamProtocol.ControlRequest.Stop -> {
+@@ -261,7 +271,10 @@ class ScreenStreamPlugin : Plugin() {
+ 
+     private fun startConsentFlowFromUi(parentActivity: Activity) {
+         syncPreferencesIntoTracker()
+-        val params = ScreenStreamProtocol.StartParams(requestAudio = isAudioEnabledInSettings())
++        val params = ScreenStreamProtocol.StartParams(
++            requestAudio = isAudioEnabledInSettings(),
++            autoRouteAudio = isAutoRouteAudioEnabledInSettings(),
++        )
+         initiateCapture(params = params, uiActivity = parentActivity)
+     }
+ 
+@@ -278,6 +291,7 @@ class ScreenStreamPlugin : Plugin() {
+             activeStreamPacket = null
+             activeMuxerQueue = null
+             audioAvailable = false
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+             Triple(active, pkt, q)
+         }
+         persistExplicitStop(true)
+@@ -300,6 +314,7 @@ class ScreenStreamPlugin : Plugin() {
+             activeStreamPacket = null
+             activeMuxerQueue = null
+             audioAvailable = false
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+             if (explicitStop) {
+                 sessionTracker.onExplicitStop("remote_stopped")
+             }
+@@ -335,11 +350,13 @@ class ScreenStreamPlugin : Plugin() {
+                 sessionTracker.onError()
+                 audioAvailable = false
+                 audioReason = ""
++                activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+                 failFastReason = "Notification permission required to request screen capture from background"
+                 false
+             } else {
+                 sessionTracker.onStartRequested(isReconnectAttempt = isReconnectAttempt)
+                 audioReason = ""
++                activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+                 true
+             }
+         }
+@@ -422,6 +439,7 @@ class ScreenStreamPlugin : Plugin() {
+         synchronized(stateLock) {
+             sessionTracker.onExplicitStop("consent_denied")
+             audioReason = ""
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+         }
+         sendStoppedPacketAndClose(explicitStop = false, reason = "consent_denied", packet = null, queue = null)
+         device.onPluginsChanged()
+@@ -437,6 +455,7 @@ class ScreenStreamPlugin : Plugin() {
+         fps: Int,
+         audioAvailable: Boolean,
+         audioReason: String,
++        audioCodec: String,
+     ) {
+         if (!isDeviceInitialized) {
+             muxerQueue.close()
+@@ -453,6 +472,7 @@ class ScreenStreamPlugin : Plugin() {
+             rotationDegrees = rotationDegrees,
+         )
+         val validRotation = geomFields.getValue("rotation")
++        val resolvedCodec = if (audioAvailable) audioCodec else ScreenStreamProtocol.AUDIO_CODEC_NONE
+         synchronized(stateLock) {
+             this.activeMuxerQueue = muxerQueue
+             this.lastDisplayWidth = displayWidth
+@@ -460,6 +480,7 @@ class ScreenStreamPlugin : Plugin() {
+             this.lastRotationDegrees = validRotation
+             this.audioAvailable = audioAvailable
+             this.audioReason = audioReason
++            this.activeAudioCodec = resolvedCodec
+             sessionTracker.onStreamingStarted()
+         }
+         persistExplicitStop(false)
+@@ -468,11 +489,7 @@ class ScreenStreamPlugin : Plugin() {
+         val streamNp = NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
+             this["event"] = "stream_open"
+             this["videoCodec"] = ScreenStreamProtocol.VIDEO_CODEC_H264_ANNEXB
+-            this["audioCodec"] = if (audioAvailable) {
+-                ScreenStreamProtocol.AUDIO_CODEC_PCM_S16LE
+-            } else {
+-                ScreenStreamProtocol.AUDIO_CODEC_NONE
+-            }
++            this["audioCodec"] = resolvedCodec
+             applyGeometryFields(this, geomFields)
+             this["fps"] = fps
+             payload = NetworkPacket.Payload(muxerQueue, -1L)
+@@ -513,11 +530,12 @@ class ScreenStreamPlugin : Plugin() {
+         sendStatePacket()
+     }
+ 
+-    internal fun onServiceAudioStatusChanged(available: Boolean, reason: String) {
++    internal fun onServiceAudioStatusChanged(available: Boolean, reason: String, audioCodec: String) {
+         if (!isDeviceInitialized) return
+         synchronized(stateLock) {
+             audioAvailable = available
+             audioReason = reason
++            activeAudioCodec = if (available) audioCodec else ScreenStreamProtocol.AUDIO_CODEC_NONE
+         }
+         sendStatePacket()
+         device.onPluginsChanged()
+@@ -535,6 +553,7 @@ class ScreenStreamPlugin : Plugin() {
+             activeMuxerQueue = null
+             activeStreamPacket = null
+             audioAvailable = false
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+             if (explicitStop || reason != "stream_closed") {
+                 sessionTracker.onExplicitStop(reason)
+             }
+@@ -560,6 +579,7 @@ class ScreenStreamPlugin : Plugin() {
+             val pkt = activeStreamPacket
+             activeStreamPacket = null
+             audioAvailable = false
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+             sessionTracker.onError()
+             pkt
+         }
+@@ -586,6 +606,7 @@ class ScreenStreamPlugin : Plugin() {
+                 activeStreamPacket != null ||
+                 activeMuxerQueue != null
+             audioAvailable = false
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+             active
+         }
+         if (isDeviceInitialized && shouldStopService) {
+@@ -634,7 +655,10 @@ class ScreenStreamPlugin : Plugin() {
+             return
+         }
+         initiateCapture(
+-            params = ScreenStreamProtocol.StartParams(requestAudio = isAudioEnabledInSettings()),
++            params = ScreenStreamProtocol.StartParams(
++                requestAudio = isAudioEnabledInSettings(),
++                autoRouteAudio = isAutoRouteAudioEnabledInSettings(),
++            ),
+             uiActivity = null,
+             isReconnectAttempt = true,
+         )
+@@ -714,6 +738,7 @@ class ScreenStreamPlugin : Plugin() {
+         val explicitStop: Boolean,
+         val audioAvailable: Boolean,
+         val audioReason: String,
++        val audioCodec: String,
+         val displayWidth: Int,
+         val displayHeight: Int,
+         val rotationDegrees: Int,
+@@ -732,6 +757,7 @@ class ScreenStreamPlugin : Plugin() {
+                 explicitStop = sessionTracker.explicitStop,
+                 audioAvailable = false,
+                 audioReason = audioReason,
++                audioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE,
+                 displayWidth = lastDisplayWidth,
+                 displayHeight = lastDisplayHeight,
+                 rotationDegrees = lastRotationDegrees,
+@@ -750,6 +776,7 @@ class ScreenStreamPlugin : Plugin() {
+                 explicitStop = sessionTracker.explicitStop,
+                 audioAvailable = audioAvailable,
+                 audioReason = audioReason,
++                audioCodec = if (audioAvailable) activeAudioCodec else ScreenStreamProtocol.AUDIO_CODEC_NONE,
+                 displayWidth = lastDisplayWidth,
+                 displayHeight = lastDisplayHeight,
+                 rotationDegrees = lastRotationDegrees,
+@@ -772,6 +799,7 @@ class ScreenStreamPlugin : Plugin() {
+             }
+             this["audioAvailable"] = snap.audioAvailable
+             this["audioReason"] = snap.audioReason
++            this["audioCodec"] = snap.audioCodec
+             this["accessibilityEnabled"] = accessibilityEnabled
+             this["displayWidth"] = snap.displayWidth
+             this["displayHeight"] = snap.displayHeight
+@@ -830,6 +858,13 @@ class ScreenStreamPlugin : Plugin() {
+         )
+     }
+ 
++    private fun isAutoRouteAudioEnabledInSettings(): Boolean {
++        return preferences.getBoolean(
++            context.getString(R.string.screenstream_pref_auto_route_audio_key),
++            true,
++        )
++    }
++
+     private fun isKeepScreenOnEnabledInSettings(): Boolean {
+         return preferences.getBoolean(
+             context.getString(R.string.screenstream_pref_keep_screen_on_key),
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt
+index d124d5ced1645f3702cacd3f7de294dda2d794b0..c770ea826cfd0e34688de34d7ea0823c47cc4c2b 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt
+@@ -10,7 +10,7 @@ import java.io.ByteArrayOutputStream
+ import java.io.InputStream
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
+-import java.util.ArrayDeque
++import java.util.LinkedList
+ import java.util.concurrent.locks.ReentrantLock
+ import kotlin.concurrent.withLock
+ import kotlin.math.max
+@@ -36,7 +36,9 @@ object ScreenStreamProtocol {
+     const val FLAG_VALID_MASK = 0x03
+ 
+     const val VIDEO_CODEC_H264_ANNEXB = "h264-annexb"
+-    const val AUDIO_CODEC_PCM_S16LE = "pcm_s16le_48000_mono"
++    const val AUDIO_CODEC_PCM_S16LE_STEREO = "pcm_s16le_48000_stereo"
++    const val AUDIO_CODEC_PCM_S16LE_MONO = "pcm_s16le_48000_mono"
++    const val AUDIO_CODEC_PCM_S16LE = AUDIO_CODEC_PCM_S16LE_STEREO
+     const val AUDIO_CODEC_NONE = "none"
+ 
+     const val DEFAULT_MAX_WIDTH = 1920
+@@ -87,6 +89,7 @@ object ScreenStreamProtocol {
+         val maxFps: Int = DEFAULT_MAX_FPS,
+         val maxBitrateKbps: Int = DEFAULT_BITRATE_KBPS,
+         val requestAudio: Boolean = true,
++        val autoRouteAudio: Boolean = true,
+     )
+ 
+     sealed class ControlRequest {
+@@ -158,6 +161,7 @@ object ScreenStreamProtocol {
+         maxFps: Int? = null,
+         maxBitrateKbps: Int? = null,
+         requestAudio: Boolean? = null,
++        autoRouteAudio: Boolean? = null,
+         explicitStop: Boolean? = null,
+     ): ControlRequest? {
+         if (rawJsonBytes <= 0 || rawJsonBytes > MAX_CONTROL_JSON_BYTES || action == null) {
+@@ -175,6 +179,7 @@ object ScreenStreamProtocol {
+                 val clampedFps = (maxFps ?: DEFAULT_MAX_FPS).coerceIn(5, 60)
+                 val clampedBitrate = (maxBitrateKbps ?: DEFAULT_BITRATE_KBPS).coerceIn(500, 20000)
+                 val audio = requestAudio ?: true
++                val autoRoute = autoRouteAudio ?: true
+                 ControlRequest.Start(
+                     StartParams(
+                         maxWidth = clampedW,
+@@ -182,6 +187,7 @@ object ScreenStreamProtocol {
+                         maxFps = clampedFps,
+                         maxBitrateKbps = clampedBitrate,
+                         requestAudio = audio,
++                        autoRouteAudio = autoRoute,
+                     )
+                 )
+             }
+@@ -355,7 +361,7 @@ class StreamMuxerQueue(
+ 
+     private val lock = ReentrantLock()
+     private val notEmpty = lock.newCondition()
+-    private val queue = ArrayDeque<QueuedPacket>()
++    private val queue = LinkedList<QueuedPacket>()
+     private var currentChunk: ByteArray? = null
+     private var currentOffset = 0
+     private var queuedVideoFrames = 0
+@@ -471,7 +477,7 @@ class StreamMuxerQueue(
+                     break
+                 }
+             }
+-            queue.addLast(
++            insertAudioPacketLocked(
+                 QueuedPacket(
+                     kind = ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK,
+                     isKeyframe = false,
+@@ -581,8 +587,22 @@ class StreamMuxerQueue(
+         callbackToRun?.invoke()
+     }
+ 
++    private fun insertAudioPacketLocked(pkt: QueuedPacket) {
++        val it = queue.listIterator()
++        while (it.hasNext()) {
++            val existing = it.next()
++            if (existing.kind == ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT ||
++                existing.kind == ScreenStreamProtocol.FrameKind.CONTROL_EOS
++            ) {
++                it.previous()
++                break
++            }
++        }
++        it.add(pkt)
++    }
++
+     private fun purgeQueuedNonKeyframesLocked() {
+-        val retained = ArrayDeque<QueuedPacket>(queue.size)
++        val retained = LinkedList<QueuedPacket>()
+         for (pkt in queue) {
+             if (pkt.kind == ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT && !pkt.isKeyframe) {
+                 queuedVideoFrames -= 1
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+index 0eae973a0667bda5b34ae1b445f10ca46b64dd4d..5a68c53f7af2e6ae7fd2d051ba318abae2573592 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+@@ -18,9 +18,11 @@ import android.content.pm.ServiceInfo
+ import android.graphics.Rect
+ import android.hardware.display.DisplayManager
+ import android.hardware.display.VirtualDisplay
++import android.media.AudioAttributes
+ import android.media.AudioDeviceCallback
+ import android.media.AudioDeviceInfo
+ import android.media.AudioManager
++import android.media.AudioPlaybackConfiguration
+ import android.media.projection.MediaProjection
+ import android.media.projection.MediaProjectionManager
+ import android.os.Build
+@@ -75,10 +77,19 @@ class ScreenStreamService : Service() {
+     private var muxerQueue: StreamMuxerQueue? = null
+     private var activeProjectionCallback: MediaProjection.Callback? = null
+     private var audioDeviceCallbackRegistered: Boolean = false
++    private var callObserversRegistered: Boolean = false
++    private var audioPlaybackCallback: AudioManager.AudioPlaybackCallback? = null
++    private var modeChangedListener: Any? = null
+ 
+     @Volatile
+     private var audioRequestedByUser: Boolean = true
+ 
++    @Volatile
++    private var forceOverrideBluetoothForSession: Boolean = true
++
++    @Volatile
++    private var activeAudioCodec: String = ScreenStreamProtocol.AUDIO_CODEC_NONE
++
+     @Volatile
+     private var sessionGeneration: Long = 0L
+ 
+@@ -155,9 +166,13 @@ class ScreenStreamService : Service() {
+             if (stopping.get() || mediaProjection == null || addedDevices.isNullOrEmpty()) {
+                 return
+             }
+-            if (addedDevices.any { isBluetoothAudioSink(it) } && audioCapturer != null) {
+-                Log.i(TAG, "Bluetooth audio sink connected during stream; routing audio to Bluetooth")
+-                applyAudioEnabledState(enabled = false, reasonWhenDisabled = AUDIO_REASON_BLUETOOTH_ROUTED)
++            if (addedDevices.any { isBluetoothAudioSink(it) } &&
++                audioCapturer != null &&
++                (!forceOverrideBluetoothForSession || isVoiceCallActive())
++            ) {
++                val reason = if (isVoiceCallActive()) AUDIO_REASON_CALL_ACTIVE else AUDIO_REASON_BLUETOOTH_ROUTED
++                Log.i(TAG, "Bluetooth audio sink connected during stream; routing audio to $reason")
++                applyAudioEnabledState(enabled = false, reasonWhenDisabled = reason)
+             }
+         }
+ 
+@@ -168,10 +183,15 @@ class ScreenStreamService : Service() {
+             if (removedDevices.any { isBluetoothAudioSink(it) } &&
+                 audioRequestedByUser &&
+                 !hasConnectedBluetoothAudioOutput() &&
++                !isVoiceCallActive() &&
+                 audioCapturer == null
+             ) {
+                 Log.i(TAG, "Bluetooth audio sink disconnected; resuming screencast audio capture")
+-                applyAudioEnabledState(enabled = true, reasonWhenDisabled = "")
++                applyAudioEnabledState(
++                    enabled = true,
++                    reasonWhenDisabled = "",
++                    forceOverrideBluetooth = forceOverrideBluetoothForSession,
++                )
+             }
+         }
+     }
+@@ -213,6 +233,7 @@ class ScreenStreamService : Service() {
+                     maxFps = intent.getIntExtra(EXTRA_MAX_FPS, ScreenStreamProtocol.DEFAULT_MAX_FPS).coerceIn(5, 60),
+                     maxBitrateKbps = intent.getIntExtra(EXTRA_MAX_BITRATE_KBPS, ScreenStreamProtocol.DEFAULT_BITRATE_KBPS).coerceIn(500, 20000),
+                     requestAudio = intent.getBooleanExtra(EXTRA_REQUEST_AUDIO, true),
++                    autoRouteAudio = intent.getBooleanExtra(EXTRA_AUTO_ROUTE_AUDIO, true),
+                 )
+                 val keepScreenOn = intent.getBooleanExtra(EXTRA_KEEP_SCREEN_ON, true)
+ 
+@@ -339,41 +360,20 @@ class ScreenStreamService : Service() {
+                 screenStateReceiverRegistered = true
+             }
+ 
+-            var audioAvailable = false
+-            var audioReason = if (params.requestAudio) "" else AUDIO_REASON_DISABLED
+             audioRequestedByUser = params.requestAudio
++            forceOverrideBluetoothForSession = params.autoRouteAudio
+             if (!audioDeviceCallbackRegistered) {
+                 audioManager?.registerAudioDeviceCallback(audioDeviceCallback, mainHandler)
+                 audioDeviceCallbackRegistered = true
+             }
+-            if (params.requestAudio && hasConnectedBluetoothAudioOutput()) {
+-                audioReason = AUDIO_REASON_BLUETOOTH_ROUTED
+-                setArbiterScreencastAudioActive(false)
+-            } else if (params.requestAudio) {
+-                val capturer = AudioPlaybackCapturer(
+-                    context = this,
+-                    mediaProjection = projection,
+-                    muxerQueue = queue,
+-                    lastPtsUs = lastPtsUs,
+-                    onAudioStatusChanged = { avail, reason ->
+-                        mainHandler.post {
+-                            setArbiterScreencastAudioActive(avail)
+-                            KdeConnect.getInstance()
+-                                .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
+-                                ?.onServiceAudioStatusChanged(avail, reason)
+-                        }
+-                    },
+-                )
+-                val audioRes = capturer.start()
+-                audioAvailable = audioRes.available
+-                audioReason = audioRes.reason
+-                setArbiterScreencastAudioActive(audioAvailable)
+-                if (audioAvailable) {
+-                    audioCapturer = capturer
+-                }
+-            } else {
+-                setArbiterScreencastAudioActive(false)
+-            }
++            registerCallAudioObservers()
++
++            val audioRes = applyAudioEnabledState(
++                enabled = params.requestAudio,
++                reasonWhenDisabled = if (params.requestAudio) "" else AUDIO_REASON_DISABLED,
++                forceOverrideBluetooth = forceOverrideBluetoothForSession,
++                notifyPlugin = false,
++            )
+ 
+             currentInstance = this
+             if (keepScreenOn) {
+@@ -387,8 +387,9 @@ class ScreenStreamService : Service() {
+                 streamHeight = streamH,
+                 rotationDegrees = geom.rotationDegrees,
+                 fps = params.maxFps,
+-                audioAvailable = audioAvailable,
+-                audioReason = audioReason,
++                audioAvailable = audioRes.available,
++                audioReason = audioRes.reason,
++                audioCodec = audioRes.codec,
+             )
+         } catch (e: Exception) {
+             Log.e(TAG, "Failed to start MediaProjection capture", e)
+@@ -672,6 +673,8 @@ class ScreenStreamService : Service() {
+             audioDeviceCallbackRegistered = false
+             audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
+         }
++        unregisterCallAudioObservers()
++        activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+         setArbiterScreencastAudioActive(false)
+ 
+         audioCapturer?.stop()
+@@ -786,6 +789,87 @@ class ScreenStreamService : Service() {
+         return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { isBluetoothAudioSink(it) }
+     }
+ 
++    private fun isVoiceCallActive(): Boolean {
++        val am = audioManager ?: return false
++        val mode = am.mode
++        if (mode == AudioManager.MODE_IN_CALL ||
++            mode == AudioManager.MODE_IN_COMMUNICATION ||
++            mode == AudioManager.MODE_CALL_SCREENING
++        ) {
++            return true
++        }
++        return am.activePlaybackConfigurations.any { cfg ->
++            val usage = cfg.audioAttributes.usage
++            usage == AudioAttributes.USAGE_VOICE_COMMUNICATION ||
++                usage == AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING
++        }
++    }
++
++    private fun registerCallAudioObservers() {
++        if (callObserversRegistered) {
++            return
++        }
++        val am = audioManager ?: return
++        callObserversRegistered = true
++        val playbackCb = object : AudioManager.AudioPlaybackCallback() {
++            override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>?) {
++                handleCallStateChanged()
++            }
++        }
++        audioPlaybackCallback = playbackCb
++        am.registerAudioPlaybackCallback(playbackCb, mainHandler)
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++            val modeListener = AudioManager.OnModeChangedListener {
++                handleCallStateChanged()
++            }
++            modeChangedListener = modeListener
++            am.addOnModeChangedListener(mainExecutor, modeListener)
++        }
++    }
++
++    private fun unregisterCallAudioObservers() {
++        if (!callObserversRegistered) {
++            return
++        }
++        callObserversRegistered = false
++        val am = audioManager
++        audioPlaybackCallback?.let { cb ->
++            am?.unregisterAudioPlaybackCallback(cb)
++        }
++        audioPlaybackCallback = null
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
++            (modeChangedListener as? AudioManager.OnModeChangedListener)?.let { listener ->
++                am?.removeOnModeChangedListener(listener)
++            }
++        }
++        modeChangedListener = null
++    }
++
++    private fun handleCallStateChanged() {
++        if (stopping.get() || mediaProjection == null) {
++            return
++        }
++        if (isVoiceCallActive()) {
++            if (audioCapturer != null) {
++                Log.i(TAG, "Voice/VoIP call active; pausing screencast audio capture")
++                applyAudioEnabledState(
++                    enabled = false,
++                    reasonWhenDisabled = AUDIO_REASON_CALL_ACTIVE,
++                    forceOverrideBluetooth = forceOverrideBluetoothForSession,
++                )
++            }
++        } else if (audioRequestedByUser && audioCapturer == null) {
++            if (forceOverrideBluetoothForSession || !hasConnectedBluetoothAudioOutput()) {
++                Log.i(TAG, "Voice/VoIP call ended; resuming screencast audio capture")
++                applyAudioEnabledState(
++                    enabled = true,
++                    reasonWhenDisabled = "",
++                    forceOverrideBluetooth = forceOverrideBluetoothForSession,
++                )
++            }
++        }
++    }
++
+     private fun setArbiterScreencastAudioActive(active: Boolean) {
+         getSharedPreferences("${packageName}_audio_arbiter", Context.MODE_PRIVATE).edit {
+             putBoolean("screenstream_audio_active", active)
+@@ -796,38 +880,58 @@ class ScreenStreamService : Service() {
+         enabled: Boolean,
+         reasonWhenDisabled: String,
+         forceOverrideBluetooth: Boolean = false,
+-    ) {
++        notifyPlugin: Boolean = true,
++    ): AudioPlaybackCapturer.StartResult {
+         if (stopping.get()) {
+-            return
++            return AudioPlaybackCapturer.StartResult(false, reasonWhenDisabled)
+         }
+-        val deviceId = activeDeviceId ?: return
+-        val projection = mediaProjection ?: return
+-        val queue = muxerQueue ?: return
++        val deviceId = activeDeviceId ?: return AudioPlaybackCapturer.StartResult(false, reasonWhenDisabled)
++        val projection = mediaProjection ?: return AudioPlaybackCapturer.StartResult(false, reasonWhenDisabled)
++        val queue = muxerQueue ?: return AudioPlaybackCapturer.StartResult(false, reasonWhenDisabled)
+         if (queue.isClosed) {
+-            return
++            return AudioPlaybackCapturer.StartResult(false, reasonWhenDisabled)
+         }
+ 
+         if (!enabled) {
+             audioCapturer?.stop()
+             audioCapturer = null
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+             setArbiterScreencastAudioActive(false)
+-            KdeConnect.getInstance()
+-                .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
+-                ?.onServiceAudioStatusChanged(false, reasonWhenDisabled)
+-            return
++            if (notifyPlugin) {
++                KdeConnect.getInstance()
++                    .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                    ?.onServiceAudioStatusChanged(false, reasonWhenDisabled, ScreenStreamProtocol.AUDIO_CODEC_NONE)
++            }
++            return AudioPlaybackCapturer.StartResult(false, reasonWhenDisabled)
++        }
++
++        if (isVoiceCallActive()) {
++            audioCapturer?.stop()
++            audioCapturer = null
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
++            setArbiterScreencastAudioActive(false)
++            if (notifyPlugin) {
++                KdeConnect.getInstance()
++                    .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                    ?.onServiceAudioStatusChanged(false, AUDIO_REASON_CALL_ACTIVE, ScreenStreamProtocol.AUDIO_CODEC_NONE)
++            }
++            return AudioPlaybackCapturer.StartResult(false, AUDIO_REASON_CALL_ACTIVE)
+         }
+ 
+         if (!forceOverrideBluetooth && hasConnectedBluetoothAudioOutput()) {
+             audioCapturer?.stop()
+             audioCapturer = null
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+             setArbiterScreencastAudioActive(false)
+-            KdeConnect.getInstance()
+-                .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
+-                ?.onServiceAudioStatusChanged(false, AUDIO_REASON_BLUETOOTH_ROUTED)
+-            return
++            if (notifyPlugin) {
++                KdeConnect.getInstance()
++                    .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                    ?.onServiceAudioStatusChanged(false, AUDIO_REASON_BLUETOOTH_ROUTED, ScreenStreamProtocol.AUDIO_CODEC_NONE)
++            }
++            return AudioPlaybackCapturer.StartResult(false, AUDIO_REASON_BLUETOOTH_ROUTED)
+         }
+ 
+-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && forceOverrideBluetooth) {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && forceOverrideBluetooth && !isVoiceCallActive()) {
+             try {
+                 audioManager?.clearCommunicationDevice()
+             } catch (_: RuntimeException) {
+@@ -837,36 +941,52 @@ class ScreenStreamService : Service() {
+         val existing = audioCapturer
+         if (existing != null) {
+             setArbiterScreencastAudioActive(true)
+-            KdeConnect.getInstance()
+-                .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
+-                ?.onServiceAudioStatusChanged(true, "")
+-            return
++            if (notifyPlugin) {
++                KdeConnect.getInstance()
++                    .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                    ?.onServiceAudioStatusChanged(true, "", activeAudioCodec)
++            }
++            return AudioPlaybackCapturer.StartResult(true, "", activeAudioCodec)
+         }
+ 
+-        val capturer = AudioPlaybackCapturer(
++        val sessionGen = sessionGeneration
++        lateinit var capturer: AudioPlaybackCapturer
++        capturer = AudioPlaybackCapturer(
+             context = this,
+             mediaProjection = projection,
+             muxerQueue = queue,
+             lastPtsUs = lastPtsUs,
+             onAudioStatusChanged = { avail, reason ->
+                 mainHandler.post {
++                    if (sessionGen != sessionGeneration || stopping.get()) {
++                        return@post
++                    }
++                    if (!avail && audioCapturer === capturer) {
++                        audioCapturer = null
++                        activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
++                    }
+                     setArbiterScreencastAudioActive(avail)
+                     KdeConnect.getInstance()
+                         .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
+-                        ?.onServiceAudioStatusChanged(avail, reason)
++                        ?.onServiceAudioStatusChanged(avail, reason, activeAudioCodec)
+                 }
+             },
+         )
+         val res = capturer.start()
+         if (res.available) {
+             audioCapturer = capturer
++            activeAudioCodec = res.codec
+         } else {
+             capturer.stop()
++            activeAudioCodec = ScreenStreamProtocol.AUDIO_CODEC_NONE
+         }
+         setArbiterScreencastAudioActive(res.available)
+-        KdeConnect.getInstance()
+-            .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
+-            ?.onServiceAudioStatusChanged(res.available, res.reason)
++        if (notifyPlugin) {
++            KdeConnect.getInstance()
++                .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                ?.onServiceAudioStatusChanged(res.available, res.reason, activeAudioCodec)
++        }
++        return res
+     }
+ 
+     override fun onBind(intent: Intent?): IBinder? = null
+@@ -884,6 +1004,7 @@ class ScreenStreamService : Service() {
+         private const val ACTION_REQUEST_KEYFRAME = "org.kde.kdeconnect.plugins.screenstream.KEYFRAME"
+ 
+         private const val AUDIO_REASON_BLUETOOTH_ROUTED = "bluetooth_routed"
++        private const val AUDIO_REASON_CALL_ACTIVE = "call_active"
+         private const val AUDIO_REASON_DISABLED = "Audio disabled by viewer request"
+ 
+         private const val EXTRA_DEVICE_ID = "device_id"
+@@ -894,6 +1015,7 @@ class ScreenStreamService : Service() {
+         private const val EXTRA_MAX_FPS = "max_fps"
+         private const val EXTRA_MAX_BITRATE_KBPS = "max_bitrate_kbps"
+         private const val EXTRA_REQUEST_AUDIO = "request_audio"
++        private const val EXTRA_AUTO_ROUTE_AUDIO = "auto_route_audio"
+         private const val EXTRA_KEEP_SCREEN_ON = "keep_screen_on"
+ 
+         @Volatile
+@@ -917,6 +1039,7 @@ class ScreenStreamService : Service() {
+                 putExtra(EXTRA_MAX_FPS, params.maxFps)
+                 putExtra(EXTRA_MAX_BITRATE_KBPS, params.maxBitrateKbps)
+                 putExtra(EXTRA_REQUEST_AUDIO, params.requestAudio)
++                putExtra(EXTRA_AUTO_ROUTE_AUDIO, params.autoRouteAudio)
+                 putExtra(EXTRA_KEEP_SCREEN_ON, keepScreenOn)
+             }
+         }
+@@ -931,6 +1054,7 @@ class ScreenStreamService : Service() {
+                 active.mainHandler.post {
+                     if (currentInstance === active && !active.stopping.get() && active.activeDeviceId == deviceId) {
+                         active.audioRequestedByUser = enabled
++                        active.forceOverrideBluetoothForSession = forceOverrideBluetooth
+                         active.applyAudioEnabledState(
+                             enabled = enabled,
+                             reasonWhenDisabled = AUDIO_REASON_BLUETOOTH_ROUTED,
+diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
+index d60ed9db4350498b8c8c96e49cb504759ad48de8..b0232866dea0f254e7abafc0c6a016a34a044e0e 100644
+--- a/src/main/res/values/strings.xml
++++ b/src/main/res/values/strings.xml
+@@ -694,6 +694,9 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <string name="screenstream_pref_send_audio_key" translatable="false">screenstream_send_audio</string>
+     <string name="screenstream_pref_send_audio_title">Include playback audio</string>
+     <string name="screenstream_pref_send_audio_summary">Stream eligible app playback audio alongside screen video</string>
++    <string name="screenstream_pref_auto_route_audio_key" translatable="false">screenstream_auto_route_audio</string>
++    <string name="screenstream_pref_auto_route_audio_title">Auto-switch Bluetooth audio to screencast</string>
++    <string name="screenstream_pref_auto_route_audio_summary">Move allowlisted Bluetooth headsets to PC screencast when streaming starts and release them on stop</string>
+     <string name="screenstream_pref_keep_screen_on_key" translatable="false">screenstream_keep_screen_on</string>
+     <string name="screenstream_pref_keep_screen_on_title">Keep screen awake while streaming</string>
+     <string name="screenstream_pref_keep_screen_on_summary">Prevent the device screen from turning off during an active screen stream</string>
+diff --git a/src/main/res/xml/screenstreamplugin_preferences.xml b/src/main/res/xml/screenstreamplugin_preferences.xml
+index 53e9744a639c087b8b6bc04169c3738aec623e31..816db72ef3a8e452d7bb3ae540d3a8cc0cef5d04 100644
+--- a/src/main/res/xml/screenstreamplugin_preferences.xml
++++ b/src/main/res/xml/screenstreamplugin_preferences.xml
+@@ -24,6 +24,12 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+         android:summary="@string/screenstream_pref_send_audio_summary"
+         android:title="@string/screenstream_pref_send_audio_title" />
+ 
++    <SwitchPreference
++        android:defaultValue="true"
++        android:key="@string/screenstream_pref_auto_route_audio_key"
++        android:summary="@string/screenstream_pref_auto_route_audio_summary"
++        android:title="@string/screenstream_pref_auto_route_audio_title" />
++
+     <SwitchPreference
+         android:defaultValue="true"
+         android:key="@string/screenstream_pref_keep_screen_on_key"
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt b/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt
+index fff0fb276c8c634db204a29146863e265311b814..7e36b74943fc0ab6f0199ee1228e3b0b960b50da 100644
+--- a/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt
++++ b/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt
+@@ -91,6 +91,7 @@ class ScreenStreamProtocolTest {
+             maxFps = 240,
+             maxBitrateKbps = 500000,
+             requestAudio = false,
++            autoRouteAudio = false,
+         ) as ScreenStreamProtocol.ControlRequest.Start
+ 
+         assertEquals(3840, req.params.maxWidth)
+@@ -98,6 +99,13 @@ class ScreenStreamProtocolTest {
+         assertEquals(60, req.params.maxFps)
+         assertEquals(20000, req.params.maxBitrateKbps)
+         assertFalse(req.params.requestAudio)
++        assertFalse(req.params.autoRouteAudio)
++
++        val defaultStartReq = ScreenStreamProtocol.parseControlRequest(
++            action = "start",
++            rawJsonBytes = 32,
++        ) as ScreenStreamProtocol.ControlRequest.Start
++        assertTrue(defaultStartReq.params.autoRouteAudio)
+ 
+         val wakeReq = ScreenStreamProtocol.parseControlRequest(action = "wake", rawJsonBytes = 17)
+         assertTrue(wakeReq is ScreenStreamProtocol.ControlRequest.Wake)
+@@ -164,15 +172,43 @@ class ScreenStreamProtocolTest {
+         queue.offerEosAndFinish(20L)
+         val streamed = queue.readBytes()
+         val decoded = ScreenStreamProtocol.parseFrames(streamed)
+-        assertEquals(ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT, decoded[0].kind)
+-        assertEquals(6L, decoded[0].ptsUs)
++        assertEquals(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK, decoded[0].kind)
++        assertEquals(11L, decoded[0].ptsUs)
+         assertEquals(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK, decoded[1].kind)
+-        assertEquals(11L, decoded[1].ptsUs)
+-        assertEquals(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK, decoded[2].kind)
+-        assertEquals(12L, decoded[2].ptsUs)
++        assertEquals(12L, decoded[1].ptsUs)
++        assertEquals(ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT, decoded[2].kind)
++        assertEquals(6L, decoded[2].ptsUs)
+         assertEquals(ScreenStreamProtocol.FrameKind.CONTROL_EOS, decoded[3].kind)
+     }
+ 
++    @Test
++    fun testMuxerQueuePrioritizesAudioAheadOfQueuedVideoFrames() {
++        val queue = StreamMuxerQueue(maxVideoFrames = 4, maxAudioChunks = 4)
++        val sps = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67)
++        val idr = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65)
++        val delta = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x41)
++
++        assertTrue(queue.offerCodecConfig(1L, sps))
++        assertTrue(queue.offerVideoFrame(ScreenStreamProtocol.FLAG_KEYFRAME, 2L, idr).accepted)
++        assertTrue(queue.offerVideoFrame(ScreenStreamProtocol.FLAG_NONE, 3L, delta).accepted)
++        assertTrue(queue.offerAudioChunk(4L, byteArrayOf(10, 20)))
++        assertTrue(queue.offerAudioChunk(5L, byteArrayOf(30, 40)))
++        queue.offerEosAndFinish(6L)
++
++        val decoded = ScreenStreamProtocol.parseFrames(queue.readBytes())
++        assertEquals(6, decoded.size)
++        assertEquals(ScreenStreamProtocol.FrameKind.CODEC_CONFIG, decoded[0].kind)
++        assertEquals(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK, decoded[1].kind)
++        assertEquals(4L, decoded[1].ptsUs)
++        assertEquals(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK, decoded[2].kind)
++        assertEquals(5L, decoded[2].ptsUs)
++        assertEquals(ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT, decoded[3].kind)
++        assertEquals(2L, decoded[3].ptsUs)
++        assertEquals(ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT, decoded[4].kind)
++        assertEquals(3L, decoded[4].ptsUs)
++        assertEquals(ScreenStreamProtocol.FrameKind.CONTROL_EOS, decoded[5].kind)
++    }
++
+     @Test
+     fun testSessionTrackerExplicitStopPersistenceAndReconnectBackoff() {
+         val tracker = ScreenStreamSessionTracker(initialExplicitStop = false, initialAutoStart = true)

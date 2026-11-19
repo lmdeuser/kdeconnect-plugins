@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 00:56:21 +0500
+Subject: [PATCH 4/4] bt_audio_switch: auto-resolve BlueZ device path across
+ hci adapters
+
+
+diff --git a/plugins/bt_audio_switch/btaudioswitchplugin.cpp b/plugins/bt_audio_switch/btaudioswitchplugin.cpp
+index c1821931cecbe1584e0a7ac3d62d261ab62c9cd0..52783985ef0898e13af9e68e558bfb876926b2ab 100644
+--- a/plugins/bt_audio_switch/btaudioswitchplugin.cpp
++++ b/plugins/bt_audio_switch/btaudioswitchplugin.cpp
+@@ -209,9 +209,41 @@ void BtAudioSwitchPlugin::sendSwitchPacket(const QString &action, const QString
+     sendPacket(np);
+ }
+ 
++QString BtAudioSwitchPlugin::resolveBluezDevicePath(const QString &canonicalMac) const
++{
++    const QString configuredPath = BtAudioSwitch::bluezDevicePath(m_adapterPath, canonicalMac);
++    if (configuredPath.isEmpty()) {
++        return {};
++    }
++
++    auto hasBluezDevice = [](const QString &path) -> bool {
++        QDBusMessage propMsg = QDBusMessage::createMethodCall(
++            QStringLiteral("org.bluez"),
++            path,
++            QStringLiteral("org.freedesktop.DBus.Properties"),
++            QStringLiteral("Get"));
++        propMsg << QStringLiteral("org.bluez.Device1") << QStringLiteral("Address");
++        const QDBusMessage reply = QDBusConnection::systemBus().call(propMsg, QDBus::Block, 300);
++        return reply.type() == QDBusMessage::ReplyMessage;
++    };
++
++    if (hasBluezDevice(configuredPath)) {
++        return configuredPath;
++    }
++
++    for (int idx = 0; idx < 8; ++idx) {
++        const QString adapter = QStringLiteral("/org/bluez/hci%1").arg(idx);
++        const QString candidate = BtAudioSwitch::bluezDevicePath(adapter, canonicalMac);
++        if (candidate != configuredPath && hasBluezDevice(candidate)) {
++            return candidate;
++        }
++    }
++    return configuredPath;
++}
++
+ void BtAudioSwitchPlugin::disconnectBluezProfiles(const QString &canonicalMac)
+ {
+-    const QString devPath = BtAudioSwitch::bluezDevicePath(m_adapterPath, canonicalMac);
++    const QString devPath = resolveBluezDevicePath(canonicalMac);
+     if (devPath.isEmpty()) {
+         return;
+     }
+@@ -232,7 +264,7 @@ void BtAudioSwitchPlugin::disconnectBluezProfiles(const QString &canonicalMac)
+ 
+ void BtAudioSwitchPlugin::connectDesktopHeadset(const QString &canonicalMac, const QString &reason, quint64 transitionGen)
+ {
+-    const QString devPath = BtAudioSwitch::bluezDevicePath(m_adapterPath, canonicalMac);
++    const QString devPath = resolveBluezDevicePath(canonicalMac);
+     if (!devPath.isEmpty()) {
+         QDBusMessage connMsg = QDBusMessage::createMethodCall(
+             QStringLiteral("org.bluez"), devPath, QStringLiteral("org.bluez.Device1"), QStringLiteral("Connect"));
+diff --git a/plugins/bt_audio_switch/btaudioswitchplugin.h b/plugins/bt_audio_switch/btaudioswitchplugin.h
+index d41e3754f0141458d67a8b5a33a63d9103877ae7..7e89ea01628e73df0fd44526c0b51179b078aa46 100644
+--- a/plugins/bt_audio_switch/btaudioswitchplugin.h
++++ b/plugins/bt_audio_switch/btaudioswitchplugin.h
+@@ -44,6 +44,7 @@ private Q_SLOTS:
+ 
+ private:
+     void sendSwitchPacket(const QString &action, const QString &canonicalMac, const QString &reason, qint64 timestampMs);
++    QString resolveBluezDevicePath(const QString &canonicalMac) const;
+     void disconnectBluezProfiles(const QString &canonicalMac);
+     void connectDesktopHeadset(const QString &canonicalMac, const QString &reason, quint64 transitionGen);
+     bool selectPipeWireSinkForMac(const QString &canonicalMac, quint64 transitionGen);

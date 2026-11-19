@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 01:00:24 +0500
+Subject: [PATCH 6/6] continuity_camera: normalize I420/30fps PipeWire caps and
+ add optional v4l2loopback tee
+
+
+diff --git a/plugins/continuity_camera/bridge/pipewirebridge.cpp b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+index 5f829352a997918395d2740a14217c5ff44ab6cc..05e512834e9d0028fa5a85c71c3d575ebf072761 100644
+--- a/plugins/continuity_camera/bridge/pipewirebridge.cpp
++++ b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+@@ -7,6 +7,9 @@
+ #include "pipewirebridge.h"
+ 
+ #include <QCoreApplication>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
+ #include <QLocalSocket>
+ 
+ #include <cstring>
+@@ -74,6 +77,9 @@ void configurePipeWireProvideSink(
+                                             "node.description",
+                                             G_TYPE_STRING,
+                                             nodeDesc.constData(),
++                                            "node.driver",
++                                            G_TYPE_STRING,
++                                            "true",
+                                             nullptr);
+     if (nodeLatency) {
+         gst_structure_set(props, "node.latency", G_TYPE_STRING, nodeLatency, nullptr);
+@@ -185,6 +191,35 @@ void teardownGstPipeline(GstElement *&pipeline, GstElement *&appsrc)
+     }
+     appsrc = nullptr;
+ }
++
++QString findWritableV4l2LoopbackDevice()
++{
++    const QDir v4lDir(QStringLiteral("/sys/class/video4linux"));
++    if (!v4lDir.exists()) {
++        return {};
++    }
++    const QStringList entries = v4lDir.entryList({QStringLiteral("video*")}, QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
++    for (const QString &entry : entries) {
++        QFile nameFile(v4lDir.filePath(entry + QStringLiteral("/name")));
++        if (!nameFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
++            continue;
++        }
++        const QString cardName = QString::fromUtf8(nameFile.readAll()).trimmed();
++        const bool isLoopback = cardName.contains(QLatin1String("Loopback"), Qt::CaseInsensitive)
++            || cardName.contains(QLatin1String("KDE Connect"), Qt::CaseInsensitive)
++            || cardName.contains(QLatin1String("Dummy"), Qt::CaseInsensitive)
++            || cardName.contains(QLatin1String("Virtual"), Qt::CaseInsensitive);
++        if (!isLoopback) {
++            continue;
++        }
++        const QString devPath = QStringLiteral("/dev/") + entry;
++        const QFileInfo devInfo(devPath);
++        if (devInfo.exists() && devInfo.isWritable()) {
++            return devPath;
++        }
++    }
++    return {};
++}
+ }
+ 
+ struct PipeWireBridge::Private {
+@@ -245,46 +280,103 @@ bool PipeWireBridge::initPipelines(QString *errorOut)
+         return false;
+     }
+ 
+-    d->videoPipeline = gst_pipeline_new("continuity-camera-video");
+-    d->videoAppSrc = gst_element_factory_make("appsrc", "vsrc");
+-    GstElement *parser = gst_element_factory_make("h264parse", "vparse");
+-    GstElement *decoder = gst_element_factory_make("avdec_h264", "vdec");
+-    GstElement *convert = gst_element_factory_make("videoconvert", "vconv");
+-    GstElement *pwSink = gst_element_factory_make("pipewiresink", "vsink");
++    const QByteArray clientName = QByteArrayLiteral("KDE Connect Continuity Camera");
++    const QByteArray camDesc = QStringLiteral("KDE Connect Camera (%1)").arg(m_deviceName).toUtf8();
++    const QString v4l2Dev = findWritableV4l2LoopbackDevice();
+ 
+-    if (!d->videoPipeline || !d->videoAppSrc || !parser || !decoder || !convert || !pwSink) {
++    auto buildVideoPipeline = [&](bool enableV4l2) -> bool {
+         if (errorOut) {
+-            *errorOut = QStringLiteral("Missing GStreamer video elements (appsrc, h264parse, avdec_h264, videoconvert, pipewiresink)");
++            errorOut->clear();
++        }
++        d->videoPipeline = gst_pipeline_new("continuity-camera-video");
++        d->videoAppSrc = gst_element_factory_make("appsrc", "vsrc");
++        GstElement *parser = gst_element_factory_make("h264parse", "vparse");
++        GstElement *decoder = gst_element_factory_make("avdec_h264", "vdec");
++        GstElement *convert = gst_element_factory_make("videoconvert", "vconv");
++        GstElement *videorate = gst_element_factory_make("videorate", "vrate");
++        GstElement *videoCaps = gst_element_factory_make("capsfilter", "vcaps");
++        GstElement *tee = gst_element_factory_make("tee", "vtee");
++        GstElement *pwQueue = gst_element_factory_make("queue", "pwqueue");
++        GstElement *pwSink = gst_element_factory_make("pipewiresink", "vsink");
++
++        if (!d->videoPipeline || !d->videoAppSrc || !parser || !decoder || !convert || !videorate || !videoCaps || !tee
++            || !pwQueue || !pwSink) {
++            if (errorOut) {
++                *errorOut = QStringLiteral(
++                    "Missing GStreamer video elements (appsrc, h264parse, avdec_h264, videoconvert, videorate, capsfilter, tee, queue, pipewiresink)");
++            }
++            if (d->videoAppSrc && !GST_OBJECT_PARENT(d->videoAppSrc)) gst_object_unref(d->videoAppSrc);
++            if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
++            if (decoder && !GST_OBJECT_PARENT(decoder)) gst_object_unref(decoder);
++            if (convert && !GST_OBJECT_PARENT(convert)) gst_object_unref(convert);
++            if (videorate && !GST_OBJECT_PARENT(videorate)) gst_object_unref(videorate);
++            if (videoCaps && !GST_OBJECT_PARENT(videoCaps)) gst_object_unref(videoCaps);
++            if (tee && !GST_OBJECT_PARENT(tee)) gst_object_unref(tee);
++            if (pwQueue && !GST_OBJECT_PARENT(pwQueue)) gst_object_unref(pwQueue);
++            if (pwSink && !GST_OBJECT_PARENT(pwSink)) gst_object_unref(pwSink);
++            teardownGstPipeline(d->videoPipeline, d->videoAppSrc);
++            return false;
+         }
+-        if (d->videoAppSrc && !GST_OBJECT_PARENT(d->videoAppSrc)) gst_object_unref(d->videoAppSrc);
+-        if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
+-        if (decoder && !GST_OBJECT_PARENT(decoder)) gst_object_unref(decoder);
+-        if (convert && !GST_OBJECT_PARENT(convert)) gst_object_unref(convert);
+-        if (pwSink && !GST_OBJECT_PARENT(pwSink)) gst_object_unref(pwSink);
+-        teardownGstPipeline(d->videoPipeline, d->videoAppSrc);
+-        return false;
+-    }
+-
+-    configureLiveAppSrc(d->videoAppSrc, "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au", 4U * 1024U * 1024U);
+-    g_object_set(parser, "config-interval", -1, nullptr);
+ 
+-    const QByteArray clientName = QByteArrayLiteral("KDE Connect Continuity Camera");
+-    const QByteArray camDesc = QStringLiteral("KDE Connect Camera (%1)").arg(m_deviceName).toUtf8();
+-    configurePipeWireProvideSink(pwSink, clientName, "Video", "Camera", "Video/Source", "kdeconnect_continuity_camera", camDesc);
++        configureLiveAppSrc(d->videoAppSrc, "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au", 4U * 1024U * 1024U);
++        g_object_set(parser, "config-interval", -1, nullptr);
++        if (g_object_class_find_property(G_OBJECT_GET_CLASS(videorate), "skip-to-first")) {
++            g_object_set(videorate, "skip-to-first", TRUE, nullptr);
++        }
++        GstCaps *normCaps = gst_caps_from_string("video/x-raw,format=(string)I420,framerate=(fraction)30/1");
++        g_object_set(videoCaps, "caps", normCaps, nullptr);
++        gst_caps_unref(normCaps);
++        g_object_set(tee, "allow-not-linked", TRUE, nullptr);
++        g_object_set(pwQueue, "max-size-buffers", static_cast<guint>(2), "leaky", 2, nullptr);
++
++        configurePipeWireProvideSink(pwSink, clientName, "Video", "Camera", "Video/Source", "kdeconnect_continuity_camera", camDesc);
++
++        gst_bin_add_many(GST_BIN(d->videoPipeline), d->videoAppSrc, parser, decoder, convert, videorate, videoCaps, tee, pwQueue, pwSink, nullptr);
++        if (!gst_element_link_many(d->videoAppSrc, parser, decoder, convert, videorate, videoCaps, tee, nullptr)
++            || !gst_element_link_many(tee, pwQueue, pwSink, nullptr)) {
++            if (errorOut) {
++                *errorOut = QStringLiteral("Failed to link Continuity Camera PipeWire video pipeline");
++            }
++            teardownGstPipeline(d->videoPipeline, d->videoAppSrc);
++            return false;
++        }
+ 
+-    gst_bin_add_many(GST_BIN(d->videoPipeline), d->videoAppSrc, parser, decoder, convert, pwSink, nullptr);
+-    if (!gst_element_link_many(d->videoAppSrc, parser, decoder, convert, pwSink, nullptr)) {
+-        if (errorOut) {
+-            *errorOut = QStringLiteral("Failed to link Continuity Camera PipeWire video pipeline");
++        if (enableV4l2 && !v4l2Dev.isEmpty()) {
++            GstElement *v4l2Queue = gst_element_factory_make("queue", "v4l2queue");
++            GstElement *v4l2Convert = gst_element_factory_make("videoconvert", "v4l2conv");
++            GstElement *v4l2Caps = gst_element_factory_make("capsfilter", "v4l2caps");
++            GstElement *v4l2Sink = gst_element_factory_make("v4l2sink", "v4l2_sink");
++            if (v4l2Queue && v4l2Convert && v4l2Caps && v4l2Sink) {
++                g_object_set(v4l2Queue, "max-size-buffers", static_cast<guint>(2), "leaky", 2, nullptr);
++                GstCaps *yuy2Caps = gst_caps_from_string("video/x-raw,format=(string)YUY2");
++                g_object_set(v4l2Caps, "caps", yuy2Caps, nullptr);
++                gst_caps_unref(yuy2Caps);
++                g_object_set(v4l2Sink, "device", v4l2Dev.toUtf8().constData(), "sync", FALSE, nullptr);
++                gst_bin_add_many(GST_BIN(d->videoPipeline), v4l2Queue, v4l2Convert, v4l2Caps, v4l2Sink, nullptr);
++                if (!gst_element_link_many(tee, v4l2Queue, v4l2Convert, v4l2Caps, v4l2Sink, nullptr)) {
++                    teardownGstPipeline(d->videoPipeline, d->videoAppSrc);
++                    return false;
++                }
++            } else {
++                if (v4l2Queue && !GST_OBJECT_PARENT(v4l2Queue)) gst_object_unref(v4l2Queue);
++                if (v4l2Convert && !GST_OBJECT_PARENT(v4l2Convert)) gst_object_unref(v4l2Convert);
++                if (v4l2Caps && !GST_OBJECT_PARENT(v4l2Caps)) gst_object_unref(v4l2Caps);
++                if (v4l2Sink && !GST_OBJECT_PARENT(v4l2Sink)) gst_object_unref(v4l2Sink);
++            }
+         }
+-        shutdown();
+-        return false;
+-    }
+ 
+-    if (gst_element_set_state(d->videoPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+-        if (errorOut) {
+-            *errorOut = QStringLiteral("Failed to start Continuity Camera video pipeline");
++        if (gst_element_set_state(d->videoPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
++            if (errorOut) {
++                *errorOut = QStringLiteral("Failed to start Continuity Camera video pipeline");
++            }
++            teardownGstPipeline(d->videoPipeline, d->videoAppSrc);
++            return false;
+         }
++        return true;
++    };
++
++    const bool startedWithV4l2 = !v4l2Dev.isEmpty() && buildVideoPipeline(true);
++    if (!startedWithV4l2 && !buildVideoPipeline(false)) {
+         shutdown();
+         return false;
+     }

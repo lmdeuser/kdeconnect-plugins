@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 16:16:08 +0500
-Subject: [PATCH 2/3] continuity_camera: fix FGS lifecycle, AudioRecord stop
+Subject: [PATCH 2/4] continuity_camera: fix FGS lifecycle, AudioRecord stop
  order, Camera2 sync, and bounded queue
 
 

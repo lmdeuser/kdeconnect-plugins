@@ -24,7 +24,7 @@
   - `PauseMusicPlugin` (`plugins/pausemusic/`) pattern for `PulseAudioQt::Context` and call-state (`kdeconnect.telephony`) / MPRIS playback monitoring.
   - Existing KDE Connect paired mutual-TLS transport for coordination messages (`kdeconnect.btaudioswitch`).
 - **New plugin components (planned Wave 2):**
-  - Desktop `plugins/bt_audio_switch/`: `BtAudioSwitchPlugin` coordinating BlueZ `org.bluez.Device1::ConnectProfile` / `DisconnectProfile` and PipeWire default sink selection, paired with per-device MAC allowlist configuration and anti-oscillation hysteresis (`3000 ms`).
+  - Desktop `plugins/bt_audio_switch/`: `BtAudioSwitchPlugin` coordinating BlueZ `org.bluez.Device1::Connect` / `DisconnectProfile` + `Disconnect` (auto-resolving devices across `/org/bluez/hci*` adapters and dropping residual ACL/AVRCP links for single-point headsets) and PipeWire default sink selection, paired with per-device MAC allowlist configuration and anti-oscillation hysteresis (`3000 ms`).
   - Android `plugins/btaudioswitch/`: `BtAudioSwitchPlugin.kt` monitoring active audio playback / `AudioManager.MODE_IN_CALL` and executing opt-in Bluetooth profile connect/release for allowlisted headset MACs.
 - **Session and capability isolation:** Never alters unconnected Bluetooth devices; operates strictly on paired, user-allowlisted headset MAC addresses configured on both sides.
 

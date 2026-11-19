@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Wed, 18 Nov 2026 23:56:24 +0500
-Subject: [PATCH 1/6] feat(screenstream): add Android screen and playback audio
+Subject: [PATCH 1/8] feat(screenstream): add Android screen and playback audio
  stream plugin
 
 

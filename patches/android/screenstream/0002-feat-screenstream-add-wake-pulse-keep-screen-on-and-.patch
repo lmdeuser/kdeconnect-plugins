@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 04:04:06 +0500
-Subject: [PATCH 2/6] feat(screenstream): add wake pulse, keep-screen-on, and
+Subject: [PATCH 2/8] feat(screenstream): add wake pulse, keep-screen-on, and
  entire-screen default
 
 

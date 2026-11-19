@@ -1,0 +1,308 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 00:59:30 +0500
+Subject: [PATCH 10/10] screenstream: auto-suspend A2DP and enable HFP gateway
+ for zero-config calls
+
+
+diff --git a/plugins/screenstream/screenstreamplugin.cpp b/plugins/screenstream/screenstreamplugin.cpp
+index 1014c01cd689cbab3d560e647378a7c4d92384f9..a910a26f8ae0eeef32a781f5df66b1d2e27b5190 100644
+--- a/plugins/screenstream/screenstreamplugin.cpp
++++ b/plugins/screenstream/screenstreamplugin.cpp
+@@ -15,6 +15,9 @@
+ #include <QCoreApplication>
+ #include <QDBusConnection>
+ #include <QDBusInterface>
++#include <QDBusMessage>
++#include <QDBusPendingCall>
++#include <QDBusReply>
+ #include <QDir>
+ #include <QFile>
+ #include <QFileInfo>
+@@ -25,6 +28,7 @@
+ #include <QStandardPaths>
+ #include <QTimer>
+ #include <QUuid>
++#include <QXmlStreamReader>
+ 
+ #include <algorithm>
+ 
+@@ -38,6 +42,16 @@ inline constexpr qsizetype kMaxPendingViewerFrames = 32;
+ inline constexpr qint64 kMaxViewerWriteQueueBytes = 4LL * 1024LL * 1024LL;
+ inline constexpr qint64 kMaxHardViewerWriteQueueBytes = kMaxViewerWriteQueueBytes * 2LL;
+ inline constexpr qint64 kPayloadReadChunkBytes = 65536LL;
++
++QString a2dpSourceUuid()
++{
++    return QStringLiteral("0000110a-0000-1000-8000-00805f9b34fb");
++}
++
++QString hfpAgUuid()
++{
++    return QStringLiteral("0000111f-0000-1000-8000-00805f9b34fb");
++}
+ } // namespace
+ 
+ ScreenStreamPlugin::ScreenStreamPlugin(QObject *parent, const QVariantList &args)
+@@ -353,6 +367,7 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+             config()->set(QStringLiteral("explicitStop"), m_explicitStop);
+         }
+ 
++        const QString prevAudioReason = m_audioReason;
+         m_audioAvailable = np.get<bool>(QStringLiteral("audioAvailable"), false);
+         m_audioReason = np.get<QString>(QStringLiteral("audioReason"));
+         const QString stateAudioCodec = np.get<QString>(QStringLiteral("audioCodec"));
+@@ -373,6 +388,11 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+             m_sessionAudioEnabled = nextAudioEnabled;
+             Q_EMIT audioEnabledChanged(m_sessionAudioEnabled);
+         }
++        if (!m_audioAvailable && m_audioReason == QLatin1String("call_active") && prevAudioReason != QLatin1String("call_active")) {
++            activatePhoneBluetoothCallGateway();
++        } else if (m_audioAvailable && prevAudioReason == QLatin1String("call_active") && m_autoRouteAudio && m_sessionAudioEnabled) {
++            claimBluetoothForScreencast(false);
++        }
+         m_accessibilityEnabled = np.get<bool>(QStringLiteral("accessibilityEnabled"), false);
+         const int dw = np.get<int>(QStringLiteral("displayWidth"), 0);
+         const int dh = np.get<int>(QStringLiteral("displayHeight"), 0);
+@@ -933,39 +953,199 @@ void ScreenStreamPlugin::claimBluetoothForScreencast(bool forceManual)
+         path,
+         QStringLiteral("org.kde.kdeconnect.device.btaudioswitch"),
+         QDBusConnection::sessionBus());
+-    if (!btIface.isValid()) {
+-        return;
++    if (btIface.isValid()) {
++        const QStringList macs = btIface.property("allowedHeadsetMacs").toStringList();
++        for (const QString &mac : macs) {
++            if (mac.isEmpty()) {
++                continue;
++            }
++            btIface.asyncCall(QStringLiteral("claimHeadset"), mac, QStringLiteral("manual"));
++            if (!m_claimedBtMacs.contains(mac)) {
++                m_claimedBtMacs.append(mac);
++            }
++        }
++    }
++
++    const QString phonePath = discoverPairedPhoneBluezPath();
++    if (!phonePath.isEmpty()) {
++        m_suspendedPhoneBluezPath = phonePath;
++        QDBusMessage discA2dp = QDBusMessage::createMethodCall(
++            QStringLiteral("org.bluez"),
++            phonePath,
++            QStringLiteral("org.bluez.Device1"),
++            QStringLiteral("DisconnectProfile"));
++        discA2dp << a2dpSourceUuid();
++        QDBusConnection::systemBus().asyncCall(discA2dp);
+     }
+-    const QStringList macs = btIface.property("allowedHeadsetMacs").toStringList();
+-    for (const QString &mac : macs) {
+-        if (mac.isEmpty()) {
++}
++
++void ScreenStreamPlugin::releaseClaimedBluetooth()
++{
++    if (!m_claimedBtMacs.isEmpty() && device()) {
++        const QStringList toRelease = m_claimedBtMacs;
++        m_claimedBtMacs.clear();
++        const QString path = QStringLiteral("/modules/kdeconnect/devices/%1/btaudioswitch").arg(device()->id());
++        QDBusInterface btIface(
++            QStringLiteral("org.kde.kdeconnect"),
++            path,
++            QStringLiteral("org.kde.kdeconnect.device.btaudioswitch"),
++            QDBusConnection::sessionBus());
++        if (btIface.isValid()) {
++            for (const QString &mac : toRelease) {
++                btIface.call(QDBus::NoBlock, QStringLiteral("releaseHeadset"), mac);
++            }
++        }
++    }
++
++    if (!m_suspendedPhoneBluezPath.isEmpty()) {
++        const QString phonePath = m_suspendedPhoneBluezPath;
++        m_suspendedPhoneBluezPath.clear();
++        setPhoneBluezCardProfile(phonePath, true);
++        QDBusMessage connA2dp = QDBusMessage::createMethodCall(
++            QStringLiteral("org.bluez"),
++            phonePath,
++            QStringLiteral("org.bluez.Device1"),
++            QStringLiteral("ConnectProfile"));
++        connA2dp << a2dpSourceUuid();
++        QDBusConnection::systemBus().asyncCall(connA2dp);
++
++        QDBusMessage connDev = QDBusMessage::createMethodCall(
++            QStringLiteral("org.bluez"),
++            phonePath,
++            QStringLiteral("org.bluez.Device1"),
++            QStringLiteral("Connect"));
++        QDBusConnection::systemBus().asyncCall(connDev);
++    }
++}
++
++QString ScreenStreamPlugin::discoverPairedPhoneBluezPath() const
++{
++    QDBusConnection sysBus = QDBusConnection::systemBus();
++    if (!sysBus.isConnected()) {
++        return {};
++    }
++
++    const QString devName = device() ? device()->name().trimmed() : QString();
++    QString bestPath;
++    int bestScore = 0;
++    int candidateCount = 0;
++
++    for (int idx = 0; idx < 4; ++idx) {
++        const QString adapterPath = QStringLiteral("/org/bluez/hci%1").arg(idx);
++        QDBusMessage introMsg = QDBusMessage::createMethodCall(
++            QStringLiteral("org.bluez"),
++            adapterPath,
++            QStringLiteral("org.freedesktop.DBus.Introspectable"),
++            QStringLiteral("Introspect"));
++        const QDBusReply<QString> introReply = sysBus.call(introMsg, QDBus::Block, 300);
++        if (!introReply.isValid()) {
+             continue;
+         }
+-        btIface.asyncCall(QStringLiteral("claimHeadset"), mac, QStringLiteral("manual"));
+-        if (!m_claimedBtMacs.contains(mac)) {
+-            m_claimedBtMacs.append(mac);
++
++        QXmlStreamReader xml(introReply.value());
++        while (!xml.atEnd()) {
++            xml.readNext();
++            if (!xml.isStartElement() || xml.name() != QLatin1String("node")) {
++                continue;
++            }
++            const QString childName = xml.attributes().value(QLatin1String("name")).toString();
++            if (!childName.startsWith(QLatin1String("dev_"))) {
++                continue;
++            }
++            const QString candidatePath = adapterPath + QLatin1Char('/') + childName;
++            QDBusMessage propsMsg = QDBusMessage::createMethodCall(
++                QStringLiteral("org.bluez"),
++                candidatePath,
++                QStringLiteral("org.freedesktop.DBus.Properties"),
++                QStringLiteral("GetAll"));
++            propsMsg << QStringLiteral("org.bluez.Device1");
++            const QDBusReply<QVariantMap> propsReply = sysBus.call(propsMsg, QDBus::Block, 300);
++            if (!propsReply.isValid()) {
++                continue;
++            }
++
++            const QVariantMap props = propsReply.value();
++            if (!props.value(QStringLiteral("Paired")).toBool()) {
++                continue;
++            }
++            const QStringList uuids = props.value(QStringLiteral("UUIDs")).toStringList();
++            const QString icon = props.value(QStringLiteral("Icon")).toString();
++            const bool isPhoneGateway = uuids.contains(a2dpSourceUuid(), Qt::CaseInsensitive)
++                || uuids.contains(hfpAgUuid(), Qt::CaseInsensitive)
++                || icon == QLatin1String("phone");
++            if (!isPhoneGateway) {
++                continue;
++            }
++
++            ++candidateCount;
++            const QString btName = props.value(QStringLiteral("Name")).toString().trimmed();
++            const QString btAlias = props.value(QStringLiteral("Alias")).toString().trimmed();
++            const bool connected = props.value(QStringLiteral("Connected")).toBool();
++            const bool nameMatches = !devName.isEmpty()
++                && ((!btName.isEmpty()
++                     && (btName.compare(devName, Qt::CaseInsensitive) == 0 || devName.contains(btName, Qt::CaseInsensitive)
++                         || btName.contains(devName, Qt::CaseInsensitive)))
++                    || (!btAlias.isEmpty()
++                        && (btAlias.compare(devName, Qt::CaseInsensitive) == 0 || devName.contains(btAlias, Qt::CaseInsensitive)
++                            || btAlias.contains(devName, Qt::CaseInsensitive))));
++
++            int score = 1;
++            if (nameMatches && connected) {
++                score = 4;
++            } else if (nameMatches) {
++                score = 3;
++            } else if (connected) {
++                score = 2;
++            }
++
++            if (score > bestScore) {
++                bestScore = score;
++                bestPath = candidatePath;
++            }
+         }
+     }
++
++    if (bestScore >= 2 || candidateCount == 1) {
++        return bestPath;
++    }
++    return {};
+ }
+ 
+-void ScreenStreamPlugin::releaseClaimedBluetooth()
++void ScreenStreamPlugin::setPhoneBluezCardProfile(const QString &bluezDevPath, bool enableAudioGateway) const
+ {
+-    if (m_claimedBtMacs.isEmpty() || !device()) {
++    const qsizetype devIdx = bluezDevPath.lastIndexOf(QLatin1String("/dev_"));
++    if (devIdx < 0) {
+         return;
+     }
+-    const QStringList toRelease = m_claimedBtMacs;
+-    m_claimedBtMacs.clear();
+-    const QString path = QStringLiteral("/modules/kdeconnect/devices/%1/btaudioswitch").arg(device()->id());
+-    QDBusInterface btIface(
+-        QStringLiteral("org.kde.kdeconnect"),
+-        path,
+-        QStringLiteral("org.kde.kdeconnect.device.btaudioswitch"),
+-        QDBusConnection::sessionBus());
+-    if (btIface.isValid()) {
+-        for (const QString &mac : toRelease) {
+-            btIface.call(QDBus::NoBlock, QStringLiteral("releaseHeadset"), mac);
+-        }
++    const QString macUnderscored = bluezDevPath.mid(devIdx + 5);
++    if (macUnderscored.isEmpty()) {
++        return;
++    }
++    const QString pactlExe = QStandardPaths::findExecutable(QStringLiteral("pactl"));
++    if (pactlExe.isEmpty()) {
++        return;
++    }
++    const QString cardName = QStringLiteral("bluez_card.") + macUnderscored;
++    const QString profile = enableAudioGateway ? QStringLiteral("audio-gateway") : QStringLiteral("off");
++    QProcess::startDetached(pactlExe, {QStringLiteral("set-card-profile"), cardName, profile});
++}
++
++void ScreenStreamPlugin::activatePhoneBluetoothCallGateway()
++{
++    const QString phonePath = !m_suspendedPhoneBluezPath.isEmpty()
++        ? m_suspendedPhoneBluezPath
++        : discoverPairedPhoneBluezPath();
++    if (phonePath.isEmpty()) {
++        return;
+     }
++    setPhoneBluezCardProfile(phonePath, true);
++    QDBusMessage connHfp = QDBusMessage::createMethodCall(
++        QStringLiteral("org.bluez"),
++        phonePath,
++        QStringLiteral("org.bluez.Device1"),
++        QStringLiteral("ConnectProfile"));
++    connHfp << hfpAgUuid();
++    QDBusConnection::systemBus().asyncCall(connHfp);
+ }
+ 
+ int ScreenStreamPlugin::audioChannelsForCodec(const QString &audioCodec)
+diff --git a/plugins/screenstream/screenstreamplugin.h b/plugins/screenstream/screenstreamplugin.h
+index b231d0e4ecd0512011ebc40164ea189235d400e9..ab176d9b2661790ea02f80552e6fe9852144b12d 100644
+--- a/plugins/screenstream/screenstreamplugin.h
++++ b/plugins/screenstream/screenstreamplugin.h
+@@ -106,6 +106,9 @@ private:
+     void flushPendingFrames();
+     void claimBluetoothForScreencast(bool forceManual = false);
+     void releaseClaimedBluetooth();
++    QString discoverPairedPhoneBluezPath() const;
++    void setPhoneBluezCardProfile(const QString &bluezDevPath, bool enableAudioGateway) const;
++    void activatePhoneBluetoothCallGateway();
+     static int audioChannelsForCodec(const QString &audioCodec);
+ 
+     ScreenStreamProtocol::ScreenStreamSessionMachine m_session;
+@@ -145,4 +148,5 @@ private:
+     QByteArray m_cachedCodecConfig;
+     QList<QByteArray> m_pendingViewerFrames;
+     QStringList m_claimedBtMacs;
++    QString m_suspendedPhoneBluezPath;
+ };

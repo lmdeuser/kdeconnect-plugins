@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 20:55:33 +0500
-Subject: [PATCH 6/6] screenstream: add live audio route switching and
+Subject: [PATCH 6/8] screenstream: add live audio route switching and
  Bluetooth arbiter state
 
 

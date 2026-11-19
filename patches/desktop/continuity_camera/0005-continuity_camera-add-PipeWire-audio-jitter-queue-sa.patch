@@ -1,0 +1,189 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 00:13:35 +0500
+Subject: [PATCH 5/6] continuity_camera: add PipeWire audio jitter queue,
+ sample PTS pacing, and node latency
+
+
+diff --git a/plugins/continuity_camera/bridge/pipewirebridge.cpp b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+index 7ce94a7c496932ec1e0f6ce7c7e7e377ae579f5a..5f829352a997918395d2740a14217c5ff44ab6cc 100644
+--- a/plugins/continuity_camera/bridge/pipewirebridge.cpp
++++ b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+@@ -16,14 +16,16 @@
+ 
+ namespace
+ {
+-void configureLiveAppSrc(GstElement *appsrc, const char *capsString, guint64 maxBytes)
++inline constexpr quint64 kMaxAudioDriftNs = 160000000ULL;
++
++void configureLiveAppSrc(GstElement *appsrc, const char *capsString, guint64 maxBytes, gboolean doTimestamp = TRUE)
+ {
+     GstCaps *caps = gst_caps_from_string(capsString);
+     g_object_set(appsrc,
+                  "is-live",
+                  TRUE,
+                  "do-timestamp",
+-                 TRUE,
++                 doTimestamp,
+                  "block",
+                  FALSE,
+                  "leaky-type",
+@@ -47,7 +49,8 @@ void configurePipeWireProvideSink(
+     const char *mediaRole,
+     const char *mediaClass,
+     const char *nodeName,
+-    const QByteArray &nodeDesc)
++    const QByteArray &nodeDesc,
++    const char *nodeLatency = nullptr)
+ {
+     GstStructure *props = gst_structure_new("props",
+                                             "media.type",
+@@ -72,6 +75,9 @@ void configurePipeWireProvideSink(
+                                             G_TYPE_STRING,
+                                             nodeDesc.constData(),
+                                             nullptr);
++    if (nodeLatency) {
++        gst_structure_set(props, "node.latency", G_TYPE_STRING, nodeLatency, nullptr);
++    }
+     g_object_set(sink,
+                  "mode",
+                  2,
+@@ -85,6 +91,59 @@ void configurePipeWireProvideSink(
+     gst_structure_free(props);
+ }
+ 
++bool pushAudioBufferToAppSrc(
++    GstElement *pipeline,
++    GstElement *appsrc,
++    const QByteArray &data,
++    bool &initialized,
++    quint64 &nextPtsNs)
++{
++    const qsizetype aligned = data.size() - (data.size() % 2);
++    if (!pipeline || !appsrc || aligned <= 0) {
++        return false;
++    }
++
++    const int numSamples = static_cast<int>(aligned / 2);
++    const quint64 durationNs = gst_util_uint64_scale_int(numSamples, GST_SECOND, 48000);
++
++    GstBuffer *buf = gst_buffer_new_allocate(nullptr, static_cast<gsize>(aligned), nullptr);
++    if (!buf) {
++        return false;
++    }
++    GstMapInfo map;
++    if (!gst_buffer_map(buf, &map, GST_MAP_WRITE)) {
++        gst_buffer_unref(buf);
++        return false;
++    }
++    std::memcpy(map.data, data.constData(), static_cast<size_t>(aligned));
++    gst_buffer_unmap(buf, &map);
++
++    const GstClockTime rawRunning = gst_element_get_current_running_time(pipeline);
++    const bool hasClock = GST_CLOCK_TIME_IS_VALID(rawRunning);
++    const quint64 runningNs = hasClock ? static_cast<quint64>(rawRunning) : 0ULL;
++
++    bool resync = !initialized;
++    if (!resync && hasClock) {
++        const quint64 diff = (runningNs >= nextPtsNs) ? (runningNs - nextPtsNs) : (nextPtsNs - runningNs);
++        if (diff > kMaxAudioDriftNs) {
++            resync = true;
++        }
++    }
++
++    if (resync) {
++        nextPtsNs = runningNs;
++        initialized = true;
++        GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_DISCONT);
++    }
++
++    GST_BUFFER_PTS(buf) = static_cast<GstClockTime>(nextPtsNs);
++    GST_BUFFER_DTS(buf) = GST_CLOCK_TIME_NONE;
++    GST_BUFFER_DURATION(buf) = static_cast<GstClockTime>(durationNs);
++    nextPtsNs += durationNs;
++
++    return gst_app_src_push_buffer(GST_APP_SRC(appsrc), buf) == GST_FLOW_OK;
++}
++
+ bool pushBufferToAppSrc(GstElement *appsrc, const QByteArray &data, quint64 ptsUs, bool setKeyframeFlag, bool isKeyframe)
+ {
+     Q_UNUSED(ptsUs)
+@@ -133,6 +192,8 @@ struct PipeWireBridge::Private {
+     GstElement *videoAppSrc = nullptr;
+     GstElement *audioPipeline = nullptr;
+     GstElement *audioAppSrc = nullptr;
++    bool audioPtsInitialized = false;
++    quint64 audioNextPtsNs = 0;
+ };
+ 
+ PipeWireBridge::PipeWireBridge(const QString &socketPath, const QString &deviceName, bool enableAudio, QObject *parent)
+@@ -229,23 +290,44 @@ bool PipeWireBridge::initPipelines(QString *errorOut)
+     }
+ 
+     if (m_enableAudio) {
++        d->audioPtsInitialized = false;
++        d->audioNextPtsNs = 0;
+         d->audioPipeline = gst_pipeline_new("continuity-camera-audio");
+         d->audioAppSrc = gst_element_factory_make("appsrc", "asrc");
++        GstElement *aqueue = gst_element_factory_make("queue", "aqueue");
+         GstElement *aconv = gst_element_factory_make("audioconvert", "aconv");
+         GstElement *aresamp = gst_element_factory_make("audioresample", "aresamp");
+         GstElement *apwSink = gst_element_factory_make("pipewiresink", "asink");
+ 
+-        if (d->audioPipeline && d->audioAppSrc && aconv && aresamp && apwSink) {
+-            configureLiveAppSrc(d->audioAppSrc, "audio/x-raw,format=(string)S16LE,channels=(int)1,rate=(int)48000,layout=(string)interleaved", 512U * 1024U);
++        if (d->audioPipeline && d->audioAppSrc && aqueue && aconv && aresamp && apwSink) {
++            configureLiveAppSrc(
++                d->audioAppSrc,
++                "audio/x-raw,format=(string)S16LE,channels=(int)1,rate=(int)48000,layout=(string)interleaved",
++                512U * 1024U,
++                FALSE);
++            g_object_set(aqueue,
++                         "max-size-buffers",
++                         static_cast<guint>(0),
++                         "max-size-bytes",
++                         static_cast<guint>(0),
++                         "max-size-time",
++                         static_cast<guint64>(160000000ULL),
++                         "min-threshold-time",
++                         static_cast<guint64>(40000000ULL),
++                         "leaky",
++                         2,
++                         nullptr);
+             const QByteArray micDesc = QStringLiteral("KDE Connect Mic (%1)").arg(m_deviceName).toUtf8();
+-            configurePipeWireProvideSink(apwSink, clientName, "Audio", "Communication", "Audio/Source", "kdeconnect_continuity_mic", micDesc);
+-            gst_bin_add_many(GST_BIN(d->audioPipeline), d->audioAppSrc, aconv, aresamp, apwSink, nullptr);
+-            if (!gst_element_link_many(d->audioAppSrc, aconv, aresamp, apwSink, nullptr)
++            configurePipeWireProvideSink(
++                apwSink, clientName, "Audio", "Communication", "Audio/Source", "kdeconnect_continuity_mic", micDesc, "960/48000");
++            gst_bin_add_many(GST_BIN(d->audioPipeline), d->audioAppSrc, aqueue, aconv, aresamp, apwSink, nullptr);
++            if (!gst_element_link_many(d->audioAppSrc, aqueue, aconv, aresamp, apwSink, nullptr)
+                 || gst_element_set_state(d->audioPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+                 teardownGstPipeline(d->audioPipeline, d->audioAppSrc);
+             }
+         } else {
+             if (d->audioAppSrc && !GST_OBJECT_PARENT(d->audioAppSrc)) gst_object_unref(d->audioAppSrc);
++            if (aqueue && !GST_OBJECT_PARENT(aqueue)) gst_object_unref(aqueue);
+             if (aconv && !GST_OBJECT_PARENT(aconv)) gst_object_unref(aconv);
+             if (aresamp && !GST_OBJECT_PARENT(aresamp)) gst_object_unref(aresamp);
+             if (apwSink && !GST_OBJECT_PARENT(apwSink)) gst_object_unref(apwSink);
+@@ -267,6 +349,8 @@ void PipeWireBridge::shutdown()
+     if (d) {
+         teardownGstPipeline(d->videoPipeline, d->videoAppSrc);
+         teardownGstPipeline(d->audioPipeline, d->audioAppSrc);
++        d->audioPtsInitialized = false;
++        d->audioNextPtsNs = 0;
+     }
+ }
+ 
+@@ -313,8 +397,8 @@ void PipeWireBridge::handleFrame(const ContinuityCameraProtocol::StreamFrame &fr
+         break;
+     }
+     case ContinuityCameraProtocol::FrameKind::AudioPcmChunk:
+-        if (d->audioAppSrc) {
+-            pushBufferToAppSrc(d->audioAppSrc, frame.payload, frame.ptsUs, false, false);
++        if (d->audioPipeline && d->audioAppSrc) {
++            pushAudioBufferToAppSrc(d->audioPipeline, d->audioAppSrc, frame.payload, d->audioPtsInitialized, d->audioNextPtsNs);
+         }
+         break;
+     case ContinuityCameraProtocol::FrameKind::ControlEos:

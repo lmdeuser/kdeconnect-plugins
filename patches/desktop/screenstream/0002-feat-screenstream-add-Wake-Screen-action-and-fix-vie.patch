@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 04:04:06 +0500
-Subject: [PATCH 2/8] feat(screenstream): add Wake Screen action and fix viewer
- exit UAF crash
+Subject: [PATCH 02/10] feat(screenstream): add Wake Screen action and fix
+ viewer exit UAF crash
 
 
 diff --git a/app/qml/DevicePage.qml b/app/qml/DevicePage.qml
