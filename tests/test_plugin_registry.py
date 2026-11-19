@@ -71,6 +71,7 @@ class PluginRegistryTests(unittest.TestCase):
             [
                 "screenstream",
                 "clipboard_images",
+                "otp_autofill",
                 "continuity_camera",
                 "remote_auth",
                 "bt_audio_switch",
