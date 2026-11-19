@@ -1,0 +1,390 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 16:05:16 +0500
+Subject: [PATCH 2/4] continuity_camera: fix live PTS stall, capture collision
+ delete, and teardown races
+
+
+diff --git a/plugins/continuity_camera/bridge/pipewirebridge.cpp b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+index f90dffbdcfe42ea953b966ef11043e68a63a3012..d04c0456df0f0d282469fc43fb2fb26f30d1b795 100644
+--- a/plugins/continuity_camera/bridge/pipewirebridge.cpp
++++ b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+@@ -22,6 +22,12 @@ void configureLiveAppSrc(GstElement *appsrc, const char *capsString, guint64 max
+     g_object_set(appsrc,
+                  "is-live",
+                  TRUE,
++                 "do-timestamp",
++                 TRUE,
++                 "block",
++                 FALSE,
++                 "leaky-type",
++                 2,
+                  "format",
+                  GST_FORMAT_TIME,
+                  "stream-type",
+@@ -62,6 +68,8 @@ void configurePipeWireProvideSink(
+     g_object_set(sink,
+                  "mode",
+                  2,
++                 "sync",
++                 FALSE,
+                  "client-name",
+                  clientName.constData(),
+                  "stream-properties",
+@@ -72,6 +80,7 @@ void configurePipeWireProvideSink(
+ 
+ bool pushBufferToAppSrc(GstElement *appsrc, const QByteArray &data, quint64 ptsUs, bool setKeyframeFlag, bool isKeyframe)
+ {
++    Q_UNUSED(ptsUs)
+     if (!appsrc || data.isEmpty()) {
+         return false;
+     }
+@@ -87,7 +96,9 @@ bool pushBufferToAppSrc(GstElement *appsrc, const QByteArray &data, quint64 ptsU
+     std::memcpy(map.data, data.constData(), static_cast<size_t>(data.size()));
+     gst_buffer_unmap(buf, &map);
+ 
+-    GST_BUFFER_PTS(buf) = static_cast<GstClockTime>(ptsUs) * 1000ULL;
++    // Let appsrc do-timestamp stamp local pipeline running time so peer monotonic
++    // uptime timestamps cannot stall live PipeWire delivery or overflow uint64.
++    GST_BUFFER_PTS(buf) = GST_CLOCK_TIME_NONE;
+     GST_BUFFER_DTS(buf) = GST_CLOCK_TIME_NONE;
+     if (setKeyframeFlag) {
+         if (isKeyframe) {
+@@ -222,9 +233,8 @@ bool PipeWireBridge::initPipelines(QString *errorOut)
+             const QByteArray micDesc = QStringLiteral("KDE Connect Mic (%1)").arg(m_deviceName).toUtf8();
+             configurePipeWireProvideSink(apwSink, clientName, "Audio", "Communication", "Audio/Source", micDesc);
+             gst_bin_add_many(GST_BIN(d->audioPipeline), d->audioAppSrc, aconv, aresamp, apwSink, nullptr);
+-            if (gst_element_link_many(d->audioAppSrc, aconv, aresamp, apwSink, nullptr)) {
+-                gst_element_set_state(d->audioPipeline, GST_STATE_PLAYING);
+-            } else {
++            if (!gst_element_link_many(d->audioAppSrc, aconv, aresamp, apwSink, nullptr)
++                || gst_element_set_state(d->audioPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+                 teardownGstPipeline(d->audioPipeline, d->audioAppSrc);
+             }
+         } else {
+diff --git a/plugins/continuity_camera/continuitycameraplugin.cpp b/plugins/continuity_camera/continuitycameraplugin.cpp
+index c489a8d48c565ca351695b2fd9f6e7b0465628fd..2cc3abefb6c745883ec366b52e86621d31059df4 100644
+--- a/plugins/continuity_camera/continuitycameraplugin.cpp
++++ b/plugins/continuity_camera/continuitycameraplugin.cpp
+@@ -8,10 +8,11 @@
+ 
+ #include "plugin_continuitycamera_debug.h"
+ 
++#include <KJob>
+ #include <KLocalizedString>
+ #include <KPluginFactory>
+-#include <KJob>
+ 
++#include <QAbstractSocket>
+ #include <QCoreApplication>
+ #include <QDateTime>
+ #include <QDir>
+@@ -21,6 +22,7 @@
+ #include <QLocalSocket>
+ #include <QProcess>
+ #include <QStandardPaths>
++#include <QTimer>
+ #include <QUrl>
+ #include <QUuid>
+ 
+@@ -33,6 +35,8 @@ namespace
+ {
+ inline constexpr qsizetype kMaxPendingFrames = 32;
+ inline constexpr qint64 kMaxBridgeWriteQueueBytes = 4LL * 1024LL * 1024LL;
++inline constexpr qint64 kMaxHardBridgeWriteQueueBytes = kMaxBridgeWriteQueueBytes * 2LL;
++inline constexpr qint64 kPayloadReadChunkBytes = 65536LL;
+ }
+ 
+ ContinuityCameraPlugin::ContinuityCameraPlugin(QObject *parent, const QVariantList &args)
+@@ -64,9 +68,8 @@ QString ContinuityCameraPlugin::dbusPath() const
+ bool ContinuityCameraPlugin::startCamera(int maxWidth, int maxHeight, int fps, bool includeMic, const QString &lens)
+ {
+     const ContinuityCameraProtocol::StreamConfig cfg = ContinuityCameraProtocol::clampStreamConfig(maxWidth, maxHeight, fps);
++    const bool wasStreaming = isStreaming();
+     m_stopping = false;
+-    m_session.beginStart();
+-    Q_EMIT stateChanged();
+ 
+     NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST);
+     np.set(QStringLiteral("action"), QStringLiteral("start_stream"));
+@@ -75,7 +78,21 @@ bool ContinuityCameraPlugin::startCamera(int maxWidth, int maxHeight, int fps, b
+     np.set(QStringLiteral("fps"), cfg.fps);
+     np.set(QStringLiteral("includeMic"), includeMic);
+     np.set(QStringLiteral("lens"), ContinuityCameraProtocol::normalizeLens(lens));
+-    return sendPacket(np);
++    if (!sendPacket(np)) {
++        m_session.onTeardown(true);
++        if (wasStreaming) {
++            Q_EMIT streamingChanged(false);
++        }
++        Q_EMIT stateChanged();
++        return false;
++    }
++
++    m_session.beginStart();
++    if (wasStreaming && !isStreaming()) {
++        Q_EMIT streamingChanged(false);
++    }
++    Q_EMIT stateChanged();
++    return true;
+ }
+ 
+ void ContinuityCameraPlugin::stopCamera()
+@@ -133,6 +150,13 @@ void ContinuityCameraPlugin::receivePacket(const NetworkPacket &np)
+     }
+ 
+     if (event == QLatin1String("stream_open")) {
++        if (!m_session.shouldAcceptStreamOpen(m_stopping)) {
++            if (np.payload()) {
++                np.payload()->close();
++            }
++            sendPacket(NetworkPacket(PACKET_TYPE_CONTINUITYCAMERA_REQUEST, {{QStringLiteral("action"), QStringLiteral("stop_stream")}}));
++            return;
++        }
+         if (!np.hasPayload() || !np.payload()) {
+             teardownSession(true, true);
+             return;
+@@ -153,12 +177,22 @@ void ContinuityCameraPlugin::receivePacket(const NetworkPacket &np)
+         connect(m_payload.data(), &QIODevice::readyRead, this, &ContinuityCameraPlugin::onPayloadReadyRead);
+         connect(m_payload.data(), &QIODevice::readChannelFinished, this, &ContinuityCameraPlugin::onPayloadClosed);
+         connect(m_payload.data(), &QIODevice::aboutToClose, this, &ContinuityCameraPlugin::onPayloadClosed);
++        if (auto *absSock = qobject_cast<QAbstractSocket *>(m_payload.data())) {
++            connect(absSock, &QAbstractSocket::disconnected, this, &ContinuityCameraPlugin::onPayloadClosed);
++            connect(absSock, &QAbstractSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
++                teardownSession(true, true);
++            });
++            if (absSock->state() == QAbstractSocket::UnconnectedState) {
++                teardownSession(true, true);
++                return;
++            }
++        }
+ 
+         m_session.onStreamOpen();
+         Q_EMIT streamingChanged(true);
+         Q_EMIT stateChanged();
+ 
+-        if (m_payload->bytesAvailable() > 0) {
++        if (m_payload && m_payload->bytesAvailable() > 0) {
+             onPayloadReadyRead();
+         }
+     }
+@@ -183,34 +217,38 @@ void ContinuityCameraPlugin::handleCaptureResult(const NetworkPacket &np)
+         dlDir = QDir::homePath();
+     }
+     QDir().mkpath(dlDir);
+-    QString destPath = QDir(dlDir).filePath(safeName);
+-    if (QFileInfo::exists(destPath)) {
+-        const QFileInfo fi(safeName);
+-        const QString unique = QStringLiteral("%1-%2.%3")
+-                                   .arg(fi.completeBaseName())
+-                                   .arg(QDateTime::currentMSecsSinceEpoch())
+-                                   .arg(fi.suffix());
+-        destPath = QDir(dlDir).filePath(unique);
+-    }
++    const QString destPath = QDir(dlDir).filePath(safeName);
+ 
+     FileTransferJob *job = np.createPayloadTransferJob(QUrl::fromLocalFile(destPath));
+-    connect(job, &KJob::result, this, [this, job, destPath, mimeType] {
++    job->setAutoRenameIfDestinationExists(true);
++    connect(job, &KJob::processedAmountChanged, this, [job](KJob *, KJob::Unit unit, qulonglong amount) {
++        if (unit == KJob::Bytes && amount > static_cast<qulonglong>(ContinuityCameraProtocol::kMaxCaptureBytes)) {
++            job->kill();
++        }
++    });
++    connect(job, &KJob::result, this, [this, job, mimeType] {
++        const QString actualPath = job->destination().isLocalFile() ? job->destination().toLocalFile() : QString();
+         if (job->error()) {
+             qCWarning(KDECONNECT_PLUGIN_CONTINUITYCAMERA) << "Capture download failed:" << job->errorString();
+-            QFile::remove(destPath);
++            // Do not delete pre-existing files when FileTransferJob reports FileExists (error == 2).
++            if (job->error() != 2 && !actualPath.isEmpty()) {
++                QFile::remove(actualPath);
++            }
+             return;
+         }
+-        if (QFileInfo(destPath).size() > ContinuityCameraProtocol::kMaxCaptureBytes) {
++        if (actualPath.isEmpty() || QFileInfo(actualPath).size() > ContinuityCameraProtocol::kMaxCaptureBytes) {
+             qCWarning(KDECONNECT_PLUGIN_CONTINUITYCAMERA) << "Downloaded capture exceeded size bound";
+-            QFile::remove(destPath);
++            if (!actualPath.isEmpty()) {
++                QFile::remove(actualPath);
++            }
+             return;
+         }
+         Daemon::instance()->sendSimpleNotification(
+             QStringLiteral("continuityCameraCapture"),
+             device()->name(),
+-            i18n("Imported capture to %1", destPath),
++            i18n("Imported capture to %1", actualPath),
+             QStringLiteral("camera-photo"));
+-        Q_EMIT captureImported(destPath, mimeType);
++        Q_EMIT captureImported(actualPath, mimeType);
+     });
+     job->start();
+ }
+@@ -294,8 +332,18 @@ void ContinuityCameraPlugin::teardownSession(bool terminateBridge, bool error)
+ {
+     const bool wasStreaming = isStreaming();
+     if (m_payload) {
+-        disconnect(m_payload.data(), nullptr, this, nullptr);
++        QSharedPointer<QIODevice> stalePayload = m_payload;
+         m_payload.clear();
++        disconnect(stalePayload.data(), nullptr, this, nullptr);
++        if (QCoreApplication *app = QCoreApplication::instance()) {
++            QTimer::singleShot(0, app, [stalePayload]() {
++                if (stalePayload) {
++                    stalePayload->close();
++                }
++            });
++        } else {
++            stalePayload->close();
++        }
+     }
+     if (m_bridgeSocket) {
+         disconnect(m_bridgeSocket, nullptr, this, nullptr);
+@@ -310,10 +358,15 @@ void ContinuityCameraPlugin::teardownSession(bool terminateBridge, bool error)
+     }
+     if (m_bridgeProcess) {
+         disconnect(m_bridgeProcess, nullptr, this, nullptr);
+-        if (terminateBridge && m_bridgeProcess->state() != QProcess::NotRunning) {
+-            m_bridgeProcess->terminate();
+-            if (!m_bridgeProcess->waitForFinished(1500)) {
+-                m_bridgeProcess->kill();
++        if (m_bridgeProcess->state() != QProcess::NotRunning) {
++            if (terminateBridge || !m_bridgeProcess->waitForFinished(800)) {
++                if (m_bridgeProcess->state() != QProcess::NotRunning) {
++                    m_bridgeProcess->terminate();
++                    if (!m_bridgeProcess->waitForFinished(1500)) {
++                        m_bridgeProcess->kill();
++                        m_bridgeProcess->waitForFinished(1000);
++                    }
++                }
+             }
+         }
+         m_bridgeProcess->deleteLater();
+@@ -390,23 +443,22 @@ void ContinuityCameraPlugin::onPayloadReadyRead()
+     if (!m_payload) {
+         return;
+     }
+-    const QByteArray data = m_payload->readAll();
+-    if (data.isEmpty()) {
+-        return;
+-    }
+ 
+-    QList<ContinuityCameraProtocol::StreamFrame> frames;
+-    if (!m_parser.feed(data, &frames)) {
+-        teardownSession(true, true);
+-        return;
+-    }
+-
+-    for (const auto &frame : std::as_const(frames)) {
+-        if (frame.kind == ContinuityCameraProtocol::FrameKind::ControlEos) {
+-            onPayloadClosed();
++    QByteArray data;
++    while (m_payload && !(data = m_payload->read(kPayloadReadChunkBytes)).isEmpty()) {
++        QList<ContinuityCameraProtocol::StreamFrame> frames;
++        if (!m_parser.feed(data, &frames)) {
++            teardownSession(true, true);
+             return;
+         }
+-        enqueueOrSendFrame(frame);
++
++        for (const auto &frame : std::as_const(frames)) {
++            if (frame.kind == ContinuityCameraProtocol::FrameKind::ControlEos) {
++                onPayloadClosed();
++                return;
++            }
++            enqueueOrSendFrame(frame);
++        }
+     }
+ }
+ 
+@@ -427,7 +479,11 @@ void ContinuityCameraPlugin::enqueueOrSendFrame(const ContinuityCameraProtocol::
+     }
+ 
+     if (m_bridgeSocket && m_bridgeSocket->state() == QLocalSocket::ConnectedState) {
+-        if (m_bridgeSocket->bytesToWrite() < kMaxBridgeWriteQueueBytes
++        const qint64 pendingBytes = m_bridgeSocket->bytesToWrite();
++        if (pendingBytes >= kMaxHardBridgeWriteQueueBytes) {
++            return;
++        }
++        if (pendingBytes < kMaxBridgeWriteQueueBytes
+             || frame.kind == ContinuityCameraProtocol::FrameKind::CodecConfig
+             || (frame.flags & ContinuityCameraProtocol::FlagKeyframe) != 0) {
+             m_bridgeSocket->write(encoded);
+diff --git a/plugins/continuity_camera/continuitycameraprotocol.cpp b/plugins/continuity_camera/continuitycameraprotocol.cpp
+index d4a105b028211f7459f13408fa635d043f64f398..e3a3c2d5eb2f243a32fa70bed88826c470a7af5b 100644
+--- a/plugins/continuity_camera/continuitycameraprotocol.cpp
++++ b/plugins/continuity_camera/continuitycameraprotocol.cpp
+@@ -247,4 +247,9 @@ void CameraSessionMachine::onTeardown(bool error)
+ {
+     m_state = error ? State::Error : State::Idle;
+ }
++
++bool CameraSessionMachine::shouldAcceptStreamOpen(bool stopping) const
++{
++    return !stopping && m_state != State::Stopping;
++}
+ }
+diff --git a/plugins/continuity_camera/continuitycameraprotocol.h b/plugins/continuity_camera/continuitycameraprotocol.h
+index 24d940a1d1d3e08b25ca2edd2074728c1310d91a..5a7438bf33bd74e7966f265e8432b9b6da465133 100644
+--- a/plugins/continuity_camera/continuitycameraprotocol.h
++++ b/plugins/continuity_camera/continuitycameraprotocol.h
+@@ -101,6 +101,7 @@ public:
+     void onStreamOpen();
+     void beginStop();
+     void onTeardown(bool error = false);
++    bool shouldAcceptStreamOpen(bool stopping) const;
+ 
+ private:
+     State m_state = State::Idle;
+diff --git a/plugins/continuity_camera/continuitycameratest.cpp b/plugins/continuity_camera/continuitycameratest.cpp
+index fb2473ff7ad2e9be1f38d523b9549ca3491ce9e5..8e35fbdc8dff5b9dea506c8337d90886edf4ba6a 100644
+--- a/plugins/continuity_camera/continuitycameratest.cpp
++++ b/plugins/continuity_camera/continuitycameratest.cpp
+@@ -89,14 +89,45 @@ private Q_SLOTS:
+ 
+         ContinuityCameraProtocol::CameraSessionMachine fsm;
+         QCOMPARE(fsm.state(), ContinuityCameraProtocol::CameraSessionMachine::State::Idle);
++        QVERIFY(fsm.shouldAcceptStreamOpen(false));
+         fsm.beginStart();
+         QCOMPARE(fsm.stateName(), QStringLiteral("starting"));
++        QVERIFY(fsm.shouldAcceptStreamOpen(false));
+         fsm.onStreamOpen();
+         QCOMPARE(fsm.stateName(), QStringLiteral("streaming"));
+         fsm.beginStop();
+         QCOMPARE(fsm.stateName(), QStringLiteral("stopping"));
++        QVERIFY(!fsm.shouldAcceptStreamOpen(true));
++        QVERIFY(!fsm.shouldAcceptStreamOpen(false));
+         fsm.onTeardown(false);
+         QCOMPARE(fsm.stateName(), QStringLiteral("idle"));
++        QVERIFY(!fsm.shouldAcceptStreamOpen(true));
++        fsm.onTeardown(true);
++        QCOMPARE(fsm.stateName(), QStringLiteral("error"));
++    }
++
++    void testZeroLengthMediaRejectedAndLargePtsSafe()
++    {
++        const QByteArray emptyVid = ContinuityCameraProtocol::encodeFrame(
++            ContinuityCameraProtocol::FrameKind::VideoAccessUnit,
++            ContinuityCameraProtocol::FlagKeyframe,
++            1234ULL,
++            QByteArray());
++        ContinuityCameraProtocol::StreamFrameParser emptyParser;
++        QList<ContinuityCameraProtocol::StreamFrame> out;
++        QVERIFY(!emptyParser.feed(emptyVid, &out));
++        QVERIFY(emptyParser.hasError());
++
++        const quint64 largePtsUs = 3600000000ULL;
++        const QByteArray wire = ContinuityCameraProtocol::encodeFrame(
++            ContinuityCameraProtocol::FrameKind::VideoAccessUnit,
++            ContinuityCameraProtocol::FlagKeyframe,
++            largePtsUs,
++            QByteArrayLiteral("\x00\x00\x00\x01\x65\x88"));
++        ContinuityCameraProtocol::StreamFrameParser parser;
++        QVERIFY(parser.feed(wire, &out));
++        QCOMPARE(out.size(), 1);
++        QCOMPARE(out.first().ptsUs, largePtsUs);
+     }
+ };
+ 

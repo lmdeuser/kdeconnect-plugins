@@ -51,38 +51,75 @@ FORBIDDEN_SUFFIXES = (
 )
 
 
-def _iter_staged_entries(root: Path) -> list[tuple[str, bytes]]:
-    raw = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"])
+def _collect_staged_entries(root: Path) -> tuple[list[tuple[str, bytes]], list[str]]:
+    raw = subprocess.check_output(["git", "-C", str(root), "ls-files", "-s", "-z"])
     entries: list[tuple[str, bytes]] = []
+    issues: list[str] = []
     for item in raw.split(b"\0"):
         if not item:
             continue
-        rel = item.decode("utf-8")
+        meta_part, _, rel_bytes = item.partition(b"\t")
+        if not rel_bytes:
+            continue
+        mode = meta_part.decode("ascii", errors="replace").split()[0]
+        rel = rel_bytes.decode("utf-8")
+        if mode == "120000":
+            issues.append(f"{rel}: symlink (mode 120000) is prohibited in public tree")
+            continue
+        if mode == "160000":
+            issues.append(f"{rel}: submodule gitlink (mode 160000) is prohibited in public tree")
+            continue
         data = subprocess.check_output(["git", "-C", str(root), "show", f":{rel}"])
         entries.append((rel, data))
-    return entries
+    return entries, issues
 
 
-def _iter_worktree_entries(root: Path, skip_state_dir: bool) -> list[tuple[str, bytes]]:
+def _collect_worktree_entries(
+    root: Path,
+    skip_state_dir: bool,
+) -> tuple[list[tuple[str, bytes]], list[str]]:
     entries: list[tuple[str, bytes]] = []
+    issues: list[str] = []
     for dirpath, dirs, files in os.walk(root):
         current = Path(dirpath)
         skipped_dirs = {".git", "__pycache__"}
         if current == root and skip_state_dir:
             skipped_dirs.update({".state", "upstreams", "worktrees", "LICENSES"})
-        dirs[:] = sorted(d for d in dirs if d not in skipped_dirs)
+        kept_dirs: list[str] = []
+        for d in sorted(dirs):
+            if d in skipped_dirs:
+                continue
+            dpath = current / d
+            if dpath.is_symlink():
+                rel = dpath.relative_to(root).as_posix()
+                issues.append(f"{rel}: symlink is prohibited in public tree")
+                continue
+            kept_dirs.append(d)
+        dirs[:] = kept_dirs
         for name in sorted(files):
             if current == root and skip_state_dir and name == "LICENSES":
                 continue
             if name.endswith((".pyc", ".pyo")):
                 continue
             path = current / name
+            if path.is_symlink():
+                rel = path.relative_to(root).as_posix()
+                issues.append(f"{rel}: symlink is prohibited in public tree")
+                continue
             if not path.is_file():
                 continue
             rel = path.relative_to(root).as_posix()
             entries.append((rel, path.read_bytes()))
     entries.sort(key=lambda item: item[0])
-    return entries
+    return entries, issues
+
+
+def _iter_staged_entries(root: Path) -> list[tuple[str, bytes]]:
+    return _collect_staged_entries(root)[0]
+
+
+def _iter_worktree_entries(root: Path, skip_state_dir: bool) -> list[tuple[str, bytes]]:
+    return _collect_worktree_entries(root, skip_state_dir=skip_state_dir)[0]
 
 
 def _check_path_policy(rel: str, skip_state_dir: bool) -> str | None:
@@ -146,11 +183,10 @@ def scan_repository(
 ) -> list[str]:
     """Return a list of policy violation descriptions for the given repository."""
     if staged_only:
-        entries = _iter_staged_entries(root)
+        entries, issues = _collect_staged_entries(root)
     else:
-        entries = _iter_worktree_entries(root, skip_state_dir=skip_state_dir)
+        entries, issues = _collect_worktree_entries(root, skip_state_dir=skip_state_dir)
 
-    issues: list[str] = []
     for rel, data in entries:
         path_issue = _check_path_policy(rel, skip_state_dir=skip_state_dir if not staged_only else False)
         if path_issue:

@@ -1,0 +1,375 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 16:24:18 +0500
+Subject: [PATCH 2/3] btaudioswitch: add settings UI, filter playback events,
+ yield audio focus, and support LE Audio
+
+
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchPlugin.kt
+index c387c99d39461e65bb3b734225985fbddb0e0c7a..c7deebb5b77686347408476d969d22e66e78c8a2 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchPlugin.kt
+@@ -8,6 +8,7 @@ package org.kde.kdeconnect.plugins.btaudioswitch
+ 
+ import android.Manifest
+ import android.annotation.SuppressLint
++import android.app.Activity
+ import android.bluetooth.BluetoothA2dp
+ import android.bluetooth.BluetoothDevice
+ import android.bluetooth.BluetoothHeadset
+@@ -15,7 +16,9 @@ import android.content.BroadcastReceiver
+ import android.content.Context
+ import android.content.Intent
+ import android.content.IntentFilter
++import android.media.AudioAttributes
+ import android.media.AudioDeviceInfo
++import android.media.AudioFocusRequest
+ import android.media.AudioManager
+ import android.media.AudioPlaybackConfiguration
+ import android.os.Build
+@@ -27,6 +30,7 @@ import androidx.core.content.getSystemService
+ import org.kde.kdeconnect.plugins.Plugin
+ import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
+ import org.kde.kdeconnect.NetworkPacket
++import org.kde.kdeconnect.ui.PluginSettingsFragment
+ import org.kde.kdeconnect_tp.R
+ 
+ @LoadablePlugin
+@@ -37,6 +41,10 @@ class BtAudioSwitchPlugin : Plugin() {
+     private var btReceiver: BroadcastReceiver? = null
+     private var playbackCallback: AudioManager.AudioPlaybackCallback? = null
+ 
++    @Volatile
++    private var pendingYieldFocusRequest: Any? = null
++    private val abandonYieldFocusRunnable = Runnable { abandonPendingYieldFocus() }
++
+     override val displayName: String
+         get() = context.getString(R.string.pref_plugin_btaudioswitch)
+ 
+@@ -59,8 +67,14 @@ class BtAudioSwitchPlugin : Plugin() {
+     override val optionalPermissionExplanation: Int
+         get() = R.string.btaudioswitch_optional_permission_explanation
+ 
++    override val hasSettings: Boolean = true
++
+     override val settingsScope: SettingsScope = SettingsScope.PER_DEVICE
+ 
++    override fun getSettingsFragment(activity: Activity): PluginSettingsFragment {
++        return PluginSettingsFragment.newInstance(pluginKey, device.deviceId, R.xml.btaudioswitchplugin_preferences)
++    }
++
+     override fun onCreate() {
+         refreshAllowlist()
+         registerBluetoothReceiver()
+@@ -83,6 +97,7 @@ class BtAudioSwitchPlugin : Plugin() {
+         }
+         playbackCallback = null
+         mainHandler.removeCallbacksAndMessages(null)
++        abandonPendingYieldFocus()
+     }
+ 
+     override fun getUiButtons(): List<PluginUiButton> = listOf(
+@@ -143,9 +158,6 @@ class BtAudioSwitchPlugin : Plugin() {
+     }
+ 
+     private fun registerBluetoothReceiver() {
+-        if (!hasBluetoothPermission()) {
+-            return
+-        }
+         val filter = IntentFilter().apply {
+             addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
+             addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
+@@ -174,7 +186,7 @@ class BtAudioSwitchPlugin : Plugin() {
+             }
+         }
+         btReceiver = receiver
+-        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_EXPORTED)
++        ContextCompat.registerReceiver(context, receiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+     }
+ 
+     private fun registerAudioPlaybackObserver() {
+@@ -187,7 +199,16 @@ class BtAudioSwitchPlugin : Plugin() {
+                 if (configs.isNullOrEmpty() || !hasBluetoothPermission()) return
+                 val inCall = audioMgr.mode == AudioManager.MODE_IN_CALL ||
+                     audioMgr.mode == AudioManager.MODE_IN_COMMUNICATION
+-                val reason = if (inCall) BtAudioSwitchProtocol.SwitchReason.CALL else BtAudioSwitchProtocol.SwitchReason.MEDIA
++                val candidateReasons = configs.mapNotNull { cfg ->
++                    when (cfg.audioAttributes.usage) {
++                        AudioAttributes.USAGE_VOICE_COMMUNICATION,
++                        AudioAttributes.USAGE_VOICE_COMMUNICATION_SIGNALLING -> BtAudioSwitchProtocol.SwitchReason.CALL
++                        AudioAttributes.USAGE_MEDIA,
++                        AudioAttributes.USAGE_GAME -> BtAudioSwitchProtocol.SwitchReason.MEDIA
++                        else -> null
++                    }
++                }
++                val reason = BtAudioSwitchProtocol.resolvePlaybackSwitchReason(candidateReasons, inCall) ?: return
+                 claimFirstConnectedAllowlistedHeadset(reason, showFeedback = false)
+             }
+         }
+@@ -218,7 +239,11 @@ class BtAudioSwitchPlugin : Plugin() {
+         }
+         val audioMgr = context.getSystemService<AudioManager>() ?: return null
+         for (info in audioMgr.getDevices(AudioManager.GET_DEVICES_OUTPUTS)) {
+-            if (info.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP || info.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
++            val isBluetoothOutput = info.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
++                info.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
++                (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
++                    (info.type == AudioDeviceInfo.TYPE_BLE_HEADSET || info.type == AudioDeviceInfo.TYPE_BLE_SPEAKER))
++            if (isBluetoothOutput) {
+                 val mac = BtAudioSwitchProtocol.normalizeMac(info.address) ?: continue
+                 if (coordinator.isAllowed(mac)) {
+                     return mac
+@@ -258,6 +283,31 @@ class BtAudioSwitchPlugin : Plugin() {
+             @Suppress("DEPRECATION")
+             audioMgr.stopBluetoothSco()
+         }
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            mainHandler.removeCallbacks(abandonYieldFocusRunnable)
++            abandonPendingYieldFocus()
++            val attrs = AudioAttributes.Builder()
++                .setUsage(AudioAttributes.USAGE_MEDIA)
++                .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
++                .build()
++            val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
++                .setAudioAttributes(attrs)
++                .build()
++            if (audioMgr.requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
++                pendingYieldFocusRequest = focusRequest
++                mainHandler.postDelayed(abandonYieldFocusRunnable, BtAudioSwitchProtocol.YIELD_DELAY_MS)
++            }
++        }
++    }
++
++    private fun abandonPendingYieldFocus() {
++        val req = pendingYieldFocusRequest ?: return
++        pendingYieldFocusRequest = null
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
++            (req as? AudioFocusRequest)?.let { focusReq ->
++                context.getSystemService<AudioManager>()?.abandonAudioFocusRequest(focusReq)
++            }
++        }
+     }
+ 
+     private fun hasBluetoothPermission(): Boolean {
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchProtocol.kt b/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchProtocol.kt
+index e5bf12977db809b571ca6a1176d0356dc516cd9b..e50bee7c1390cf397d6112c7fa30459c362c1ae0 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchProtocol.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchProtocol.kt
+@@ -89,6 +89,16 @@ object BtAudioSwitchProtocol {
+         }
+     }
+ 
++    fun resolvePlaybackSwitchReason(
++        candidateReasons: Collection<SwitchReason>,
++        inCall: Boolean,
++    ): SwitchReason? {
++        if (inCall) {
++            return SwitchReason.CALL
++        }
++        return candidateReasons.maxByOrNull { it.priority }
++    }
++
+     class Coordinator {
+         private data class EntryState(
+             val owner: Owner,
+@@ -96,6 +106,7 @@ object BtAudioSwitchProtocol {
+             val lastTransitionMs: Long,
+         )
+ 
++        private val lock = Any()
+         private var allowlist: Set<String> = emptySet()
+         private val states = HashMap<String, EntryState>()
+ 
+@@ -108,14 +119,16 @@ object BtAudioSwitchProtocol {
+                     clean.add(canonical)
+                 }
+             }
+-            allowlist = clean
++            synchronized(lock) {
++                allowlist = clean
++            }
+         }
+ 
+-        fun getAllowlist(): Set<String> = allowlist
++        fun getAllowlist(): Set<String> = synchronized(lock) { allowlist }
+ 
+         fun isAllowed(mac: String?): Boolean {
+             val canonical = normalizeMac(mac) ?: return false
+-            return canonical in allowlist
++            return synchronized(lock) { canonical in allowlist }
+         }
+ 
+         fun evaluateTransition(
+@@ -125,25 +138,33 @@ object BtAudioSwitchProtocol {
+             nowMs: Long,
+         ): TransitionDecision {
+             val canonical = normalizeMac(rawMac) ?: return TransitionDecision(false, null, "invalid_mac")
+-            if (canonical !in allowlist) {
+-                return TransitionDecision(false, canonical, "not_allowlisted")
+-            }
++            synchronized(lock) {
++                if (canonical !in allowlist) {
++                    return TransitionDecision(false, canonical, "not_allowlisted")
++                }
+ 
+-            val prev = states[canonical]
+-            if (prev != null) {
+-                val elapsed = nowMs - prev.lastTransitionMs
+-                if (elapsed in 0 until HYSTERESIS_MS && reason.priority <= prev.lastReason.priority) {
+-                    return TransitionDecision(false, canonical, "hysteresis_cooldown")
++                val prev = states[canonical]
++                if (prev != null) {
++                    if (prev.owner == targetOwner &&
++                        reason != SwitchReason.MANUAL &&
++                        reason.priority <= prev.lastReason.priority
++                    ) {
++                        return TransitionDecision(false, canonical, "already_owned")
++                    }
++                    val elapsed = nowMs - prev.lastTransitionMs
++                    if (elapsed in 0 until HYSTERESIS_MS && reason.priority <= prev.lastReason.priority) {
++                        return TransitionDecision(false, canonical, "hysteresis_cooldown")
++                    }
+                 }
+-            }
+ 
+-            states[canonical] = EntryState(owner = targetOwner, lastReason = reason, lastTransitionMs = nowMs)
+-            return TransitionDecision(true, canonical, "")
++                states[canonical] = EntryState(owner = targetOwner, lastReason = reason, lastTransitionMs = nowMs)
++                return TransitionDecision(true, canonical, "")
++            }
+         }
+ 
+         fun ownerFor(rawMac: String?): Owner {
+             val canonical = normalizeMac(rawMac) ?: return Owner.NONE
+-            return states[canonical]?.owner ?: Owner.NONE
++            return synchronized(lock) { states[canonical]?.owner ?: Owner.NONE }
+         }
+     }
+ }
+diff --git a/src/main/res/values/strings_bt_audio_switch.xml b/src/main/res/values/strings_bt_audio_switch.xml
+index ee16d80df5677129b6a27a281dfe94cf9f60c284..00fa67d53f0737a37bb5bee50da4f2e74f4b759b 100644
+--- a/src/main/res/values/strings_bt_audio_switch.xml
++++ b/src/main/res/values/strings_bt_audio_switch.xml
+@@ -11,4 +11,7 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <string name="btaudioswitch_optional_permission_explanation">Bluetooth permission lets KDE Connect detect connected allowlisted headsets by MAC address</string>
+     <string name="btaudioswitch_no_allowlisted_headset">No connected allowlisted Bluetooth headset available</string>
+     <string name="btaudioswitch_claim_sent">Requested Bluetooth headset handoff</string>
++    <string name="btaudioswitch_pref_allowed_macs_title">Allowlisted headset MAC addresses</string>
++    <string name="btaudioswitch_pref_allowed_macs_summary">Comma-separated Bluetooth MACs eligible for handoff</string>
++    <string name="btaudioswitch_pref_allowed_macs_dialog_desc">Enter comma-separated Bluetooth headset MAC addresses (AA:BB:CC:DD:EE:FF)</string>
+ </resources>
+diff --git a/src/main/res/xml/btaudioswitchplugin_preferences.xml b/src/main/res/xml/btaudioswitchplugin_preferences.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..2ef902101d2f1c48375a669ae3c6f55d7beb7085
+--- /dev/null
++++ b/src/main/res/xml/btaudioswitchplugin_preferences.xml
+@@ -0,0 +1,19 @@
++<?xml version="1.0" encoding="utf-8"?>
++
++<!--
++SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++
++SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++-->
++
++<PreferenceScreen xmlns:tools="http://schemas.android.com/tools"
++    xmlns:android="http://schemas.android.com/apk/res/android"
++    tools:keep="@xml/btaudioswitchplugin_preferences">
++
++    <EditTextPreference
++        android:dialogMessage="@string/btaudioswitch_pref_allowed_macs_dialog_desc"
++        android:key="allowedHeadsetMacs"
++        android:summary="@string/btaudioswitch_pref_allowed_macs_summary"
++        android:title="@string/btaudioswitch_pref_allowed_macs_title" />
++
++</PreferenceScreen>
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchProtocolTest.kt b/src/test/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchProtocolTest.kt
+index 8c1b2082aae32a8711b13c6f3aea6dc07204b4b8..a6398ed0fdedf5d72e65a2907db19ffd37f7f4c7 100644
+--- a/src/test/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchProtocolTest.kt
++++ b/src/test/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchProtocolTest.kt
+@@ -87,4 +87,85 @@ class BtAudioSwitchProtocolTest {
+         }
+         assertNull(BtAudioSwitchProtocol.parsePacket(malformed))
+     }
++
++    @Test
++    fun coordinatorSuppressesSameOwnerNonManualSpamWhileAllowingManualAndHigherPriority() {
++        val coord = BtAudioSwitchProtocol.Coordinator()
++        coord.setAllowlist(listOf("AA:BB:CC:DD:EE:FF"))
++
++        assertTrue(
++            coord.evaluateTransition(
++                rawMac = "AA:BB:CC:DD:EE:FF",
++                targetOwner = BtAudioSwitchProtocol.Owner.LOCAL,
++                reason = BtAudioSwitchProtocol.SwitchReason.MEDIA,
++                nowMs = 10_000L,
++            ).accepted
++        )
++
++        // Repeat same-owner non-MANUAL MEDIA claim is rejected even after hysteresis cooldown
++        val repeatMedia = coord.evaluateTransition(
++            rawMac = "AA:BB:CC:DD:EE:FF",
++            targetOwner = BtAudioSwitchProtocol.Owner.LOCAL,
++            reason = BtAudioSwitchProtocol.SwitchReason.MEDIA,
++            nowMs = 20_000L,
++        )
++        assertFalse(repeatMedia.accepted)
++        assertEquals("already_owned", repeatMedia.rejectReason)
++
++        // MANUAL claim by same owner succeeds
++        assertTrue(
++            coord.evaluateTransition(
++                rawMac = "AA:BB:CC:DD:EE:FF",
++                targetOwner = BtAudioSwitchProtocol.Owner.LOCAL,
++                reason = BtAudioSwitchProtocol.SwitchReason.MANUAL,
++                nowMs = 20_500L,
++            ).accepted
++        )
++
++        // Repeated MANUAL claim after hysteresis cooldown also succeeds
++        assertTrue(
++            coord.evaluateTransition(
++                rawMac = "AA:BB:CC:DD:EE:FF",
++                targetOwner = BtAudioSwitchProtocol.Owner.LOCAL,
++                reason = BtAudioSwitchProtocol.SwitchReason.MANUAL,
++                nowMs = 25_000L,
++            ).accepted
++        )
++
++        // Higher-priority CALL claim by same owner still succeeds within hysteresis
++        assertTrue(
++            coord.evaluateTransition(
++                rawMac = "AA:BB:CC:DD:EE:FF",
++                targetOwner = BtAudioSwitchProtocol.Owner.LOCAL,
++                reason = BtAudioSwitchProtocol.SwitchReason.CALL,
++                nowMs = 25_500L,
++            ).accepted
++        )
++    }
++
++    @Test
++    fun playbackSwitchReasonPrefersCallAndIgnoresEmpty() {
++        assertNull(BtAudioSwitchProtocol.resolvePlaybackSwitchReason(emptyList(), inCall = false))
++        assertEquals(
++            BtAudioSwitchProtocol.SwitchReason.MEDIA,
++            BtAudioSwitchProtocol.resolvePlaybackSwitchReason(
++                listOf(BtAudioSwitchProtocol.SwitchReason.MEDIA),
++                inCall = false,
++            ),
++        )
++        assertEquals(
++            BtAudioSwitchProtocol.SwitchReason.CALL,
++            BtAudioSwitchProtocol.resolvePlaybackSwitchReason(
++                listOf(BtAudioSwitchProtocol.SwitchReason.MEDIA),
++                inCall = true,
++            ),
++        )
++        assertEquals(
++            BtAudioSwitchProtocol.SwitchReason.CALL,
++            BtAudioSwitchProtocol.resolvePlaybackSwitchReason(
++                listOf(BtAudioSwitchProtocol.SwitchReason.MEDIA, BtAudioSwitchProtocol.SwitchReason.CALL),
++                inCall = false,
++            ),
++        )
++    }
+ }

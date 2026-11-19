@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 20:55:54 +0500
+Subject: [PATCH 3/3] bt_audio_switch: defer automatic media claims while
+ screencast audio is active
+
+
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchPlugin.kt
+index c7deebb5b77686347408476d969d22e66e78c8a2..494beb20ccd7e1a42e4da8f67e8fd1d06b95fff0 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/btaudioswitch/BtAudioSwitchPlugin.kt
+@@ -147,11 +147,18 @@ class BtAudioSwitchPlugin : Plugin() {
+                 reason = msg.reason,
+                 nowMs = nowMs,
+             )
++            mainHandler.removeCallbacks(abandonYieldFocusRunnable)
++            abandonPendingYieldFocus()
+             return true
+         }
+         return false
+     }
+ 
++    private fun isScreencastAudioActiveOnPc(): Boolean {
++        return context.getSharedPreferences("${context.packageName}_audio_arbiter", Context.MODE_PRIVATE)
++            .getBoolean("screenstream_audio_active", false)
++    }
++
+     private fun refreshAllowlist() {
+         val raw = preferences.getString(PREF_ALLOWED_HEADSET_MACS, "").orEmpty()
+         coordinator.setAllowlist(BtAudioSwitchProtocol.parseAllowlist(raw))
+@@ -209,6 +216,9 @@ class BtAudioSwitchPlugin : Plugin() {
+                     }
+                 }
+                 val reason = BtAudioSwitchProtocol.resolvePlaybackSwitchReason(candidateReasons, inCall) ?: return
++                if (reason == BtAudioSwitchProtocol.SwitchReason.MEDIA && isScreencastAudioActiveOnPc()) {
++                    return
++                }
+                 claimFirstConnectedAllowlistedHeadset(reason, showFeedback = false)
+             }
+         }

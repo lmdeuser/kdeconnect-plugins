@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:10:26 +0500
+Subject: [PATCH 4/6] notifications: support remote open action for Screen
+ Stream
+
+
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
+index 9dceab33eb6b7ccd3f81999263ee3cbb13cc4230..763669f00179b1c78fbaa97fceeee9932ce7b920 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
+@@ -6,6 +6,7 @@
+ package org.kde.kdeconnect.plugins.notifications
+ 
+ import android.app.Activity
++import android.app.ActivityOptions
+ import android.app.KeyguardManager
+ import android.app.Notification
+ import android.app.PendingIntent
+@@ -55,6 +56,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+     private val postedNotifications = HashSet<String>()
+     private val pendingIntents = HashMap<String, RepliableNotification>()
+     private val pendingActions = mutableMapOf<String, MutableList<Notification.Action>>()
++    private val pendingContentIntents = HashMap<String, PendingIntent>()
+     private var serviceReady = false
+     private lateinit var keyguardManager: KeyguardManager
+     private lateinit var mainHandler: Handler
+@@ -90,6 +92,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+         notificationsIcons.clear()
+         pendingIntents.clear()
+         pendingActions.clear()
++        pendingContentIntents.clear()
+ 
+         synchronized(postedNotificationsLock) {
+             mainHandler.removeCallbacksAndMessages(null)
+@@ -117,6 +120,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+         }
+ 
+         pendingActions.remove(id)
++        pendingContentIntents.remove(id)
+ 
+         if (!appDatabase.isEnabled(statusBarNotification.packageName)) {
+             currentNotifications.remove(id)
+@@ -250,6 +254,11 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+         val isGroupConversation = isConversation && messagingStyle.isGroupConversation() && messagingStyle.conversationTitle != null
+ 
+         np["actions"] = extractActions(notification, key)
++        val contentIntent = notification.contentIntent
++        if (contentIntent != null) {
++            pendingContentIntents[key] = contentIntent
++            np["hasContentIntent"] = true
++        }
+ 
+         // Some apps ask to notify the user only once they are posted and not for updates, but (for some reason),
+         // some messaging apps also set that flag, and we should notify the user for every new message (since they
+@@ -507,6 +516,28 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+     override fun onPacketReceived(np: NetworkPacket): Boolean {
+         if (np.type == PACKET_TYPE_NOTIFICATION_ACTION) {
+             val key = np.getString("key")
++            if (np.getBoolean("open", false)) {
++                val contentIntent = pendingContentIntents[key]
++                if (contentIntent != null) {
++                    try {
++                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
++                            val opts = ActivityOptions.makeBasic()
++                                .setPendingIntentBackgroundActivityStartMode(
++                                    ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED,
++                                )
++                                .toBundle()
++                            contentIntent.send(context, 0, null, null, null, null, opts)
++                        } else {
++                            contentIntent.send()
++                        }
++                    } catch (e: PendingIntent.CanceledException) {
++                        Log.e(TAG, "Opening notification contentIntent failed", e)
++                    } catch (e: SecurityException) {
++                        Log.e(TAG, "Opening notification contentIntent denied", e)
++                    }
++                }
++                return true
++            }
+             val title = np.getString("action")
+             val intent = pendingActions[key]?.firstOrNull { it.title?.contentEquals(title) == true }?.actionIntent
+ 

@@ -109,6 +109,18 @@ class PublicTreeCheckTests(unittest.TestCase):
             self.assertTrue(any(item.startswith("upstreams/") for item in strict_issues), strict_issues)
             self.assertTrue(any(item.startswith("worktrees/") for item in strict_issues), strict_issues)
 
+    def test_rejects_symlinks_in_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_clean_repo(root)
+            (root / "escape.link").symlink_to("/etc/passwd")
+            sym_dir = root / "dirlink"
+            sym_dir.symlink_to("/etc")
+            issues = scan_repository(root, staged_only=False)
+            joined = "\n".join(issues)
+            self.assertIn("escape.link", joined)
+            self.assertIn("dirlink", joined)
+
 
 class KdeComplianceTests(unittest.TestCase):
     def _populate_licenses(self, root: Path) -> None:
@@ -161,6 +173,40 @@ class KdeComplianceTests(unittest.TestCase):
             joined = "\n".join(issues)
             self.assertIn("missing.py", joined)
             self.assertIn("bad_lic.py", joined)
+
+    def test_repo_reuse_validates_annotations_and_rejects_unknown_annotation_licenses(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._populate_licenses(root)
+            (root / "REUSE.toml").write_text(
+                "# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>\n"
+                "# SPDX-License-Identifier: CC0-1.0\n\n"
+                "version = 1\n\n"
+                "[[annotations]]\n"
+                'path = "patches/**"\n'
+                'SPDX-FileCopyrightText = "2026 Dmitriy Volkov <dennshield@duck.com>"\n'
+                'SPDX-License-Identifier = "GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL"\n',
+                encoding="utf-8",
+            )
+            patch = root / "patches" / "desktop" / "demo" / "0001-demo.patch"
+            patch.parent.mkdir(parents=True)
+            patch.write_text("From: Test <t@example.invalid>\nSubject: demo\n", encoding="utf-8")
+            self.assertEqual(check_repo_reuse(root), [])
+
+            (root / "unannotated.py").write_text("print('hi')\n", encoding="utf-8")
+            self.assertTrue(any("unannotated.py" in item for item in check_repo_reuse(root)))
+            (root / "unannotated.py").unlink()
+
+            (root / "REUSE.toml").write_text(
+                "# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>\n"
+                "# SPDX-License-Identifier: CC0-1.0\n\n"
+                "[[annotations]]\n"
+                'path = "patches/**"\n'
+                'SPDX-FileCopyrightText = "2026 Dmitriy Volkov <dennshield@duck.com>"\n'
+                'SPDX-License-Identifier = "MIT"\n',
+                encoding="utf-8",
+            )
+            self.assertTrue(any("unknown license" in item for item in check_repo_reuse(root)))
 
     def _init_upstream_repo(self, repo: Path) -> str:
         _git(repo, "init", "-b", "master")

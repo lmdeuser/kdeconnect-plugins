@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:09:51 +0500
+Subject: [PATCH 5/8] screenstream: add Drag & Drop file share and Open on
+ Phone Screen action
+
+
+diff --git a/plugins/notifications/notification.cpp b/plugins/notifications/notification.cpp
+index 364916dd31fa63f2aa8bf1a13659838375b8e89e..6d284ae2ef08f1282836330622ddf91f9a118149 100644
+--- a/plugins/notifications/notification.cpp
++++ b/plugins/notifications/notification.cpp
+@@ -140,6 +140,12 @@ void Notification::updateKNotification()
+             Q_EMIT actionTriggered(m_internalId, actionId);
+         });
+     }
++    if (m_contents.hasContentIntent && m_device && m_device->incomingCapabilities().contains(QStringLiteral("kdeconnect.screenstream.request"))) {
++        KNotificationAction *openAct = m_notification->addAction(i18nc("@action:button", "Open on Phone Screen"));
++        connect(openAct, &KNotificationAction::activated, this, [this] {
++            Q_EMIT openRequested(m_internalId);
++        });
++    }
+ 
+     m_notification->setPixmap(m_contents.iconPath.isEmpty() ? QPixmap() : QPixmap(m_contents.iconPath, "PNG"));
+ }
+@@ -193,6 +199,7 @@ void Notification::update(const NetworkPacket &np)
+     m_contents.dismissable = np.get<bool>(QStringLiteral("isClearable"));
+     m_payloadHash = np.get<QString>(QStringLiteral("payloadHash"));
+     m_contents.requestReplyId = np.get<QString>(QStringLiteral("requestReplyId"), QString());
++    m_contents.hasContentIntent = np.get<bool>(QStringLiteral("hasContentIntent"), false);
+ 
+     m_contents.conversation = np.get<QJsonArray>(QStringLiteral("conversation"), QJsonArray());
+     if (!m_contents.conversation.isEmpty()) {
+diff --git a/plugins/notifications/notification.h b/plugins/notifications/notification.h
+index e1ba92b3267f4584b6901c8124e8502b95ee58ca..0da008d272137535a42b74896848f48717251b34 100644
+--- a/plugins/notifications/notification.h
++++ b/plugins/notifications/notification.h
+@@ -38,6 +38,7 @@ class Notification : public QObject
+     Q_PROPERTY(bool hasIcon READ hasIcon NOTIFY ready)
+     Q_PROPERTY(bool silent READ silent NOTIFY ready)
+     Q_PROPERTY(QString replyId READ replyId NOTIFY ready)
++    Q_PROPERTY(bool hasContentIntent READ hasContentIntent NOTIFY ready)
+ 
+ public:
+     Notification(const NetworkPacket &np, const Device *device, QObject *parent);
+@@ -82,6 +83,10 @@ public:
+     {
+         return !m_contents.iconPath.isEmpty();
+     }
++    bool hasContentIntent() const
++    {
++        return m_contents.hasContentIntent;
++    }
+     void show();
+     bool silent() const
+     {
+@@ -111,6 +116,7 @@ Q_SIGNALS:
+     void replyRequested();
+     Q_SCRIPTABLE void ready();
+     void actionTriggered(const QString &key, const QString &action);
++    void openRequested(const QString &key);
+     void replied(const QString &message);
+ 
+ private:
+@@ -126,6 +132,7 @@ private:
+         QString requestReplyId;
+         QStringList actions;
+         QJsonArray conversation;
++        bool hasContentIntent = false;
+ 
+         bool operator==(const Contents &other) const = default;
+     };
+diff --git a/plugins/notifications/notificationsplugin.cpp b/plugins/notifications/notificationsplugin.cpp
+index 6f1056b55a014ba09ed4c7ffa4d1ebf6e5455ea1..1bf9b23f805998e40a0bcee4a4393567508d7c95 100644
+--- a/plugins/notifications/notificationsplugin.cpp
++++ b/plugins/notifications/notificationsplugin.cpp
+@@ -14,6 +14,8 @@
+ 
+ #include <KPluginFactory>
+ #include <KSystemClipboard>
++#include <QDBusConnection>
++#include <QDBusInterface>
+ 
+ #if WITH_X11
+ #include <KStartupInfo>
+@@ -109,6 +111,7 @@ void NotificationsPlugin::addNotification(Notification *noti)
+     });
+ 
+     connect(noti, &Notification::actionTriggered, this, &NotificationsPlugin::sendAction);
++    connect(noti, &Notification::openRequested, this, &NotificationsPlugin::openNotification);
+     connect(noti, &Notification::replied, this, [this, noti](const QString &message) {
+         sendReply(noti->replyId(), message);
+     });
+@@ -228,5 +231,27 @@ QString NotificationsPlugin::dbusPath() const
+     return QLatin1String("/modules/kdeconnect/devices/%1/notifications").arg(device()->id());
+ }
+ 
++void NotificationsPlugin::openNotification(const QString &key)
++{
++    NetworkPacket np(PACKET_TYPE_NOTIFICATION_ACTION);
++    np.set<QString>(QStringLiteral("key"), key);
++    np.set<bool>(QStringLiteral("open"), true);
++    sendPacket(np);
++
++    const QString streamPath = QStringLiteral("/modules/kdeconnect/devices/%1/screenstream").arg(device()->id());
++    QDBusInterface streamIface(QStringLiteral("org.kde.kdeconnect"),
++                               streamPath,
++                               QStringLiteral("org.kde.kdeconnect.device.screenstream"),
++                               QDBusConnection::sessionBus());
++    if (!streamIface.isValid()) {
++        return;
++    }
++    if (streamIface.property("isStreaming").toBool()) {
++        streamIface.asyncCall(QStringLiteral("wakeScreen"));
++    } else {
++        streamIface.asyncCall(QStringLiteral("startStream"));
++    }
++}
++
+ #include "moc_notificationsplugin.cpp"
+ #include "notificationsplugin.moc"
+diff --git a/plugins/notifications/notificationsplugin.h b/plugins/notifications/notificationsplugin.h
+index b24c5ed9a559e733f5f39d2aef8abb2755655f6b..65514d6c9025e26af8680f36fa2d00ad5b81d33c 100644
+--- a/plugins/notifications/notificationsplugin.h
++++ b/plugins/notifications/notificationsplugin.h
+@@ -36,6 +36,7 @@ public Q_SLOTS:
+     Q_SCRIPTABLE QStringList activeNotifications();
+     Q_SCRIPTABLE void sendReply(const QString &replyId, const QString &message);
+     Q_SCRIPTABLE void sendAction(const QString &key, const QString &action);
++    Q_SCRIPTABLE void openNotification(const QString &key);
+ 
+ Q_SIGNALS:
+     Q_SCRIPTABLE void notificationPosted(const QString &publicId);
+diff --git a/plugins/screenstream/viewer/viewerwindow.cpp b/plugins/screenstream/viewer/viewerwindow.cpp
+index 9bec9ec490dd4d9f83e4fdabc15dcbf6e74b5ebe..132f3c46d68cf482afbf306acc5374ad31f1c72e 100644
+--- a/plugins/screenstream/viewer/viewerwindow.cpp
++++ b/plugins/screenstream/viewer/viewerwindow.cpp
+@@ -15,13 +15,17 @@
+ #include <QCloseEvent>
+ #include <QDBusConnection>
+ #include <QDBusInterface>
++#include <QDragEnterEvent>
++#include <QDropEvent>
+ #include <QFileDialog>
++#include <QFileInfo>
+ #include <QFocusEvent>
+ #include <QGuiApplication>
+ #include <QIcon>
+ #include <QKeyEvent>
+ #include <QLabel>
+ #include <QLocalSocket>
++#include <QMimeData>
+ #include <QMouseEvent>
+ #include <QPainter>
+ #include <QPalette>
+@@ -29,6 +33,7 @@
+ #include <QStandardPaths>
+ #include <QTimer>
+ #include <QToolBar>
++#include <QUrl>
+ #include <QVBoxLayout>
+ #include <QWheelEvent>
+ 
+@@ -291,6 +296,7 @@ void ViewerWindow::setupUi()
+ {
+     const QString titleName = m_config.deviceName.isEmpty() ? m_config.deviceId : m_config.deviceName;
+     setWindowTitle(i18n("Screen Stream - %1", titleName));
++    setAcceptDrops(true);
+ 
+     m_toolbar = addToolBar(i18n("Screen Stream Controls"));
+     m_toolbar->setMovable(false);
+@@ -753,6 +759,48 @@ void ViewerWindow::onDbusStreamingChanged(bool streaming)
+     }
+ }
+ 
++void ViewerWindow::dragEnterEvent(QDragEnterEvent *event)
++{
++    const QMimeData *mime = event->mimeData();
++    if (!mime || !mime->hasUrls()) {
++        event->ignore();
++        return;
++    }
++    const QList<QUrl> urls = mime->urls();
++    for (const QUrl &url : urls) {
++        if (url.isLocalFile() && QFileInfo(url.toLocalFile()).isFile()) {
++            event->acceptProposedAction();
++            return;
++        }
++    }
++    event->ignore();
++}
++
++void ViewerWindow::dropEvent(QDropEvent *event)
++{
++    const QMimeData *mime = event->mimeData();
++    if (!mime || !mime->hasUrls() || !m_shareIface || !m_shareIface->isValid()) {
++        event->ignore();
++        return;
++    }
++    QStringList rawUrls;
++    const QList<QUrl> urls = mime->urls();
++    for (const QUrl &url : urls) {
++        if (rawUrls.size() >= 32) {
++            break;
++        }
++        if (url.isLocalFile() && QFileInfo(url.toLocalFile()).isFile()) {
++            rawUrls.append(url.toString());
++        }
++    }
++    if (rawUrls.isEmpty()) {
++        event->ignore();
++        return;
++    }
++    m_shareIface->asyncCall(QStringLiteral("shareUrls"), rawUrls);
++    event->acceptProposedAction();
++}
++
+ void ViewerWindow::closeEvent(QCloseEvent *event)
+ {
+     m_closing = true;
+diff --git a/plugins/screenstream/viewer/viewerwindow.h b/plugins/screenstream/viewer/viewerwindow.h
+index 991792499f625598025f63fbe495401dc9fd8dd5..af907a23a87964eb90d317c604cdf5e0ebc31283 100644
+--- a/plugins/screenstream/viewer/viewerwindow.h
++++ b/plugins/screenstream/viewer/viewerwindow.h
+@@ -21,6 +21,8 @@ class PcmPlayer;
+ class QAction;
+ class QCloseEvent;
+ class QDBusInterface;
++class QDragEnterEvent;
++class QDropEvent;
+ class QFocusEvent;
+ class QKeyEvent;
+ class QLabel;
+@@ -97,6 +99,8 @@ public:
+ 
+ protected:
+     void closeEvent(QCloseEvent *event) override;
++    void dragEnterEvent(QDragEnterEvent *event) override;
++    void dropEvent(QDropEvent *event) override;
+ 
+ private Q_SLOTS:
+     void onSocketConnected();

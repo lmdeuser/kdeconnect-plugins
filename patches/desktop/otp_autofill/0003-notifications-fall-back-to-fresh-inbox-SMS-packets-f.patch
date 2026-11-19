@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 18:05:57 +0500
+Subject: [PATCH 3/3] notifications: fall back to fresh inbox SMS packets for
+ OTP extraction
+
+
+diff --git a/plugins/notifications/kdeconnect_notifications.json b/plugins/notifications/kdeconnect_notifications.json
+index 976343f8814cb9465294ebc7248da989c746f613..d90a2fa8547b5fd348b4eea03ddab096af2af042 100644
+--- a/plugins/notifications/kdeconnect_notifications.json
++++ b/plugins/notifications/kdeconnect_notifications.json
+@@ -168,6 +168,7 @@
+         "kdeconnect.notification.action"
+     ],
+     "X-KdeConnect-SupportedPacketType": [
+-        "kdeconnect.notification"
++        "kdeconnect.notification",
++        "kdeconnect.sms.messages"
+     ]
+ }
+diff --git a/plugins/notifications/notificationsplugin.cpp b/plugins/notifications/notificationsplugin.cpp
+index 76f91c0b60605faa5e212cb32111bc4c0f1b4b17..4d9b52eb4589f2b854f2137918f49fecb687b3e9 100644
+--- a/plugins/notifications/notificationsplugin.cpp
++++ b/plugins/notifications/notificationsplugin.cpp
+@@ -20,6 +20,7 @@
+ #include <private/qtx11extras_p.h>
+ #endif
+ 
++#include <QDateTime>
+ #include <QMimeData>
+ #include <QPointer>
+ #include <QTimer>
+@@ -36,6 +37,11 @@ void NotificationsPlugin::connected()
+ 
+ void NotificationsPlugin::receivePacket(const NetworkPacket &np)
+ {
++    if (np.type() == QLatin1String("kdeconnect.sms.messages")) {
++        maybeAutoCopyAuthCodeFromSms(np);
++        return;
++    }
++
+     if (np.get<bool>(QStringLiteral("request"))) {
+         qCWarning(KDECONNECT_PLUGIN_NOTIFICATIONS) << "Unexpected notification request. Maybe the paired client is very old?";
+     }
+@@ -223,22 +229,22 @@ void NotificationsPlugin::copyAuthCodeIfPresent(const QString &action)
+     writeOtpToClipboard(text, false);
+ }
+ 
+-void NotificationsPlugin::maybeAutoCopyAuthCode(Notification *noti)
++void NotificationsPlugin::commitAutoCopiedOtp(const QString &sourceKey, const QString &code)
+ {
+-    if (!noti || noti->silent() || !config()->getBool(QStringLiteral("autoCopyAuthCode"), true)) {
++    if (code.isEmpty()) {
+         return;
+     }
+-
+-    const QString code = OtpCodeExtractor::extractFromNotification(noti->title(), noti->text(), noti->actions());
+-    if (code.isEmpty()) {
++    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
++    if (!sourceKey.isEmpty() && m_lastAutoCopiedSourceKey == sourceKey && m_lastAutoCopiedCode == code) {
+         return;
+     }
+-    if (m_lastAutoCopiedNotificationId == noti->internalId() && m_lastAutoCopiedCode == code) {
++    if (m_lastAutoCopiedCode == code && (nowMs - m_lastAutoCopiedEpochMs) >= 0 && (nowMs - m_lastAutoCopiedEpochMs) <= 15000) {
+         return;
+     }
+ 
+-    m_lastAutoCopiedNotificationId = noti->internalId();
++    m_lastAutoCopiedSourceKey = sourceKey;
+     m_lastAutoCopiedCode = code;
++    m_lastAutoCopiedEpochMs = nowMs;
+     writeOtpToClipboard(code, true);
+ 
+     QPointer<NotificationsPlugin> guard(this);
+@@ -252,6 +258,31 @@ void NotificationsPlugin::maybeAutoCopyAuthCode(Notification *noti)
+     });
+ }
+ 
++void NotificationsPlugin::maybeAutoCopyAuthCode(Notification *noti)
++{
++    if (!noti || noti->silent() || !config()->getBool(QStringLiteral("autoCopyAuthCode"), true)) {
++        return;
++    }
++
++    const QString code = OtpCodeExtractor::extractFromNotification(noti->title(), noti->text(), noti->actions());
++    if (!code.isEmpty()) {
++        commitAutoCopiedOtp(noti->internalId(), code);
++    }
++}
++
++void NotificationsPlugin::maybeAutoCopyAuthCodeFromSms(const NetworkPacket &np)
++{
++    if (!config()->getBool(QStringLiteral("autoCopyAuthCode"), true)) {
++        return;
++    }
++
++    const QVariantList messages = np.get<QVariantList>(QStringLiteral("messages"));
++    const QString code = OtpCodeExtractor::extractFromSmsBatch(messages, QDateTime::currentMSecsSinceEpoch());
++    if (!code.isEmpty()) {
++        commitAutoCopiedOtp(QStringLiteral("sms:") + code, code);
++    }
++}
++
+ QString NotificationsPlugin::newId()
+ {
+     return QString::number(++m_lastId);
+diff --git a/plugins/notifications/notificationsplugin.h b/plugins/notifications/notificationsplugin.h
+index 85a1520160ee1da87f6d7b9aff019ef475de60c0..fb3007597f6d219af31ccdf4588030c9daf18c05 100644
+--- a/plugins/notifications/notificationsplugin.h
++++ b/plugins/notifications/notificationsplugin.h
+@@ -52,6 +52,8 @@ private:
+      */
+     void copyAuthCodeIfPresent(const QString &action);
+     void maybeAutoCopyAuthCode(Notification *noti);
++    void maybeAutoCopyAuthCodeFromSms(const NetworkPacket &np);
++    void commitAutoCopiedOtp(const QString &sourceKey, const QString &code);
+ 
+     void removeNotification(const QString &internalId);
+     QString newId(); // Generates successive identifiers to use as public ids
+@@ -61,6 +63,7 @@ private:
+     QHash<QString, QString> m_internalIdToPublicId;
+     QHash<QString, Notification *> m_pendingNotifications; // By internal id, waiting for their icon to download
+     int m_lastId = 0;
+-    QString m_lastAutoCopiedNotificationId;
++    QString m_lastAutoCopiedSourceKey;
+     QString m_lastAutoCopiedCode;
++    qint64 m_lastAutoCopiedEpochMs = 0;
+ };
+diff --git a/plugins/notifications/otpcodeextractor.cpp b/plugins/notifications/otpcodeextractor.cpp
+index cc0a0858d2bb1f24be07efbe5a048396be6f1e6a..94ef05feb84f57b4bf9aeee35d2d547fadbf5273 100644
+--- a/plugins/notifications/otpcodeextractor.cpp
++++ b/plugins/notifications/otpcodeextractor.cpp
+@@ -9,6 +9,7 @@
+ #include <QList>
+ #include <QPair>
+ #include <QRegularExpression>
++#include <QVariantMap>
+ 
+ namespace
+ {
+@@ -16,6 +17,9 @@ constexpr int MAX_ACTION_LENGTH = 256;
+ constexpr int MAX_TITLE_LENGTH = 512;
+ constexpr int MAX_TEXT_LENGTH = 4096;
+ constexpr int MAX_ACTIONS_COUNT = 16;
++constexpr qsizetype MAX_SMS_BATCH_FOR_OTP = 16;
++constexpr int SMS_MESSAGE_TYPE_INBOX = 1;
++constexpr qint64 SMS_FRESHNESS_WINDOW_MS = 120000;
+ 
+ bool isCurrencyChar(QChar ch)
+ {
+@@ -230,4 +234,49 @@ QString extractFromNotification(const QString &title, const QString &text, const
+ 
+     return {};
+ }
++
++QString extractFromSmsBatch(const QVariantList &messages, qint64 nowEpochMs)
++{
++    if (messages.isEmpty() || messages.size() > MAX_SMS_BATCH_FOR_OTP) {
++        return {};
++    }
++
++    QString newestCode;
++    qint64 newestTimestamp = -1;
++
++    for (const QVariant &entry : messages) {
++        const QVariantMap msg = entry.toMap();
++        if (msg.value(QStringLiteral("type")).toInt() != SMS_MESSAGE_TYPE_INBOX) {
++            continue;
++        }
++
++        bool dateOk = false;
++        const qint64 msgDateMs = msg.value(QStringLiteral("date")).toLongLong(&dateOk);
++        if (!dateOk || msgDateMs <= 0) {
++            continue;
++        }
++        if (nowEpochMs > 0 && qAbs(nowEpochMs - msgDateMs) > SMS_FRESHNESS_WINDOW_MS) {
++            continue;
++        }
++
++        const QString body = msg.value(QStringLiteral("body")).toString();
++        if (body.isEmpty()) {
++            continue;
++        }
++
++        QString sender;
++        const QVariantList addresses = msg.value(QStringLiteral("addresses")).toList();
++        if (!addresses.isEmpty()) {
++            sender = addresses.constFirst().toMap().value(QStringLiteral("address")).toString();
++        }
++
++        const QString candidate = extractFromNotification(sender, body, {});
++        if (!candidate.isEmpty() && msgDateMs >= newestTimestamp) {
++            newestTimestamp = msgDateMs;
++            newestCode = candidate;
++        }
++    }
++
++    return newestCode;
++}
+ }
+diff --git a/plugins/notifications/otpcodeextractor.h b/plugins/notifications/otpcodeextractor.h
+index 092fdb8ee6ad15c4a82cbbf496b40be788fceb01..233e139a244a2d13de65664484e3162b203eef03 100644
+--- a/plugins/notifications/otpcodeextractor.h
++++ b/plugins/notifications/otpcodeextractor.h
+@@ -8,9 +8,12 @@
+ 
+ #include <QString>
+ #include <QStringList>
++#include <QVariantList>
++#include <QtGlobal>
+ 
+ namespace OtpCodeExtractor
+ {
+ QString extractFromAction(const QString &action);
+ QString extractFromNotification(const QString &title, const QString &text, const QStringList &actions = {});
++QString extractFromSmsBatch(const QVariantList &messages, qint64 nowEpochMs);
+ }
+diff --git a/tests/otpextractortest.cpp b/tests/otpextractortest.cpp
+index 04a1623382b6a99acb2b745cbf8d048e072a31a3..16a2b7f7b1e394a3cc2ea1439437d1d6208de38a 100644
+--- a/tests/otpextractortest.cpp
++++ b/tests/otpextractortest.cpp
+@@ -89,6 +89,42 @@ private Q_SLOTS:
+         const QString oversizedAction = QString(300, QLatin1Char('a')) + QStringLiteral(" 123456");
+         QVERIFY(OtpCodeExtractor::extractFromAction(oversizedAction).isEmpty());
+     }
++
++    void testSmsBatchFallbackAndGuards()
++    {
++        const qint64 nowMs = 1763550000000LL;
++        auto makeMsg = [](const QString &addr, const QString &body, qint64 dateMs, int type) -> QVariantMap {
++            return {
++                {QStringLiteral("body"), body},
++                {QStringLiteral("date"), dateMs},
++                {QStringLiteral("type"), type},
++                {QStringLiteral("addresses"), QVariantList{QVariantMap{{QStringLiteral("address"), addr}}}},
++            };
++        };
++
++        // Android 15 redacted notification yields nothing, while fresh inbox SMS extracts OTP.
++        QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Messages"), QStringLiteral("Sensitive notification content hidden"), {}).isEmpty());
++
++        const QVariantList enBatch = {makeMsg(QStringLiteral("32665"), QStringLiteral("Your verification code is 582941."), nowMs - 2000, 1)};
++        QCOMPARE(OtpCodeExtractor::extractFromSmsBatch(enBatch, nowMs), QStringLiteral("582941"));
++
++        const QVariantList ruBatch = {makeMsg(QStringLiteral("Bank"), QStringLiteral("\u041a\u043e\u0434 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f: 739104"), nowMs - 1000, 1)};
++        QCOMPARE(OtpCodeExtractor::extractFromSmsBatch(ruBatch, nowMs), QStringLiteral("739104"));
++
++        // Rejects outgoing (type == 2) and stale (> 120 s) messages.
++        const QVariantList sentOnly = {makeMsg(QStringLiteral("32665"), QStringLiteral("Your verification code is 111222."), nowMs - 1000, 2)};
++        QVERIFY(OtpCodeExtractor::extractFromSmsBatch(sentOnly, nowMs).isEmpty());
++
++        const QVariantList staleOnly = {makeMsg(QStringLiteral("32665"), QStringLiteral("Your verification code is 333444."), nowMs - 180000, 1)};
++        QVERIFY(OtpCodeExtractor::extractFromSmsBatch(staleOnly, nowMs).isEmpty());
++
++        // Rejects bulk conversation sync batches (> 16 messages).
++        QVariantList bulkBatch;
++        for (int i = 0; i < 17; ++i) {
++            bulkBatch.append(makeMsg(QStringLiteral("32665"), QStringLiteral("Your verification code is 582941."), nowMs - 1000, 1));
++        }
++        QVERIFY(OtpCodeExtractor::extractFromSmsBatch(bulkBatch, nowMs).isEmpty());
++    }
+ };
+ 
+ QTEST_MAIN(OtpExtractorTest)

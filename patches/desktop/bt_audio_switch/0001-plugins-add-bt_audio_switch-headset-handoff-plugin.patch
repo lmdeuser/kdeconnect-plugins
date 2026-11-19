@@ -1,0 +1,735 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:53:12 +0500
+Subject: [PATCH 1/2] plugins: add bt_audio_switch headset handoff plugin
+
+
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 0afd522eaf6dfa35ffceff69e9b34070a09218bc..aa998b3d23c586c148454821d64a8c68ea65132c 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -50,6 +50,10 @@ if (WITH_PULSEAUDIO OR WIN32 OR APPLE)
+     add_subdirectory(systemvolume)
+ endif()
+ 
++if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux" AND WITH_PULSEAUDIO)
++    add_subdirectory(bt_audio_switch)
++endif()
++
+ 
+ # If we split notifications per plugin, in several notifyrc files, they won't
+ # appear in the same group in the Notifications KCM
+diff --git a/plugins/bt_audio_switch/CMakeLists.txt b/plugins/bt_audio_switch/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..524f6e5038f7f2210ecd6c836752f376932a70ee
+--- /dev/null
++++ b/plugins/bt_audio_switch/CMakeLists.txt
+@@ -0,0 +1,33 @@
++# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++add_library(kdeconnectbtaudioswitchcommon STATIC
++    btaudioswitchlogic.cpp
++)
++set_property(TARGET kdeconnectbtaudioswitchcommon PROPERTY POSITION_INDEPENDENT_CODE ON)
++target_include_directories(kdeconnectbtaudioswitchcommon PUBLIC
++    ${PROJECT_SOURCE_DIR}
++    ${CMAKE_CURRENT_SOURCE_DIR}
++)
++target_link_libraries(kdeconnectbtaudioswitchcommon PUBLIC
++    Qt::Core
++)
++
++kdeconnect_add_plugin(kdeconnect_btaudioswitch SOURCES
++    btaudioswitchplugin.cpp
++)
++target_link_libraries(kdeconnect_btaudioswitch
++    kdeconnectcore
++    kdeconnectbtaudioswitchcommon
++    Qt::Core
++    Qt::DBus
++    KF6::I18n
++    KF6::PulseAudioQt
++)
++
++if(BUILD_TESTING)
++    find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Test)
++    ecm_add_test(btaudioswitchtest.cpp
++        LINK_LIBRARIES kdeconnectcore kdeconnectbtaudioswitchcommon Qt::Core Qt::Test)
++    set_tests_properties(btaudioswitchtest PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
++endif()
+diff --git a/plugins/bt_audio_switch/btaudioswitchlogic.cpp b/plugins/bt_audio_switch/btaudioswitchlogic.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..0dd94bb2a2e0c62a6c7beaa57673264d3025bd1a
+--- /dev/null
++++ b/plugins/bt_audio_switch/btaudioswitchlogic.cpp
+@@ -0,0 +1,187 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "btaudioswitchlogic.h"
++
++#include <QRegularExpression>
++
++namespace BtAudioSwitch
++{
++namespace
++{
++const QRegularExpression &macRegex()
++{
++    static const QRegularExpression re(QStringLiteral("^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$"));
++    return re;
++}
++
++const QRegularExpression &adapterRegex()
++{
++    static const QRegularExpression re(QStringLiteral("^/org/bluez/hci[0-9]{1,2}$"));
++    return re;
++}
++}
++
++QString normalizeMac(const QString &raw)
++{
++    const QString trimmed = raw.trimmed();
++    if (!macRegex().match(trimmed).hasMatch()) {
++        return {};
++    }
++    return trimmed.toUpper();
++}
++
++QStringList parseAllowlist(const QString &raw)
++{
++    const QStringList parts = raw.split(QLatin1Char(','), Qt::SkipEmptyParts);
++    return normalizeAllowlist(parts);
++}
++
++QStringList normalizeAllowlist(const QStringList &rawList)
++{
++    QStringList out;
++    for (const QString &item : rawList) {
++        if (out.size() >= kMaxAllowlistEntries) {
++            break;
++        }
++        const QString canonical = normalizeMac(item);
++        if (!canonical.isEmpty() && !out.contains(canonical)) {
++            out.append(canonical);
++        }
++    }
++    return out;
++}
++
++QString bluezDevicePath(const QString &adapterPath, const QString &canonicalMac)
++{
++    const QString cleanMac = normalizeMac(canonicalMac);
++    if (cleanMac.isEmpty()) {
++        return {};
++    }
++    const QString trimmedAdapter = adapterPath.trimmed();
++    const QString safeAdapter = adapterRegex().match(trimmedAdapter).hasMatch() ? trimmedAdapter : QStringLiteral("/org/bluez/hci0");
++    QString underscored = cleanMac;
++    underscored.replace(QLatin1Char(':'), QLatin1Char('_'));
++    return safeAdapter + QStringLiteral("/dev_") + underscored;
++}
++
++QString bluezSinkPrefix(const QString &canonicalMac)
++{
++    const QString cleanMac = normalizeMac(canonicalMac);
++    if (cleanMac.isEmpty()) {
++        return {};
++    }
++    QString underscored = cleanMac;
++    underscored.replace(QLatin1Char(':'), QLatin1Char('_'));
++    return QStringLiteral("bluez_output.") + underscored;
++}
++
++bool isValidAction(const QString &action)
++{
++    return action == QLatin1String("claim") || action == QLatin1String("release") || action == QLatin1String("status");
++}
++
++SwitchReason reasonFromString(const QString &raw, bool *ok)
++{
++    const QString clean = raw.trimmed().toLower();
++    if (clean == QLatin1String("call")) {
++        if (ok) {
++            *ok = true;
++        }
++        return SwitchReason::Call;
++    }
++    if (clean == QLatin1String("manual")) {
++        if (ok) {
++            *ok = true;
++        }
++        return SwitchReason::Manual;
++    }
++    if (clean == QLatin1String("media")) {
++        if (ok) {
++            *ok = true;
++        }
++        return SwitchReason::Media;
++    }
++    if (ok) {
++        *ok = false;
++    }
++    return SwitchReason::Media;
++}
++
++QString reasonToString(SwitchReason reason)
++{
++    switch (reason) {
++    case SwitchReason::Call:
++        return QStringLiteral("call");
++    case SwitchReason::Manual:
++        return QStringLiteral("manual");
++    case SwitchReason::Media:
++        return QStringLiteral("media");
++    }
++    return QStringLiteral("media");
++}
++
++void BtAudioCoordinator::setAllowlist(const QStringList &rawMacs)
++{
++    m_allowlist = normalizeAllowlist(rawMacs);
++}
++
++QStringList BtAudioCoordinator::allowlist() const
++{
++    return m_allowlist;
++}
++
++bool BtAudioCoordinator::isAllowed(const QString &canonicalMac) const
++{
++    const QString clean = normalizeMac(canonicalMac);
++    return !clean.isEmpty() && m_allowlist.contains(clean);
++}
++
++TransitionDecision BtAudioCoordinator::evaluateTransition(const QString &rawMac, Owner targetOwner, SwitchReason reason, qint64 nowMs)
++{
++    TransitionDecision decision;
++    const QString clean = normalizeMac(rawMac);
++    if (clean.isEmpty()) {
++        decision.rejectReason = QStringLiteral("invalid_mac");
++        return decision;
++    }
++    if (!m_allowlist.contains(clean)) {
++        decision.canonicalMac = clean;
++        decision.rejectReason = QStringLiteral("not_allowlisted");
++        return decision;
++    }
++
++    const EntryState prev = m_states.value(clean);
++    const qint64 elapsed = nowMs - prev.lastTransitionMs;
++    if (prev.owner != Owner::None && elapsed >= 0 && elapsed < kHysteresisMs) {
++        const bool higherPriority = static_cast<int>(reason) > static_cast<int>(prev.lastReason);
++        if (!higherPriority) {
++            decision.canonicalMac = clean;
++            decision.rejectReason = QStringLiteral("hysteresis_cooldown");
++            return decision;
++        }
++    }
++
++    EntryState next;
++    next.owner = targetOwner;
++    next.lastReason = reason;
++    next.lastTransitionMs = nowMs;
++    m_states.insert(clean, next);
++
++    decision.accepted = true;
++    decision.canonicalMac = clean;
++    if (targetOwner == Owner::Desktop && prev.owner == Owner::Remote) {
++        decision.delayMs = kSinglePointYieldMs;
++    }
++    return decision;
++}
++
++Owner BtAudioCoordinator::ownerFor(const QString &rawMac) const
++{
++    const QString clean = normalizeMac(rawMac);
++    return clean.isEmpty() ? Owner::None : m_states.value(clean).owner;
++}
++}
+diff --git a/plugins/bt_audio_switch/btaudioswitchlogic.h b/plugins/bt_audio_switch/btaudioswitchlogic.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..66999267e404cef1c17ab7ff7c852688536776a0
+--- /dev/null
++++ b/plugins/bt_audio_switch/btaudioswitchlogic.h
+@@ -0,0 +1,77 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QHash>
++#include <QString>
++#include <QStringList>
++
++namespace BtAudioSwitch
++{
++inline constexpr qint64 kHysteresisMs = 3000;
++inline constexpr int kSinglePointYieldMs = 300;
++inline constexpr int kMaxAllowlistEntries = 16;
++
++inline QString a2dpUuid()
++{
++    return QStringLiteral("0000110b-0000-1000-8000-00805f9b34fb");
++}
++
++inline QString hfpUuid()
++{
++    return QStringLiteral("0000111e-0000-1000-8000-00805f9b34fb");
++}
++
++enum class Owner {
++    None,
++    Desktop,
++    Remote,
++};
++
++enum class SwitchReason {
++    Media = 1,
++    Manual = 2,
++    Call = 3,
++};
++
++QString normalizeMac(const QString &raw);
++QStringList parseAllowlist(const QString &raw);
++QStringList normalizeAllowlist(const QStringList &rawList);
++QString bluezDevicePath(const QString &adapterPath, const QString &canonicalMac);
++QString bluezSinkPrefix(const QString &canonicalMac);
++bool isValidAction(const QString &action);
++SwitchReason reasonFromString(const QString &raw, bool *ok = nullptr);
++QString reasonToString(SwitchReason reason);
++
++struct TransitionDecision {
++    bool accepted = false;
++    QString canonicalMac;
++    QString rejectReason;
++    int delayMs = 0;
++};
++
++class BtAudioCoordinator
++{
++public:
++    void setAllowlist(const QStringList &rawMacs);
++    QStringList allowlist() const;
++    bool isAllowed(const QString &canonicalMac) const;
++
++    TransitionDecision evaluateTransition(const QString &rawMac, Owner targetOwner, SwitchReason reason, qint64 nowMs);
++    Owner ownerFor(const QString &rawMac) const;
++
++private:
++    struct EntryState {
++        Owner owner = Owner::None;
++        SwitchReason lastReason = SwitchReason::Media;
++        qint64 lastTransitionMs = -kHysteresisMs - 1;
++    };
++
++    QStringList m_allowlist;
++    QHash<QString, EntryState> m_states;
++};
++}
+diff --git a/plugins/bt_audio_switch/btaudioswitchplugin.cpp b/plugins/bt_audio_switch/btaudioswitchplugin.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d8ac58c7eddec8c0c5515f974ea52a152266e0f
+--- /dev/null
++++ b/plugins/bt_audio_switch/btaudioswitchplugin.cpp
+@@ -0,0 +1,214 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "btaudioswitchplugin.h"
++
++#include "plugin_btaudioswitch_debug.h"
++
++#include <KPluginFactory>
++#include <PulseAudioQt/Context>
++#include <PulseAudioQt/Sink>
++
++#include <QDBusConnection>
++#include <QDBusInterface>
++#include <QDateTime>
++#include <QPointer>
++#include <QTimer>
++
++K_PLUGIN_CLASS_WITH_JSON(BtAudioSwitchPlugin, "kdeconnect_btaudioswitch.json")
++
++BtAudioSwitchPlugin::BtAudioSwitchPlugin(QObject *parent, const QVariantList &args)
++    : KdeConnectPlugin(parent, args)
++{
++    connect(config(), &KdeConnectPluginConfig::configChanged, this, &BtAudioSwitchPlugin::onConfigChanged);
++    onConfigChanged();
++}
++
++QString BtAudioSwitchPlugin::dbusPath() const
++{
++    return QLatin1String("/modules/kdeconnect/devices/%1/btaudioswitch").arg(device()->id());
++}
++
++void BtAudioSwitchPlugin::onConfigChanged()
++{
++    const QString rawMacs = config()->getString(QStringLiteral("allowedHeadsetMacs"), QString());
++    m_coordinator.setAllowlist(BtAudioSwitch::parseAllowlist(rawMacs));
++    m_autoSwitch = config()->getBool(QStringLiteral("autoSwitch"), true);
++    m_adapterPath = config()->getString(QStringLiteral("adapterPath"), QStringLiteral("/org/bluez/hci0"));
++}
++
++QStringList BtAudioSwitchPlugin::allowedHeadsetMacs() const
++{
++    return m_coordinator.allowlist();
++}
++
++void BtAudioSwitchPlugin::setAllowedHeadsetMacs(const QStringList &macs)
++{
++    const QStringList normalized = BtAudioSwitch::normalizeAllowlist(macs);
++    config()->set(QStringLiteral("allowedHeadsetMacs"), normalized.join(QLatin1Char(',')));
++    m_coordinator.setAllowlist(normalized);
++    Q_EMIT allowedHeadsetMacsChanged(normalized);
++}
++
++bool BtAudioSwitchPlugin::claimHeadset(const QString &mac, const QString &reason)
++{
++    bool okReason = false;
++    const BtAudioSwitch::SwitchReason parsedReason = BtAudioSwitch::reasonFromString(reason, &okReason);
++    if (!okReason) {
++        return false;
++    }
++
++    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
++    const BtAudioSwitch::TransitionDecision decision =
++        m_coordinator.evaluateTransition(mac, BtAudioSwitch::Owner::Desktop, parsedReason, nowMs);
++    if (!decision.accepted) {
++        qCDebug(KDECONNECT_PLUGIN_BTAUDIOSWITCH) << "Claim rejected for" << mac << decision.rejectReason;
++        return false;
++    }
++
++    const QString reasonWire = BtAudioSwitch::reasonToString(parsedReason);
++    sendSwitchPacket(QStringLiteral("claim"), decision.canonicalMac, reasonWire, nowMs);
++
++    if (decision.delayMs > 0) {
++        QPointer<BtAudioSwitchPlugin> guard(this);
++        const QString canonical = decision.canonicalMac;
++        QTimer::singleShot(decision.delayMs, this, [guard, canonical, reasonWire] {
++            if (guard) {
++                guard->connectDesktopHeadset(canonical, reasonWire);
++            }
++        });
++    } else {
++        connectDesktopHeadset(decision.canonicalMac, reasonWire);
++    }
++    return true;
++}
++
++bool BtAudioSwitchPlugin::releaseHeadset(const QString &mac)
++{
++    const QString canonical = BtAudioSwitch::normalizeMac(mac);
++    if (canonical.isEmpty() || !m_coordinator.isAllowed(canonical)) {
++        return false;
++    }
++    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
++    m_coordinator.evaluateTransition(canonical, BtAudioSwitch::Owner::Remote, BtAudioSwitch::SwitchReason::Manual, nowMs);
++    disconnectBluezProfiles(canonical);
++    sendSwitchPacket(QStringLiteral("release"), canonical, QStringLiteral("manual"), nowMs);
++    Q_EMIT headsetOwnerChanged(canonical, QStringLiteral("remote"), QStringLiteral("manual"));
++    return true;
++}
++
++void BtAudioSwitchPlugin::receivePacket(const NetworkPacket &np)
++{
++    if (np.type() != PACKET_TYPE_BTAUDIOSWITCH) {
++        return;
++    }
++
++    const QString action = np.get<QString>(QStringLiteral("action")).trimmed().toLower();
++    const QString mac = BtAudioSwitch::normalizeMac(np.get<QString>(QStringLiteral("mac")));
++    bool okReason = false;
++    const BtAudioSwitch::SwitchReason reason = BtAudioSwitch::reasonFromString(np.get<QString>(QStringLiteral("reason")), &okReason);
++
++    if (!BtAudioSwitch::isValidAction(action) || mac.isEmpty() || !okReason) {
++        qCWarning(KDECONNECT_PLUGIN_BTAUDIOSWITCH) << "Ignoring malformed btaudioswitch packet";
++        return;
++    }
++    if (!m_coordinator.isAllowed(mac)) {
++        qCWarning(KDECONNECT_PLUGIN_BTAUDIOSWITCH) << "Ignoring non-allowlisted Bluetooth MAC" << mac;
++        return;
++    }
++    if (action == QLatin1String("status")) {
++        return;
++    }
++    if (!m_autoSwitch && reason != BtAudioSwitch::SwitchReason::Manual) {
++        return;
++    }
++
++    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
++    const QString reasonWire = BtAudioSwitch::reasonToString(reason);
++
++    if (action == QLatin1String("claim")) {
++        const BtAudioSwitch::TransitionDecision decision =
++            m_coordinator.evaluateTransition(mac, BtAudioSwitch::Owner::Remote, reason, nowMs);
++        if (!decision.accepted) {
++            qCDebug(KDECONNECT_PLUGIN_BTAUDIOSWITCH) << "Remote claim ignored for" << mac << decision.rejectReason;
++            return;
++        }
++        disconnectBluezProfiles(mac);
++        sendSwitchPacket(QStringLiteral("status"), mac, reasonWire, nowMs);
++        Q_EMIT headsetOwnerChanged(mac, QStringLiteral("remote"), reasonWire);
++        return;
++    }
++
++    if (action == QLatin1String("release")) {
++        const BtAudioSwitch::TransitionDecision decision =
++            m_coordinator.evaluateTransition(mac, BtAudioSwitch::Owner::Desktop, reason, nowMs);
++        if (!decision.accepted) {
++            return;
++        }
++        QPointer<BtAudioSwitchPlugin> guard(this);
++        QTimer::singleShot(BtAudioSwitch::kSinglePointYieldMs, this, [guard, mac, reasonWire] {
++            if (guard) {
++                guard->connectDesktopHeadset(mac, reasonWire);
++            }
++        });
++    }
++}
++
++void BtAudioSwitchPlugin::sendSwitchPacket(const QString &action, const QString &canonicalMac, const QString &reason, qint64 timestampMs)
++{
++    NetworkPacket np(PACKET_TYPE_BTAUDIOSWITCH);
++    np.set(QStringLiteral("action"), action);
++    np.set(QStringLiteral("mac"), canonicalMac);
++    np.set(QStringLiteral("reason"), reason);
++    np.set(QStringLiteral("timestampMs"), timestampMs);
++    sendPacket(np);
++}
++
++void BtAudioSwitchPlugin::disconnectBluezProfiles(const QString &canonicalMac)
++{
++    const QString devPath = BtAudioSwitch::bluezDevicePath(m_adapterPath, canonicalMac);
++    if (devPath.isEmpty()) {
++        return;
++    }
++    QDBusInterface bluezDev(QStringLiteral("org.bluez"), devPath, QStringLiteral("org.bluez.Device1"), QDBusConnection::systemBus());
++    if (!bluezDev.isValid()) {
++        return;
++    }
++    bluezDev.asyncCall(QStringLiteral("DisconnectProfile"), BtAudioSwitch::a2dpUuid());
++    bluezDev.asyncCall(QStringLiteral("DisconnectProfile"), BtAudioSwitch::hfpUuid());
++}
++
++void BtAudioSwitchPlugin::connectDesktopHeadset(const QString &canonicalMac, const QString &reason)
++{
++    const QString devPath = BtAudioSwitch::bluezDevicePath(m_adapterPath, canonicalMac);
++    if (!devPath.isEmpty()) {
++        QDBusInterface bluezDev(QStringLiteral("org.bluez"), devPath, QStringLiteral("org.bluez.Device1"), QDBusConnection::systemBus());
++        if (bluezDev.isValid()) {
++            bluezDev.asyncCall(QStringLiteral("Connect"));
++        }
++    }
++    selectPipeWireSinkForMac(canonicalMac);
++    Q_EMIT headsetOwnerChanged(canonicalMac, QStringLiteral("desktop"), reason);
++}
++
++void BtAudioSwitchPlugin::selectPipeWireSinkForMac(const QString &canonicalMac)
++{
++    const QString prefix = BtAudioSwitch::bluezSinkPrefix(canonicalMac);
++    PulseAudioQt::Context *ctx = PulseAudioQt::Context::instance();
++    if (prefix.isEmpty() || !ctx) {
++        return;
++    }
++    const auto sinks = ctx->sinks();
++    for (PulseAudioQt::Sink *sink : sinks) {
++        if (sink && sink->name().startsWith(prefix, Qt::CaseInsensitive)) {
++            sink->setDefault(true);
++            return;
++        }
++    }
++}
++
++#include "btaudioswitchplugin.moc"
++#include "moc_btaudioswitchplugin.cpp"
+diff --git a/plugins/bt_audio_switch/btaudioswitchplugin.h b/plugins/bt_audio_switch/btaudioswitchplugin.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..516a994440438e5763f98f0b030fe7c0d9200081
+--- /dev/null
++++ b/plugins/bt_audio_switch/btaudioswitchplugin.h
+@@ -0,0 +1,51 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QString>
++#include <QStringList>
++
++#include <core/kdeconnectplugin.h>
++
++#include "btaudioswitchlogic.h"
++
++#define PACKET_TYPE_BTAUDIOSWITCH QStringLiteral("kdeconnect.btaudioswitch")
++
++class BtAudioSwitchPlugin : public KdeConnectPlugin
++{
++    Q_OBJECT
++    Q_CLASSINFO("D-Bus Interface", "org.kde.kdeconnect.device.btaudioswitch")
++    Q_PROPERTY(QStringList allowedHeadsetMacs READ allowedHeadsetMacs WRITE setAllowedHeadsetMacs NOTIFY allowedHeadsetMacsChanged)
++
++public:
++    explicit BtAudioSwitchPlugin(QObject *parent, const QVariantList &args);
++
++    void receivePacket(const NetworkPacket &np) override;
++    QString dbusPath() const override;
++
++    Q_SCRIPTABLE bool claimHeadset(const QString &mac, const QString &reason = QStringLiteral("manual"));
++    Q_SCRIPTABLE bool releaseHeadset(const QString &mac);
++    Q_SCRIPTABLE QStringList allowedHeadsetMacs() const;
++    Q_SCRIPTABLE void setAllowedHeadsetMacs(const QStringList &macs);
++
++Q_SIGNALS:
++    Q_SCRIPTABLE void headsetOwnerChanged(const QString &mac, const QString &owner, const QString &reason);
++    Q_SCRIPTABLE void allowedHeadsetMacsChanged(const QStringList &macs);
++
++private Q_SLOTS:
++    void onConfigChanged();
++
++private:
++    void sendSwitchPacket(const QString &action, const QString &canonicalMac, const QString &reason, qint64 timestampMs);
++    void disconnectBluezProfiles(const QString &canonicalMac);
++    void connectDesktopHeadset(const QString &canonicalMac, const QString &reason);
++    void selectPipeWireSinkForMac(const QString &canonicalMac);
++
++    BtAudioSwitch::BtAudioCoordinator m_coordinator;
++    bool m_autoSwitch = true;
++    QString m_adapterPath = QStringLiteral("/org/bluez/hci0");
++};
+diff --git a/plugins/bt_audio_switch/btaudioswitchtest.cpp b/plugins/bt_audio_switch/btaudioswitchtest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..90f30892d6dcbb1b8522e35e84318d1a86fec075
+--- /dev/null
++++ b/plugins/bt_audio_switch/btaudioswitchtest.cpp
+@@ -0,0 +1,88 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "btaudioswitchlogic.h"
++
++#include <QtTest>
++
++class BtAudioSwitchTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testMacNormalizationAndValidation()
++    {
++        QCOMPARE(BtAudioSwitch::normalizeMac(QStringLiteral(" aa:bb:cc:dd:ee:ff ")), QStringLiteral("AA:BB:CC:DD:EE:FF"));
++        QVERIFY(BtAudioSwitch::normalizeMac(QStringLiteral("ZZ:BB:CC:DD:EE:FF")).isEmpty());
++        QVERIFY(BtAudioSwitch::normalizeMac(QStringLiteral("AA:BB:CC")).isEmpty());
++
++        const QStringList list = BtAudioSwitch::parseAllowlist(
++            QStringLiteral("aa:bb:cc:dd:ee:ff, invalid, AA:BB:CC:DD:EE:FF, 11:22:33:44:55:66"));
++        QCOMPARE(list, QStringList({QStringLiteral("AA:BB:CC:DD:EE:FF"), QStringLiteral("11:22:33:44:55:66")}));
++    }
++
++    void testAllowlistHysteresisAndPriorityTieBreak()
++    {
++        BtAudioSwitch::BtAudioCoordinator coord;
++        coord.setAllowlist({QStringLiteral("AA:BB:CC:DD:EE:FF")});
++
++        const auto rejected = coord.evaluateTransition(
++            QStringLiteral("11:22:33:44:55:66"),
++            BtAudioSwitch::Owner::Remote,
++            BtAudioSwitch::SwitchReason::Media,
++            10000);
++        QVERIFY(!rejected.accepted);
++        QCOMPARE(rejected.rejectReason, QStringLiteral("not_allowlisted"));
++
++        const auto mediaRemote = coord.evaluateTransition(
++            QStringLiteral("aa:bb:cc:dd:ee:ff"),
++            BtAudioSwitch::Owner::Remote,
++            BtAudioSwitch::SwitchReason::Media,
++            10000);
++        QVERIFY(mediaRemote.accepted);
++        QCOMPARE(coord.ownerFor(QStringLiteral("AA:BB:CC:DD:EE:FF")), BtAudioSwitch::Owner::Remote);
++
++        // Same priority inside 3000 ms cooldown must be rejected.
++        const auto bounceDesktop = coord.evaluateTransition(
++            QStringLiteral("AA:BB:CC:DD:EE:FF"),
++            BtAudioSwitch::Owner::Desktop,
++            BtAudioSwitch::SwitchReason::Media,
++            11500);
++        QVERIFY(!bounceDesktop.accepted);
++        QCOMPARE(bounceDesktop.rejectReason, QStringLiteral("hysteresis_cooldown"));
++
++        // Higher-priority Call overrides active Media cooldown.
++        const auto callOverride = coord.evaluateTransition(
++            QStringLiteral("AA:BB:CC:DD:EE:FF"),
++            BtAudioSwitch::Owner::Remote,
++            BtAudioSwitch::SwitchReason::Call,
++            11600);
++        QVERIFY(callOverride.accepted);
++
++        // After >= 3000 ms, Desktop manual claim is accepted with single-point yield delay.
++        const auto manualAfterCooldown = coord.evaluateTransition(
++            QStringLiteral("AA:BB:CC:DD:EE:FF"),
++            BtAudioSwitch::Owner::Desktop,
++            BtAudioSwitch::SwitchReason::Manual,
++            15000);
++        QVERIFY(manualAfterCooldown.accepted);
++        QCOMPARE(manualAfterCooldown.delayMs, BtAudioSwitch::kSinglePointYieldMs);
++    }
++
++    void testBluezPathAndSinkPrefix()
++    {
++        QCOMPARE(BtAudioSwitch::bluezDevicePath(QStringLiteral("/org/bluez/hci1"), QStringLiteral("aa:bb:cc:dd:ee:ff")),
++                 QStringLiteral("/org/bluez/hci1/dev_AA_BB_CC_DD_EE_FF"));
++        QCOMPARE(BtAudioSwitch::bluezDevicePath(QStringLiteral("../bad/path"), QStringLiteral("aa:bb:cc:dd:ee:ff")),
++                 QStringLiteral("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF"));
++        QCOMPARE(BtAudioSwitch::bluezSinkPrefix(QStringLiteral("aa:bb:cc:dd:ee:ff")),
++                 QStringLiteral("bluez_output.AA_BB_CC_DD_EE_FF"));
++    }
++};
++
++QTEST_MAIN(BtAudioSwitchTest)
++
++#include "btaudioswitchtest.moc"
+diff --git a/plugins/bt_audio_switch/kdeconnect_btaudioswitch.json b/plugins/bt_audio_switch/kdeconnect_btaudioswitch.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..373cc3fb3533cd53a286ca07a36df75bbab2ea92
+--- /dev/null
++++ b/plugins/bt_audio_switch/kdeconnect_btaudioswitch.json
+@@ -0,0 +1,22 @@
++{
++    "$schema": "../kdeconnect.schema.json",
++    "KPlugin": {
++        "Authors": [
++            {
++                "Email": "dennshield@duck.com",
++                "Name": "Dmitriy Volkov"
++            }
++        ],
++        "Description": "Coordinate Bluetooth headset ownership between desktop and Android device",
++        "EnabledByDefault": true,
++        "Icon": "audio-headphones",
++        "License": "GPL",
++        "Name": "Bluetooth Audio Handoff"
++    },
++    "X-KdeConnect-OutgoingPacketType": [
++        "kdeconnect.btaudioswitch"
++    ],
++    "X-KdeConnect-SupportedPacketType": [
++        "kdeconnect.btaudioswitch"
++    ]
++}

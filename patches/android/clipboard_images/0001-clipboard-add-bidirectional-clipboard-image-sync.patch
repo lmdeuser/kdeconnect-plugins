@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:12:58 +0500
+Subject: [PATCH 1/2] clipboard: add bidirectional clipboard image sync
+
+
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardImageHelper.kt b/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardImageHelper.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3e8b26d321215c5864aef0967d9da60b25a2034
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardImageHelper.kt
+@@ -0,0 +1,135 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.clipboard
++
++import java.io.ByteArrayOutputStream
++import java.io.File
++import java.io.FileOutputStream
++import java.io.IOException
++import java.io.InputStream
++import java.util.Locale
++
++internal object ClipboardImageHelper {
++    const val MAX_CLIPBOARD_IMAGE_BYTES = 20L * 1024L * 1024L
++    const val CACHE_SUBDIR = "clipboard_images"
++    private const val MAX_FILENAME_LENGTH = 128
++    private const val COPY_BUFFER_BYTES = 8192
++
++    private val SUPPORTED_EXTENSIONS = setOf(".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
++    private val SAFE_CHAR_RE = Regex("[^A-Za-z0-9._-]")
++
++    fun sanitizeFilename(raw: String?): String? {
++        val trimmed = raw?.trim() ?: return null
++        if (trimmed.isEmpty() ||
++            trimmed.length > MAX_FILENAME_LENGTH ||
++            trimmed.contains('\u0000') ||
++            trimmed.contains('/') ||
++            trimmed.contains('\\') ||
++            trimmed.contains("..")
++        ) {
++            return null
++        }
++        val cleaned = SAFE_CHAR_RE.replace(trimmed, "_")
++        val dotIndex = cleaned.lastIndexOf('.')
++        if (dotIndex <= 0 || dotIndex >= cleaned.length - 1) {
++            return null
++        }
++        val stem = cleaned.substring(0, dotIndex)
++        val ext = cleaned.substring(dotIndex).lowercase(Locale.ROOT)
++        if (stem.isEmpty() || ext !in SUPPORTED_EXTENSIONS) {
++            return null
++        }
++        return stem + ext
++    }
++
++    fun isSupportedImageMime(mime: String?): Boolean {
++        val normalized = mime?.trim()?.lowercase(Locale.ROOT) ?: return false
++        return normalized.startsWith("image/") && normalized.length > "image/".length
++    }
++
++    fun extensionForMime(mime: String?): String {
++        return when (mime?.trim()?.lowercase(Locale.ROOT)) {
++            "image/jpeg", "image/jpg" -> ".jpg"
++            "image/webp" -> ".webp"
++            "image/gif" -> ".gif"
++            "image/bmp", "image/x-ms-bmp" -> ".bmp"
++            else -> ".png"
++        }
++    }
++
++    @Throws(IOException::class)
++    fun copyStreamBounded(
++        input: InputStream,
++        outputFile: File,
++        maxBytes: Long = MAX_CLIPBOARD_IMAGE_BYTES,
++    ): Long {
++        var total = 0L
++        val buffer = ByteArray(COPY_BUFFER_BYTES)
++        try {
++            FileOutputStream(outputFile).use { out ->
++                while (true) {
++                    val read = input.read(buffer)
++                    if (read < 0) {
++                        break
++                    }
++                    total += read
++                    if (total > maxBytes) {
++                        throw IOException("Clipboard image exceeds limit of $maxBytes bytes")
++                    }
++                    if (read > 0) {
++                        out.write(buffer, 0, read)
++                    }
++                }
++            }
++            if (total <= 0L) {
++                throw IOException("Empty clipboard image payload")
++            }
++            return total
++        } catch (e: IOException) {
++            outputFile.delete()
++            throw e
++        }
++    }
++
++    fun readBytesBounded(
++        input: InputStream,
++        maxBytes: Long = MAX_CLIPBOARD_IMAGE_BYTES,
++    ): ByteArray? {
++        val out = ByteArrayOutputStream()
++        val buffer = ByteArray(COPY_BUFFER_BYTES)
++        var total = 0L
++        while (true) {
++            val read = input.read(buffer)
++            if (read < 0) {
++                break
++            }
++            total += read
++            if (total > maxBytes) {
++                return null
++            }
++            if (read > 0) {
++                out.write(buffer, 0, read)
++            }
++        }
++        val bytes = out.toByteArray()
++        return if (bytes.isEmpty()) null else bytes
++    }
++
++    fun pruneCacheDirectory(cacheDir: File, keepCount: Int = 5) {
++        if (!cacheDir.isDirectory || keepCount < 0) {
++            return
++        }
++        val files = cacheDir.listFiles()?.filter { it.isFile } ?: return
++        if (files.size <= keepCount) {
++            return
++        }
++        val sortedOldestFirst = files.sortedWith(compareBy<File>({ it.lastModified() }, { it.name }))
++        val removeCount = sortedOldestFirst.size - keepCount
++        for (i in 0 until removeCount) {
++            sortedOldestFirst[i].delete()
++        }
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardListener.kt b/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardListener.kt
+index 90952454a4fd1c4f4a9e0858bbfd9a756e100279..1dff40d2500e830449d4add79f2035810b897e0f 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardListener.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardListener.kt
+@@ -10,6 +10,7 @@ import android.content.ClipData
+ import android.content.ClipDescription
+ import android.content.ClipboardManager
+ import android.content.Context
++import android.net.Uri
+ import android.os.Build
+ import android.os.Handler
+ import android.os.Looper
+@@ -30,6 +31,7 @@ class ClipboardListener {
+ 
+     interface ClipboardObserver {
+         fun clipboardChanged(content: String, contentType: ClipboardContentType)
++        fun clipboardImageChanged(uri: Uri, mimeType: String) {}
+     }
+ 
+     private val observers: HashSet<ClipboardObserver> = HashSet()
+@@ -42,6 +44,9 @@ class ClipboardListener {
+     var updateTimestamp: Long = 0
+         private set
+ 
++    @Volatile
++    private var lastSetImageUri: Uri? = null
++
+     private lateinit var cm: ClipboardManager
+ 
+     private constructor(ctx: Context) {
+@@ -80,6 +85,28 @@ class ClipboardListener {
+         try {
+             val clip = cm.primaryClip!!
+             val item = clip.getItemAt(0)
++            val uri = item.uri
++            if (uri != null) {
++                if (uri == lastSetImageUri) {
++                    return
++                }
++                val mimeType = try {
++                    context.contentResolver.getType(uri)
++                } catch (_: SecurityException) {
++                    null
++                }
++                if (ClipboardImageHelper.isSupportedImageMime(mimeType)) {
++                    updateTimestamp = System.currentTimeMillis()
++                    currentContent = null
++                    currentContentType = ClipboardContentType.Text
++                    lastSetImageUri = uri
++                    val resolvedMime = mimeType!!
++                    for (observer in observers) {
++                        observer.clipboardImageChanged(uri, resolvedMime)
++                    }
++                    return
++                }
++            }
+             val content = item.coerceToText(context).toString()
+             val contentType = detectContentType(clip)
+ 
+@@ -89,6 +116,7 @@ class ClipboardListener {
+             updateTimestamp = System.currentTimeMillis()
+             currentContent = content
+             currentContentType = contentType
++            lastSetImageUri = null
+ 
+             for (observer in observers) {
+                 observer.clipboardChanged(content, contentType)
+@@ -106,10 +134,28 @@ class ClipboardListener {
+             updateTimestamp = System.currentTimeMillis()
+             currentContent = text
+             currentContentType = ClipboardContentType.Text
++            lastSetImageUri = null
+             cm.setPrimaryClip(ClipData.newPlainText(null, text))
+         }
+     }
+ 
++    fun setImageUri(uri: Uri, label: String = "Image") {
++        val applyClip = {
++            if (this::cm.isInitialized) {
++                updateTimestamp = System.currentTimeMillis()
++                currentContent = null
++                currentContentType = ClipboardContentType.Text
++                lastSetImageUri = uri
++                cm.setPrimaryClip(ClipData.newUri(context.contentResolver, label, uri))
++            }
++        }
++        if (Looper.myLooper() == Looper.getMainLooper()) {
++            applyClip()
++        } else {
++            Handler(Looper.getMainLooper()).post(applyClip)
++        }
++    }
++
+     companion object {
+         private var _instance: ClipboardListener? = null
+ 
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardPlugin.kt
+index 3a7042378084175060d1d01d64ec82327ca9b339..40df7e7edf50f701d4e1b4c6796420e85f6ac9cc 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/clipboard/ClipboardPlugin.kt
+@@ -11,17 +11,25 @@ import android.content.ClipData
+ import android.content.ClipboardManager
+ import android.content.Context
+ import android.content.pm.PackageManager
++import android.net.Uri
+ import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import android.util.Log
+ import android.widget.Toast
+ import androidx.annotation.VisibleForTesting
+ import androidx.core.content.ContextCompat
++import androidx.core.content.FileProvider
+ import androidx.core.content.getSystemService
+ import org.kde.kdeconnect.NetworkPacket
++import org.kde.kdeconnect.helpers.ThreadHelper
+ import org.kde.kdeconnect.plugins.Plugin
+ import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
+ import org.kde.kdeconnect.plugins.clipboard.ClipboardListener.ClipboardObserver
+ import org.kde.kdeconnect.ui.PluginSettingsFragment
+ import org.kde.kdeconnect_tp.R
++import java.io.File
++import java.io.IOException
+ 
+ @LoadablePlugin
+ class ClipboardPlugin : Plugin() {
+@@ -40,27 +48,73 @@ class ClipboardPlugin : Plugin() {
+     }
+ 
+     override fun onPacketReceived(np: NetworkPacket): Boolean {
+-        val content = np.getString("content")
+         when (np.type) {
+-            (PACKET_TYPE_CLIPBOARD) -> {
+-                ClipboardListener.instance(context).setText(content)
++            PACKET_TYPE_CLIPBOARD -> {
++                ClipboardListener.instance(context).setText(np.getString("content"))
+                 return true
+             }
+-            (PACKET_TYPE_CLIPBOARD_CONNECT) -> {
++            PACKET_TYPE_CLIPBOARD_CONNECT -> {
+                 val packetTime = np.getLong("timestamp")
+                 // If the packetTime is 0, it means the timestamp is unknown (so do nothing).
+                 if (packetTime == 0L || packetTime < ClipboardListener.instance(context).updateTimestamp) {
+                     return false
+                 }
+                 if ("content" in np) { // change clipboard if content is in NetworkPacket
+-                    ClipboardListener.instance(context).setText(content)
++                    ClipboardListener.instance(context).setText(np.getString("content"))
+                 }
+                 return true
+             }
++            PACKET_TYPE_CLIPBOARD_FILE -> {
++                return handleIncomingClipboardFile(np)
++            }
+             else -> throw UnsupportedOperationException("Unknown packet type: ${np.type}")
+         }
+     }
+ 
++    private fun handleIncomingClipboardFile(np: NetworkPacket): Boolean {
++        val payload = np.payload
++        if (!np.hasPayload() || payload == null) {
++            return false
++        }
++        val safeName = ClipboardImageHelper.sanitizeFilename(np.getStringOrNull("filename"))
++        if (safeName == null || payload.payloadSize > ClipboardImageHelper.MAX_CLIPBOARD_IMAGE_BYTES) {
++            payload.close()
++            return false
++        }
++
++        val appContext = context.applicationContext
++        ThreadHelper.runOnNewThread {
++            payload.use { p ->
++                val input = p.inputStream ?: return@runOnNewThread
++                val cacheDir = File(appContext.cacheDir, ClipboardImageHelper.CACHE_SUBDIR).apply {
++                    mkdirs()
++                }
++                val outFile = File(cacheDir, "${System.currentTimeMillis()}_$safeName")
++                try {
++                    ClipboardImageHelper.copyStreamBounded(
++                        input,
++                        outFile,
++                        ClipboardImageHelper.MAX_CLIPBOARD_IMAGE_BYTES,
++                    )
++                    ClipboardImageHelper.pruneCacheDirectory(cacheDir)
++                    val uri = FileProvider.getUriForFile(
++                        appContext,
++                        "${appContext.packageName}.fileprovider",
++                        outFile,
++                    )
++                    ClipboardListener.instance(appContext).setImageUri(uri, safeName)
++                } catch (e: IOException) {
++                    Log.w(TAG, "Failed to receive clipboard image", e)
++                    outFile.delete()
++                } catch (e: IllegalArgumentException) {
++                    Log.w(TAG, "Failed to share clipboard image via FileProvider", e)
++                    outFile.delete()
++                }
++            }
++        }
++        return true
++    }
++
+     private val observer: ClipboardObserver = object : ClipboardObserver {
+         override fun clipboardChanged(content: String, contentType: ClipboardListener.ClipboardContentType) {
+             if (contentType == ClipboardListener.ClipboardContentType.Password &&
+@@ -73,6 +127,10 @@ class ClipboardPlugin : Plugin() {
+             }
+             propagateClipboard(content)
+         }
++
++        override fun clipboardImageChanged(uri: Uri, mimeType: String) {
++            sendClipboardImageUri(uri, showToast = false)
++        }
+     }
+ 
+     @VisibleForTesting
+@@ -109,9 +167,17 @@ class ClipboardPlugin : Plugin() {
+         ClipboardListener.instance(context).removeObserver(observer)
+     }
+ 
+-    override val supportedPacketTypes: Array<String> = arrayOf(PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT)
++    override val supportedPacketTypes: Array<String> = arrayOf(
++        PACKET_TYPE_CLIPBOARD,
++        PACKET_TYPE_CLIPBOARD_CONNECT,
++        PACKET_TYPE_CLIPBOARD_FILE,
++    )
+ 
+-    override val outgoingPacketTypes: Array<String> = arrayOf(PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT)
++    override val outgoingPacketTypes: Array<String> = arrayOf(
++        PACKET_TYPE_CLIPBOARD,
++        PACKET_TYPE_CLIPBOARD_CONNECT,
++        PACKET_TYPE_CLIPBOARD_FILE,
++    )
+ 
+     override fun getUiButtons(): List<PluginUiButton> {
+         return if (!canSyncAutomatically(context)) {
+@@ -140,6 +206,10 @@ class ClipboardPlugin : Plugin() {
+             val item: ClipData.Item
+             if (clipboardManager.hasPrimaryClip()) {
+                 item = clipboardManager.primaryClip!!.getItemAt(0)
++                val uri = item.uri
++                if (uri != null && sendClipboardImageUri(uri, showToast = true)) {
++                    return
++                }
+                 val content = item.coerceToText(this.context).toString()
+                 // Don't check if the content is sensitive, just send it
+                 this.propagateClipboard(content)
+@@ -148,7 +218,46 @@ class ClipboardPlugin : Plugin() {
+         }
+     }
+ 
++    private fun sendClipboardImageUri(uri: Uri, showToast: Boolean = true): Boolean {
++        val mime = try {
++            context.contentResolver.getType(uri)
++        } catch (_: SecurityException) {
++            null
++        }
++        if (!ClipboardImageHelper.isSupportedImageMime(mime)) {
++            return false
++        }
++
++        val appContext = context.applicationContext
++        val ext = ClipboardImageHelper.extensionForMime(mime)
++        ThreadHelper.runOnNewThread {
++            try {
++                val bytes = appContext.contentResolver.openInputStream(uri)?.use { stream ->
++                    ClipboardImageHelper.readBytesBounded(stream, ClipboardImageHelper.MAX_CLIPBOARD_IMAGE_BYTES)
++                } ?: return@runOnNewThread
++
++                val np = NetworkPacket(PACKET_TYPE_CLIPBOARD_FILE)
++                np["filename"] = "${System.currentTimeMillis()}$ext"
++                np.payload = NetworkPacket.Payload(bytes)
++                device.sendPacket(np)
++
++                if (showToast) {
++                    Handler(Looper.getMainLooper()).post {
++                        Toast.makeText(appContext, R.string.pref_plugin_clipboard_sent, Toast.LENGTH_SHORT).show()
++                    }
++                }
++            } catch (e: IOException) {
++                Log.w(TAG, "Failed to read clipboard image URI", e)
++            } catch (e: SecurityException) {
++                Log.w(TAG, "Permission denied reading clipboard image URI", e)
++            }
++        }
++        return true
++    }
++
+     companion object {
++        private const val TAG = "KDE/ClipboardPlugin"
++        private const val PACKET_TYPE_CLIPBOARD_FILE = "kdeconnect.clipboard.file"
+         /**
+          * Packet containing just clipboard contents, sent when a device updates its clipboard.
+          *
+diff --git a/src/main/res/xml/fileprovider_paths.xml b/src/main/res/xml/fileprovider_paths.xml
+index 62f0b5fbb675b6a98a0e2acdbed5187892317311..ae48699cb3f6882f73c8cd2e6226096436e4a8aa 100644
+--- a/src/main/res/xml/fileprovider_paths.xml
++++ b/src/main/res/xml/fileprovider_paths.xml
+@@ -11,4 +11,5 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+         name="external_files"
+         path="." />
+     <external-path name="images" path="Android/data/org.kde.kdeconnect_tp/files/Pictures" />
++    <cache-path name="clipboard_cache" path="clipboard_images/" />
+ </paths>
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/clipboard/ClipboardImageHelperTest.kt b/src/test/java/org/kde/kdeconnect/plugins/clipboard/ClipboardImageHelperTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..31ce9af52d85cfdb675bce976123842d4b154cbf
+--- /dev/null
++++ b/src/test/java/org/kde/kdeconnect/plugins/clipboard/ClipboardImageHelperTest.kt
+@@ -0,0 +1,113 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.clipboard
++
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Assert.fail
++import org.junit.Test
++import java.io.ByteArrayInputStream
++import java.io.File
++import java.io.IOException
++import java.nio.file.Files
++
++class ClipboardImageHelperTest {
++
++    @Test
++    fun sanitizeFilenameAcceptsValidImagesAndRejectsTraversalOrInvalidExtensions() {
++        assertEquals("screenshot.png", ClipboardImageHelper.sanitizeFilename(" screenshot.PNG "))
++        assertEquals("photo_2026.jpg", ClipboardImageHelper.sanitizeFilename("photo 2026.jpg"))
++
++        val rejected = listOf(
++            null,
++            "",
++            "   ",
++            "../secret.png",
++            "sub/dir/img.png",
++            "sub\\dir\\img.png",
++            "img\u0000.png",
++            ".png",
++            "noext",
++            "payload.apk",
++            "script.sh",
++        )
++        for (bad in rejected) {
++            assertNull("Expected null for $bad", ClipboardImageHelper.sanitizeFilename(bad))
++        }
++    }
++
++    @Test
++    fun mimeHelpersIdentifyImagesAndPickSafeExtensions() {
++        assertTrue(ClipboardImageHelper.isSupportedImageMime("image/png"))
++        assertTrue(ClipboardImageHelper.isSupportedImageMime("IMAGE/JPEG"))
++        assertFalse(ClipboardImageHelper.isSupportedImageMime(null))
++        assertFalse(ClipboardImageHelper.isSupportedImageMime("image/"))
++        assertFalse(ClipboardImageHelper.isSupportedImageMime("text/plain"))
++
++        assertEquals(".png", ClipboardImageHelper.extensionForMime("image/png"))
++        assertEquals(".jpg", ClipboardImageHelper.extensionForMime("image/jpeg"))
++        assertEquals(".webp", ClipboardImageHelper.extensionForMime("image/webp"))
++        assertEquals(".gif", ClipboardImageHelper.extensionForMime("image/gif"))
++        assertEquals(".bmp", ClipboardImageHelper.extensionForMime("image/bmp"))
++        assertEquals(".png", ClipboardImageHelper.extensionForMime("image/tiff"))
++    }
++
++    @Test
++    fun boundedCopyAndReadEnforceLimitsAndCleanupOnOverflow() {
++        val tempDir = Files.createTempDirectory("clipboard-test-").toFile()
++        try {
++            val outFile = File(tempDir, "valid.png")
++            val validData = ByteArray(128) { (it and 0xFF).toByte() }
++            val copied = ClipboardImageHelper.copyStreamBounded(
++                ByteArrayInputStream(validData),
++                outFile,
++                maxBytes = 256L,
++            )
++            assertEquals(128L, copied)
++            assertTrue(outFile.isFile)
++            assertArrayEquals(validData, outFile.readBytes())
++
++            val overflowFile = File(tempDir, "overflow.png")
++            val oversized = ByteArray(300) { 1 }
++            try {
++                ClipboardImageHelper.copyStreamBounded(
++                    ByteArrayInputStream(oversized),
++                    overflowFile,
++                    maxBytes = 256L,
++                )
++                fail("Expected IOException when payload exceeds maxBytes")
++            } catch (_: IOException) {
++                assertFalse("Overflow target must be deleted", overflowFile.exists())
++            }
++
++            assertArrayEquals(validData, ClipboardImageHelper.readBytesBounded(ByteArrayInputStream(validData), 256L))
++            assertNull(ClipboardImageHelper.readBytesBounded(ByteArrayInputStream(oversized), 256L))
++            assertNull(ClipboardImageHelper.readBytesBounded(ByteArrayInputStream(ByteArray(0)), 256L))
++        } finally {
++            tempDir.deleteRecursively()
++        }
++    }
++
++    @Test
++    fun pruneCacheDirectoryKeepsOnlyMostRecentEntries() {
++        val tempDir = Files.createTempDirectory("clipboard-prune-").toFile()
++        try {
++            for (i in 1..7) {
++                val f = File(tempDir, "img_$i.png")
++                f.writeBytes(byteArrayOf(i.toByte()))
++                f.setLastModified(1_000_000L + i * 1000L)
++            }
++            ClipboardImageHelper.pruneCacheDirectory(tempDir, keepCount = 5)
++            val remaining = tempDir.listFiles()?.map { it.name }?.sorted() ?: emptyList()
++            assertEquals(listOf("img_3.png", "img_4.png", "img_5.png", "img_6.png", "img_7.png"), remaining)
++        } finally {
++            tempDir.deleteRecursively()
++        }
++    }
++}

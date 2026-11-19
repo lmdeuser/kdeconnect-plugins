@@ -1,0 +1,441 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 13:47:02 +0500
+Subject: [PATCH 3/6] screenstream: recreate H.264 encoder on wake and fix
+ monotonic clock base
+
+
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt
+index 00f31bcbdafb9533ec4004041afc512128cce6cc..dbfb3069bd6c73edf39deacdeb4d59cec63aea3c 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt
+@@ -16,7 +16,6 @@ import android.media.AudioPlaybackCaptureConfiguration
+ import android.media.AudioRecord
+ import android.media.projection.MediaProjection
+ import android.os.Build
+-import android.os.SystemClock
+ import android.util.Log
+ import androidx.annotation.RequiresApi
+ import androidx.core.content.ContextCompat
+@@ -154,7 +153,7 @@ class AudioPlaybackCapturer(
+     }
+ 
+     private fun nextMonotonicPts(): Long {
+-        val clockNowUs = SystemClock.elapsedRealtimeNanos() / 1000L
++        val clockNowUs = System.nanoTime() / 1000L
+         while (true) {
+             val prev = lastPtsUs.get()
+             val next = if (clockNowUs > prev) clockNowUs else prev + 1L
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt
+index 7fd6d403db7fa275f99b4ff56f31d87187572a5d..c04c5469eab8732a7be97d7df959cf1315206b3a 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt
+@@ -11,7 +11,6 @@ import android.media.MediaCodecInfo
+ import android.media.MediaFormat
+ import android.os.Build
+ import android.os.Bundle
+-import android.os.SystemClock
+ import android.util.Log
+ import android.view.Surface
+ import androidx.annotation.RequiresApi
+@@ -98,8 +97,9 @@ class ScreenEncoder(
+             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
+             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
+             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
++            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L)
+             if (includeLowLatency) {
++                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                 setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+             }
+         }
+@@ -193,7 +193,7 @@ class ScreenEncoder(
+     }
+ 
+     private fun nextMonotonicPts(encoderPtsUs: Long): Long {
+-        val clockNowUs = SystemClock.elapsedRealtimeNanos() / 1000L
++        val clockNowUs = System.nanoTime() / 1000L
+         val candidate = if (encoderPtsUs > 0L) encoderPtsUs else clockNowUs
+         while (true) {
+             val prev = lastPtsUs.get()
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
+index 8e98d6d51f3fc8d4989e757f19cc276b7118e772..01ca686a44883cabfe9b8b3d07b1178635978b32 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
+@@ -174,7 +174,7 @@ class ScreenStreamPlugin : Plugin() {
+             is ScreenStreamProtocol.ControlRequest.Wake -> {
+                 wakeDeviceScreen()
+                 if (sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING) {
+-                    ScreenStreamService.requestKeyframeIfRunning(device.deviceId)
++                    ScreenStreamService.recoverAfterWakeIfRunning(device.deviceId)
+                 }
+             }
+             is ScreenStreamProtocol.ControlRequest.RequestKeyframe -> {
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+index af23db9a1437d9cf4e7b4ed75e5293f04c025c4c..932913024b22e53cdb1d92ed6e50979a7dd46a71 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+@@ -10,8 +10,10 @@ import android.app.Activity
+ import android.app.Notification
+ import android.app.PendingIntent
+ import android.app.Service
++import android.content.BroadcastReceiver
+ import android.content.Context
+ import android.content.Intent
++import android.content.IntentFilter
+ import android.content.pm.ServiceInfo
+ import android.graphics.Rect
+ import android.hardware.display.DisplayManager
+@@ -23,12 +25,12 @@ import android.os.Handler
+ import android.os.IBinder
+ import android.os.Looper
+ import android.os.PowerManager
+-import android.os.SystemClock
+ import android.util.Log
+ import android.view.Display
+ import android.view.WindowManager
+ import androidx.annotation.RequiresApi
+ import androidx.core.app.NotificationCompat
++import androidx.core.content.ContextCompat
+ import androidx.core.content.IntentCompat
+ import org.kde.kdeconnect.KdeConnect
+ import org.kde.kdeconnect.helpers.NotificationHelper
+@@ -54,6 +56,10 @@ class ScreenStreamService : Service() {
+     private var activeDeviceId: String? = null
+     private var startParams = ScreenStreamProtocol.StartParams()
+     private var currentDisplayGeometry: DisplayGeometry? = null
++    private var lastDisplayState: Int = Display.STATE_UNKNOWN
++    private var screenStateReceiverRegistered: Boolean = false
++    private var pendingWakeRecoveryReason: String = "wake"
++    private val wakeRecoveryRunnable = Runnable { recoverEncoderAfterWake() }
+     private var keepAwakeLock: PowerManager.WakeLock? = null
+ 
+     private var displayManager: DisplayManager? = null
+@@ -63,6 +69,35 @@ class ScreenStreamService : Service() {
+     private var audioCapturer: AudioPlaybackCapturer? = null
+     private var muxerQueue: StreamMuxerQueue? = null
+ 
++    private val screenStateReceiver = object : BroadcastReceiver() {
++        override fun onReceive(context: Context?, intent: Intent?) {
++            if (stopping.get()) {
++                return
++            }
++            when (intent?.action) {
++                Intent.ACTION_SCREEN_ON -> scheduleWakeRecovery("screen_on")
++                Intent.ACTION_USER_PRESENT -> scheduleWakeRecovery("user_present")
++            }
++        }
++    }
++
++    private val virtualDisplayCallback = object : VirtualDisplay.Callback() {
++        override fun onPaused() {
++            Log.i(TAG, "VirtualDisplay paused")
++        }
++
++        override fun onResumed() {
++            Log.i(TAG, "VirtualDisplay resumed")
++        }
++
++        override fun onStopped() {
++            Log.w(TAG, "VirtualDisplay stopped by system")
++            mainHandler.post {
++                stopCaptureAndNotify(reason = "virtual_display_stopped", explicitStop = false)
++            }
++        }
++    }
++
+     private val projectionCallback = object : MediaProjection.Callback() {
+         override fun onStop() {
+             mainHandler.post {
+@@ -72,6 +107,7 @@ class ScreenStreamService : Service() {
+ 
+         override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
+             protectedContentActive.set(!isVisible)
++            Log.i(TAG, "Captured content visibility changed: isVisible=$isVisible")
+         }
+     }
+ 
+@@ -138,7 +174,7 @@ class ScreenStreamService : Service() {
+                 teardownResources()
+                 stopping.set(false)
+                 protectedContentActive.set(false)
+-                lastPtsUs.set(SystemClock.elapsedRealtimeNanos() / 1000L)
++                lastPtsUs.set(System.nanoTime() / 1000L)
+                 activeDeviceId = deviceId
+                 startParams = params
+ 
+@@ -179,6 +215,7 @@ class ScreenStreamService : Service() {
+ 
+             val geom = queryDefaultDisplayGeometry()
+             currentDisplayGeometry = geom
++            lastDisplayState = queryDefaultDisplayState()
+ 
+             val (streamW, streamH) = ScreenStreamProtocol.computeStreamGeometry(
+                 geom.width,
+@@ -223,11 +260,19 @@ class ScreenStreamService : Service() {
+                 geom.densityDpi,
+                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                 surface,
+-                null,
++                virtualDisplayCallback,
+                 mainHandler,
+             )
+ 
+             displayManager?.registerDisplayListener(displayListener, mainHandler)
++            if (!screenStateReceiverRegistered) {
++                val filter = IntentFilter().apply {
++                    addAction(Intent.ACTION_SCREEN_ON)
++                    addAction(Intent.ACTION_USER_PRESENT)
++                }
++                ContextCompat.registerReceiver(this, screenStateReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
++                screenStateReceiverRegistered = true
++            }
+ 
+             var audioAvailable = false
+             var audioReason = if (params.requestAudio) "" else "Audio disabled by viewer request"
+@@ -274,12 +319,124 @@ class ScreenStreamService : Service() {
+         }
+     }
+ 
++    private fun queryDefaultDisplayState(): Int {
++        return displayManager?.getDisplay(Display.DEFAULT_DISPLAY)?.state ?: Display.STATE_UNKNOWN
++    }
++
++    private fun scheduleWakeRecovery(reason: String) {
++        if (stopping.get() || virtualDisplay == null || muxerQueue == null) {
++            return
++        }
++        pendingWakeRecoveryReason = reason
++        mainHandler.removeCallbacks(wakeRecoveryRunnable)
++        mainHandler.postDelayed(wakeRecoveryRunnable, WAKE_RECOVERY_DELAY_MS)
++    }
++
++    private fun replaceEncoder(
++        deviceId: String,
++        queue: StreamMuxerQueue,
++        vd: VirtualDisplay,
++        streamW: Int,
++        streamH: Int,
++        densityDpi: Int,
++        resizeVirtualDisplay: Boolean,
++        reason: String,
++    ) {
++        val oldEncoder = screenEncoder
++        screenEncoder = null
++        vd.setSurface(null)
++        oldEncoder?.stop()
++
++        val replacement = ScreenEncoder(
++            width = streamW,
++            height = streamH,
++            fps = startParams.maxFps,
++            bitrateKbps = startParams.maxBitrateKbps,
++            muxerQueue = queue,
++            protectedContentActive = protectedContentActive,
++            lastPtsUs = lastPtsUs,
++            onFatalError = { errorMsg ->
++                mainHandler.post {
++                    failStart(deviceId, errorMsg)
++                }
++            },
++        )
++        replacement.start()
++        try {
++            val newSurface = replacement.inputSurface
++                ?: throw IllegalStateException("Replacement encoder produced no input surface")
++            if (resizeVirtualDisplay) {
++                vd.resize(streamW, streamH, densityDpi)
++            }
++            vd.setSurface(newSurface)
++            screenEncoder = replacement
++            Log.i(TAG, "Recreated ScreenEncoder ($reason): ${streamW}x${streamH}")
++        } catch (e: Exception) {
++            replacement.stop()
++            throw e
++        }
++    }
++
++    private fun recoverEncoderAfterWake() {
++        if (stopping.get()) {
++            return
++        }
++        val vd = virtualDisplay ?: return
++        val deviceId = activeDeviceId ?: return
++        val queue = muxerQueue ?: return
++        if (queue.isClosed) {
++            return
++        }
++
++        val displayState = queryDefaultDisplayState()
++        lastDisplayState = displayState
++        if (displayState != Display.STATE_ON) {
++            return
++        }
++
++        val geom = queryDefaultDisplayGeometry()
++        currentDisplayGeometry = geom
++        val (streamW, streamH) = ScreenStreamProtocol.computeStreamGeometry(
++            geom.width,
++            geom.height,
++            startParams.maxWidth,
++            startParams.maxHeight,
++        )
++
++        val currentEncoder = screenEncoder
++        val resizeVirtualDisplay = (currentEncoder == null || currentEncoder.width != streamW || currentEncoder.height != streamH)
++        try {
++            replaceEncoder(
++                deviceId = deviceId,
++                queue = queue,
++                vd = vd,
++                streamW = streamW,
++                streamH = streamH,
++                densityDpi = geom.densityDpi,
++                resizeVirtualDisplay = resizeVirtualDisplay,
++                reason = pendingWakeRecoveryReason,
++            )
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to recreate encoder after wake ($pendingWakeRecoveryReason)", e)
++            failStart(deviceId, "Wake recovery failed: ${e.message ?: e.javaClass.simpleName}")
++        }
++    }
++
+     private fun handleDisplayChanged() {
+         val vd = virtualDisplay ?: return
+         val deviceId = activeDeviceId ?: return
+         val queue = muxerQueue ?: return
+         if (queue.isClosed) return
+ 
++        val displayState = queryDefaultDisplayState()
++        val wokeToOn = (lastDisplayState != Display.STATE_UNKNOWN &&
++            lastDisplayState != Display.STATE_ON &&
++            displayState == Display.STATE_ON)
++        lastDisplayState = displayState
++        if (displayState != Display.STATE_ON) {
++            mainHandler.removeCallbacks(wakeRecoveryRunnable)
++        }
++
+         val prev = currentDisplayGeometry
+         val next = queryDefaultDisplayGeometry()
+         if (prev != null &&
+@@ -287,8 +444,13 @@ class ScreenStreamService : Service() {
+             prev.height == next.height &&
+             prev.rotationDegrees == next.rotationDegrees
+         ) {
++            if (wokeToOn) {
++                scheduleWakeRecovery("display_state_on")
++            }
+             return
+         }
++
++        mainHandler.removeCallbacks(wakeRecoveryRunnable)
+         currentDisplayGeometry = next
+ 
+         val (newStreamW, newStreamH) = ScreenStreamProtocol.computeStreamGeometry(
+@@ -300,6 +462,9 @@ class ScreenStreamService : Service() {
+ 
+         val oldEncoder = screenEncoder
+         if (oldEncoder != null && oldEncoder.width == newStreamW && oldEncoder.height == newStreamH) {
++            if (wokeToOn) {
++                scheduleWakeRecovery("display_state_on")
++            }
+             KdeConnect.getInstance()
+                 .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
+                 ?.onServiceGeometryChanged(next.width, next.height, newStreamW, newStreamH, next.rotationDegrees)
+@@ -307,28 +472,16 @@ class ScreenStreamService : Service() {
+         }
+ 
+         try {
+-            val replacement = ScreenEncoder(
+-                width = newStreamW,
+-                height = newStreamH,
+-                fps = startParams.maxFps,
+-                bitrateKbps = startParams.maxBitrateKbps,
+-                muxerQueue = queue,
+-                protectedContentActive = protectedContentActive,
+-                lastPtsUs = lastPtsUs,
+-                onFatalError = { errorMsg ->
+-                    mainHandler.post {
+-                        failStart(deviceId, errorMsg)
+-                    }
+-                },
++            replaceEncoder(
++                deviceId = deviceId,
++                queue = queue,
++                vd = vd,
++                streamW = newStreamW,
++                streamH = newStreamH,
++                densityDpi = next.densityDpi,
++                resizeVirtualDisplay = true,
++                reason = "rotation",
+             )
+-            replacement.start()
+-            val newSurface = replacement.inputSurface
+-                ?: throw IllegalStateException("Replacement encoder produced no input surface")
+-
+-            vd.resize(newStreamW, newStreamH, next.densityDpi)
+-            vd.setSurface(newSurface)
+-            screenEncoder = replacement
+-            oldEncoder?.stop()
+ 
+             KdeConnect.getInstance()
+                 .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
+@@ -414,6 +567,15 @@ class ScreenStreamService : Service() {
+     }
+ 
+     private fun teardownCaptureHardwareOnly() {
++        mainHandler.removeCallbacks(wakeRecoveryRunnable)
++        lastDisplayState = Display.STATE_UNKNOWN
++        if (screenStateReceiverRegistered) {
++            screenStateReceiverRegistered = false
++            try {
++                unregisterReceiver(screenStateReceiver)
++            } catch (_: IllegalArgumentException) {
++            }
++        }
+         releaseKeepAwakeLock()
+         if (currentInstance === this) {
+             currentInstance = null
+@@ -449,7 +611,7 @@ class ScreenStreamService : Service() {
+         teardownCaptureHardwareOnly()
+         val queue = muxerQueue
+         muxerQueue = null
+-        queue?.offerEosAndFinish(SystemClock.elapsedRealtimeNanos() / 1000L)
++        queue?.offerEosAndFinish(System.nanoTime() / 1000L)
+         queue?.close()
+     }
+ 
+@@ -504,6 +666,7 @@ class ScreenStreamService : Service() {
+ 
+     override fun onDestroy() {
+         stopping.set(true)
++        mainHandler.removeCallbacks(wakeRecoveryRunnable)
+         releaseKeepAwakeLock()
+         teardownResources()
+         super.onDestroy()
+@@ -517,6 +680,7 @@ class ScreenStreamService : Service() {
+         private const val NOTIFICATION_GROUP = "ScreenStream"
+         private const val VIRTUAL_DISPLAY_NAME = "KDEConnectScreenStream"
+         private const val KEEP_AWAKE_TIMEOUT_MS = 4L * 60L * 60L * 1000L
++        private const val WAKE_RECOVERY_DELAY_MS = 450L
+ 
+         private const val ACTION_START_CAPTURE = "org.kde.kdeconnect.plugins.screenstream.START"
+         private const val ACTION_USER_STOP = "org.kde.kdeconnect.plugins.screenstream.STOP"
+@@ -564,6 +728,17 @@ class ScreenStreamService : Service() {
+             }
+         }
+ 
++        fun recoverAfterWakeIfRunning(deviceId: String) {
++            val active = currentInstance ?: return
++            if (active.activeDeviceId == deviceId) {
++                active.mainHandler.post {
++                    if (currentInstance === active && !active.stopping.get()) {
++                        active.scheduleWakeRecovery("remote_wake")
++                    }
++                }
++            }
++        }
++
+         fun stopCaptureForDevice(context: Context, deviceId: String, closeQueueImmediately: Boolean = true) {
+             val active = currentInstance
+             if (active != null && active.activeDeviceId == deviceId) {

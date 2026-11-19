@@ -1,0 +1,23 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:12:58 +0500
+Subject: [PATCH] clipboard: expose local image files as QImage clipboard data
+
+
+diff --git a/plugins/clipboard/clipboardlistener.cpp b/plugins/clipboard/clipboardlistener.cpp
+index d2fc1fc80d60125ed976e6690c6db1b4bd0abdba..62c9f1db1fd57f963b2c53d78a3d45c25a211036 100644
+--- a/plugins/clipboard/clipboardlistener.cpp
++++ b/plugins/clipboard/clipboardlistener.cpp
+@@ -138,6 +138,12 @@ void ClipboardListener::setFile(const KJob *job)
+         refreshContent(url, ClipboardContentType::ClipboardContentTypeFile);
+ 
+         auto mime = new QMimeData;
++        if (url.isLocalFile()) {
++            const QImage img(url.toLocalFile());
++            if (!img.isNull()) {
++                mime->setImageData(img);
++            }
++        }
+         mime->setUrls({url});
+         clipboard->setMimeData(mime, QClipboard::Clipboard);
+     } else {

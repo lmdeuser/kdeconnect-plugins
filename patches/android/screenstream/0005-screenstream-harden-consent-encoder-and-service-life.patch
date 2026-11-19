@@ -1,0 +1,1057 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 16:20:47 +0500
+Subject: [PATCH 5/6] screenstream: harden consent, encoder, and service
+ lifecycle guards
+
+
+diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
+index 71c06fdb416ed7f5636614872213b046a245fcba..bae5a4d9fe358f2ade7ef6aa0d2ea73834575e92 100644
+--- a/src/main/AndroidManifest.xml
++++ b/src/main/AndroidManifest.xml
+@@ -212,7 +212,6 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+             android:name="org.kde.kdeconnect.plugins.screenstream.ScreenStreamPermissionActivity"
+             android:exported="false"
+             android:excludeFromRecents="true"
+-            android:noHistory="true"
+             android:theme="@style/Theme.Transparent"
+             tools:targetApi="r" />
+ 
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
+index 763669f00179b1c78fbaa97fceeee9932ce7b920..b16cdf52c02d63c5b0eef71fe3cefec0923b9041 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
+@@ -46,6 +46,7 @@ import org.kde.kdeconnect_tp.R
+ import java.io.ByteArrayOutputStream
+ import java.security.MessageDigest
+ import java.util.Locale
++import java.util.concurrent.ConcurrentHashMap
+ 
+ @LoadablePlugin
+ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener {
+@@ -56,7 +57,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+     private val postedNotifications = HashSet<String>()
+     private val pendingIntents = HashMap<String, RepliableNotification>()
+     private val pendingActions = mutableMapOf<String, MutableList<Notification.Action>>()
+-    private val pendingContentIntents = HashMap<String, PendingIntent>()
++    private val pendingContentIntents = ConcurrentHashMap<String, PendingIntent>()
+     private var serviceReady = false
+     private lateinit var keyguardManager: KeyguardManager
+     private lateinit var mainHandler: Handler
+@@ -258,6 +259,8 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+         if (contentIntent != null) {
+             pendingContentIntents[key] = contentIntent
+             np["hasContentIntent"] = true
++        } else {
++            pendingContentIntents.remove(key)
+         }
+ 
+         // Some apps ask to notify the user only once they are posted and not for updates, but (for some reason),
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt
+index c04c5469eab8732a7be97d7df959cf1315206b3a..79d0a1aa69ac1e62509094d05739d876d6ff6e15 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt
+@@ -43,16 +43,40 @@ class ScreenEncoder(
+         private set
+ 
+     fun start() {
+-        val created = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+-        val surface = configureAndCreateSurface(created)
+-        created.start()
+-        codec = created
+-        inputSurface = surface
+-        stopRequested.set(false)
++        var created: MediaCodec? = null
++        var surface: Surface? = null
++        try {
++            created = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
++            surface = configureAndCreateSurface(created)
++            created.start()
++            codec = created
++            inputSurface = surface
++            stopRequested.set(false)
++
++            val thread = Thread(::drainLoop, "ScreenStreamEncoder")
++            workerThread = thread
++            thread.start()
++        } catch (t: Throwable) {
++            codec = null
++            inputSurface = null
++            try {
++                created?.stop()
++            } catch (_: IllegalStateException) {
++            }
++            try {
++                created?.release()
++            } catch (_: RuntimeException) {
++            }
++            try {
++                surface?.release()
++            } catch (_: RuntimeException) {
++            }
++            throw t
++        }
++    }
+ 
+-        val thread = Thread(::drainLoop, "ScreenStreamEncoder")
+-        workerThread = thread
+-        thread.start()
++    fun markStopping() {
++        stopRequested.set(true)
+     }
+ 
+     fun requestSyncFrame(forceCodecConfig: Boolean = false) {
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt
+index 85f5ce1498133ee4872f118ef7c695332a159f42..14021b7aaa35a328ada03815921993900bb69b27 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt
+@@ -77,6 +77,10 @@ class ScreenStreamPermissionActivity : AppCompatActivity() {
+             return
+         }
+ 
++        KdeConnect.getInstance()
++            .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++            ?.onConsentUiOpened()
++
+         if (savedInstanceState == null) {
+             val mgr = getSystemService(MediaProjectionManager::class.java)
+             if (mgr == null) {
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
+index 01ca686a44883cabfe9b8b3d07b1178635978b32..7dd30189aa15a1f71ef06f914e9f94d0d003823e 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
+@@ -39,6 +39,7 @@ import org.kde.kdeconnect_tp.R
+ @RequiresApi(Build.VERSION_CODES.R)
+ class ScreenStreamPlugin : Plugin() {
+ 
++    private val stateLock = Any()
+     private val mainHandler = Handler(Looper.getMainLooper())
+     private val sessionTracker = ScreenStreamSessionTracker()
+     private val reconnectRunnable = Runnable { attemptScheduledReconnect() }
+@@ -99,8 +100,9 @@ class ScreenStreamPlugin : Plugin() {
+     }
+ 
+     override fun getUiButtons(): List<PluginUiButton> {
+-        val isActive = sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING ||
+-            sessionTracker.state == ScreenStreamProtocol.SessionState.AWAITING_CONSENT
++        val isActive = synchronized(stateLock) {
++            !ScreenStreamProtocol.canInitiateStart(sessionTracker.state)
++        }
+         return listOf(
+             if (isActive) {
+                 PluginUiButton(
+@@ -126,9 +128,12 @@ class ScreenStreamPlugin : Plugin() {
+         registerAccessibilityListener()
+         sendStatePacket()
+ 
+-        if (sessionTracker.hasPendingReconnect) {
++        val (hasReconnect, autoStart) = synchronized(stateLock) {
++            Pair(sessionTracker.hasPendingReconnect, sessionTracker.shouldAutoStartOnConnect())
++        }
++        if (hasReconnect) {
+             scheduleReconnectIfEligible()
+-        } else if (sessionTracker.shouldAutoStartOnConnect()) {
++        } else if (autoStart) {
+             val audioWanted = isAudioEnabledInSettings()
+             initiateCapture(
+                 params = ScreenStreamProtocol.StartParams(requestAudio = audioWanted),
+@@ -145,7 +150,9 @@ class ScreenStreamPlugin : Plugin() {
+         releaseWakePulseLock()
+         cancelPendingConsentNotification()
+         teardownActiveStream()
+-        sessionTracker.onLinkLost()
++        synchronized(stateLock) {
++            sessionTracker.onLinkLost()
++        }
+         device.onPluginsChanged()
+     }
+ 
+@@ -173,12 +180,18 @@ class ScreenStreamPlugin : Plugin() {
+             }
+             is ScreenStreamProtocol.ControlRequest.Wake -> {
+                 wakeDeviceScreen()
+-                if (sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING) {
++                val isStreaming = synchronized(stateLock) {
++                    sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING
++                }
++                if (isStreaming) {
+                     ScreenStreamService.recoverAfterWakeIfRunning(device.deviceId)
+                 }
+             }
+             is ScreenStreamProtocol.ControlRequest.RequestKeyframe -> {
+-                if (sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING) {
++                val isStreaming = synchronized(stateLock) {
++                    sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING
++                }
++                if (isStreaming) {
+                     ScreenStreamService.requestKeyframeIfRunning(device.deviceId)
+                 }
+             }
+@@ -203,15 +216,23 @@ class ScreenStreamPlugin : Plugin() {
+ 
+     private fun stopStreamingByUser() {
+         cancelScheduledReconnect()
+-        sessionTracker.onExplicitStop("user_stopped")
+-        persistExplicitStop(true)
+         cancelPendingConsentNotification()
+-        val packet = activeStreamPacket
+-        val queue = activeMuxerQueue
+-        activeStreamPacket = null
+-        activeMuxerQueue = null
+-        audioAvailable = false
+-        ScreenStreamService.stopCaptureForDevice(context, device.deviceId, closeQueueImmediately = false)
++        val (shouldStopService, packet, queue) = synchronized(stateLock) {
++            val active = !ScreenStreamProtocol.canInitiateStart(sessionTracker.state) ||
++                activeStreamPacket != null ||
++                activeMuxerQueue != null
++            sessionTracker.onExplicitStop("user_stopped")
++            val pkt = activeStreamPacket
++            val q = activeMuxerQueue
++            activeStreamPacket = null
++            activeMuxerQueue = null
++            audioAvailable = false
++            Triple(active, pkt, q)
++        }
++        persistExplicitStop(true)
++        if (shouldStopService) {
++            ScreenStreamService.stopCaptureForDevice(context, device.deviceId, closeQueueImmediately = false)
++        }
+         sendStoppedPacketAndClose(explicitStop = true, reason = "user_stopped", packet = packet, queue = queue)
+         device.onPluginsChanged()
+     }
+@@ -219,15 +240,25 @@ class ScreenStreamPlugin : Plugin() {
+     private fun stopFromRemote(explicitStop: Boolean) {
+         cancelScheduledReconnect()
+         cancelPendingConsentNotification()
+-        val packet = activeStreamPacket
+-        val queue = activeMuxerQueue
+-        activeStreamPacket = null
+-        activeMuxerQueue = null
+-        audioAvailable = false
+-        ScreenStreamService.stopCaptureForDevice(context, device.deviceId, closeQueueImmediately = false)
++        val (shouldStopService, packet, queue) = synchronized(stateLock) {
++            val active = !ScreenStreamProtocol.canInitiateStart(sessionTracker.state) ||
++                activeStreamPacket != null ||
++                activeMuxerQueue != null
++            val pkt = activeStreamPacket
++            val q = activeMuxerQueue
++            activeStreamPacket = null
++            activeMuxerQueue = null
++            audioAvailable = false
++            if (explicitStop) {
++                sessionTracker.onExplicitStop("remote_stopped")
++            }
++            Triple(active, pkt, q)
++        }
++        if (shouldStopService) {
++            ScreenStreamService.stopCaptureForDevice(context, device.deviceId, closeQueueImmediately = false)
++        }
+ 
+         if (explicitStop) {
+-            sessionTracker.onExplicitStop("remote_stopped")
+             persistExplicitStop(true)
+             sendStoppedPacketAndClose(explicitStop = true, reason = "remote_stopped", packet = packet, queue = queue)
+         } else {
+@@ -241,15 +272,40 @@ class ScreenStreamPlugin : Plugin() {
+         uiActivity: Activity?,
+         isReconnectAttempt: Boolean = false,
+     ) {
+-        if (sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING) {
++        val canPostNotifications = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
++            isPermissionGranted(Manifest.permission.POST_NOTIFICATIONS)
++        val isForegroundLaunch = (uiActivity != null) || LifecycleHelper.isInForeground
++
++        var failFastReason: String? = null
++        val shouldStart = synchronized(stateLock) {
++            if (!ScreenStreamProtocol.canInitiateStart(sessionTracker.state)) {
++                false
++            } else if (!isForegroundLaunch && !canPostNotifications) {
++                sessionTracker.onError()
++                audioAvailable = false
++                audioReason = ""
++                failFastReason = "Notification permission required to request screen capture from background"
++                false
++            } else {
++                sessionTracker.onStartRequested(isReconnectAttempt = isReconnectAttempt)
++                audioReason = ""
++                true
++            }
++        }
++
++        if (failFastReason != null) {
++            cancelScheduledReconnect()
++            sendErrorStatePacket(failFastReason!!)
++            device.onPluginsChanged()
++            return
++        }
++        if (!shouldStart) {
+             sendStatePacket()
+             return
+         }
+ 
+         cancelScheduledReconnect()
+         persistExplicitStop(false)
+-        sessionTracker.onStartRequested(isReconnectAttempt = isReconnectAttempt)
+-        audioReason = ""
+         refreshDefaultDisplayInfo()
+         sendStatePacket()
+         device.onPluginsChanged()
+@@ -267,6 +323,9 @@ class ScreenStreamPlugin : Plugin() {
+         }
+ 
+         if (LifecycleHelper.isInForeground) {
++            if (canPostNotifications) {
++                showConsentNotification(consentIntent)
++            }
+             consentIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+             context.startActivity(consentIntent)
+         } else {
+@@ -302,11 +361,17 @@ class ScreenStreamPlugin : Plugin() {
+         context.getSystemService<NotificationManager>()?.cancel(CONSENT_NOTIFICATION_ID)
+     }
+ 
++    internal fun onConsentUiOpened() {
++        cancelPendingConsentNotification()
++    }
++
+     internal fun onConsentDenied() {
+         if (!isDeviceInitialized) return
+         cancelPendingConsentNotification()
+-        sessionTracker.onExplicitStop("consent_denied")
+-        audioReason = ""
++        synchronized(stateLock) {
++            sessionTracker.onExplicitStop("consent_denied")
++            audioReason = ""
++        }
+         sendStoppedPacketAndClose(explicitStop = false, reason = "consent_denied", packet = null, queue = null)
+         device.onPluginsChanged()
+     }
+@@ -329,15 +394,23 @@ class ScreenStreamPlugin : Plugin() {
+         cancelScheduledReconnect()
+         cancelPendingConsentNotification()
+         closeActiveStreamObjects()
+-        val validRotation = if (ScreenStreamProtocol.isValidRotation(rotationDegrees)) rotationDegrees else 0
+-        this.activeMuxerQueue = muxerQueue
+-        this.lastDisplayWidth = displayWidth
+-        this.lastDisplayHeight = displayHeight
+-        this.lastRotationDegrees = validRotation
+-        this.audioAvailable = audioAvailable
+-        this.audioReason = audioReason
+-
+-        sessionTracker.onStreamingStarted()
++        val geomFields = ScreenStreamProtocol.buildGeometryFields(
++            displayWidth = displayWidth,
++            displayHeight = displayHeight,
++            streamWidth = streamWidth,
++            streamHeight = streamHeight,
++            rotationDegrees = rotationDegrees,
++        )
++        val validRotation = geomFields.getValue("rotation")
++        synchronized(stateLock) {
++            this.activeMuxerQueue = muxerQueue
++            this.lastDisplayWidth = displayWidth
++            this.lastDisplayHeight = displayHeight
++            this.lastRotationDegrees = validRotation
++            this.audioAvailable = audioAvailable
++            this.audioReason = audioReason
++            sessionTracker.onStreamingStarted()
++        }
+         persistExplicitStop(false)
+         sendStatePacket()
+ 
+@@ -349,13 +422,13 @@ class ScreenStreamPlugin : Plugin() {
+             } else {
+                 ScreenStreamProtocol.AUDIO_CODEC_NONE
+             }
+-            this["width"] = streamWidth
+-            this["height"] = streamHeight
+-            this["rotation"] = validRotation
++            applyGeometryFields(this, geomFields)
+             this["fps"] = fps
+             payload = NetworkPacket.Payload(muxerQueue, -1L)
+         }
+-        activeStreamPacket = streamNp
++        synchronized(stateLock) {
++            activeStreamPacket = streamNp
++        }
+         device.sendPacket(streamNp)
+         device.onPluginsChanged()
+     }
+@@ -368,16 +441,22 @@ class ScreenStreamPlugin : Plugin() {
+         rotationDegrees: Int,
+     ) {
+         if (!isDeviceInitialized) return
+-        val validRotation = if (ScreenStreamProtocol.isValidRotation(rotationDegrees)) rotationDegrees else 0
+-        lastDisplayWidth = displayWidth
+-        lastDisplayHeight = displayHeight
+-        lastRotationDegrees = validRotation
++        val geomFields = ScreenStreamProtocol.buildGeometryFields(
++            displayWidth = displayWidth,
++            displayHeight = displayHeight,
++            streamWidth = streamWidth,
++            streamHeight = streamHeight,
++            rotationDegrees = rotationDegrees,
++        )
++        synchronized(stateLock) {
++            lastDisplayWidth = displayWidth
++            lastDisplayHeight = displayHeight
++            lastRotationDegrees = geomFields.getValue("rotation")
++        }
+ 
+         val geomNp = NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
+             this["event"] = "geometry_changed"
+-            this["width"] = streamWidth
+-            this["height"] = streamHeight
+-            this["rotation"] = validRotation
++            applyGeometryFields(this, geomFields)
+         }
+         device.sendPacket(geomNp)
+         sendStatePacket()
+@@ -385,8 +464,10 @@ class ScreenStreamPlugin : Plugin() {
+ 
+     internal fun onServiceAudioStatusChanged(available: Boolean, reason: String) {
+         if (!isDeviceInitialized) return
+-        audioAvailable = available
+-        audioReason = reason
++        synchronized(stateLock) {
++            audioAvailable = available
++            audioReason = reason
++        }
+         sendStatePacket()
+     }
+ 
+@@ -396,20 +477,24 @@ class ScreenStreamPlugin : Plugin() {
+             return
+         }
+         cancelScheduledReconnect()
+-        val packet = activeStreamPacket
+-        val targetQueue = queue ?: activeMuxerQueue
+-        activeMuxerQueue = null
+-        activeStreamPacket = null
+-        audioAvailable = false
++        val (packet, targetQueue) = synchronized(stateLock) {
++            val pkt = activeStreamPacket
++            val tgt = queue ?: activeMuxerQueue
++            activeMuxerQueue = null
++            activeStreamPacket = null
++            audioAvailable = false
++            if (explicitStop || reason != "stream_closed") {
++                sessionTracker.onExplicitStop(reason)
++            }
++            Pair(pkt, tgt)
++        }
+ 
+         if (explicitStop) {
+-            sessionTracker.onExplicitStop(reason)
+             persistExplicitStop(true)
+             sendStoppedPacketAndClose(explicitStop = true, reason = reason, packet = packet, queue = targetQueue)
+         } else if (reason == "stream_closed") {
+             handleTransportDropped(packet, targetQueue)
+         } else {
+-            sessionTracker.onExplicitStop(reason)
+             sendStoppedPacketAndClose(explicitStop = false, reason = reason, packet = packet, queue = targetQueue)
+         }
+         device.onPluginsChanged()
+@@ -418,50 +503,52 @@ class ScreenStreamPlugin : Plugin() {
+     internal fun onServiceError(reason: String) {
+         if (!isDeviceInitialized) return
+         cancelScheduledReconnect()
+-        activeMuxerQueue = null
+-        activeStreamPacket?.cancel()
+-        activeStreamPacket = null
+-        audioAvailable = false
+-        sessionTracker.onError()
+-
+-        val np = NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
+-            this["event"] = "state"
+-            this["state"] = ScreenStreamProtocol.SessionState.ERROR.wireName
+-            this["explicitStop"] = sessionTracker.explicitStop
+-            this["reason"] = reason
+-            this["audioAvailable"] = false
+-            this["audioReason"] = audioReason
+-            this["accessibilityEnabled"] = (KdeConnectAccessibilityService.instance != null)
+-            this["displayWidth"] = lastDisplayWidth
+-            this["displayHeight"] = lastDisplayHeight
+-            this["rotation"] = lastRotationDegrees
+-        }
+-        device.sendPacket(np)
++        val stalePacket = synchronized(stateLock) {
++            activeMuxerQueue = null
++            val pkt = activeStreamPacket
++            activeStreamPacket = null
++            audioAvailable = false
++            sessionTracker.onError()
++            pkt
++        }
++        stalePacket?.cancel()
++        sendErrorStatePacket(reason)
+         device.onPluginsChanged()
+     }
+ 
+     private fun closeActiveStreamObjects() {
+-        val packet = activeStreamPacket
+-        activeStreamPacket = null
++        val (packet, queue) = synchronized(stateLock) {
++            val pkt = activeStreamPacket
++            val q = activeMuxerQueue
++            activeStreamPacket = null
++            activeMuxerQueue = null
++            Pair(pkt, q)
++        }
+         packet?.cancel()
+-        val queue = activeMuxerQueue
+-        activeMuxerQueue = null
+         queue?.close()
+     }
+ 
+     private fun teardownActiveStream() {
+-        if (isDeviceInitialized) {
++        val shouldStopService = synchronized(stateLock) {
++            val active = !ScreenStreamProtocol.canInitiateStart(sessionTracker.state) ||
++                activeStreamPacket != null ||
++                activeMuxerQueue != null
++            audioAvailable = false
++            active
++        }
++        if (isDeviceInitialized && shouldStopService) {
+             ScreenStreamService.stopCaptureForDevice(context, device.deviceId)
+         }
+         closeActiveStreamObjects()
+-        audioAvailable = false
+     }
+ 
+     private fun handleTransportDropped(packet: NetworkPacket?, queue: StreamMuxerQueue?) {
+         packet?.cancel()
+         queue?.close()
+         syncPreferencesIntoTracker()
+-        sessionTracker.onLinkLost()
++        synchronized(stateLock) {
++            sessionTracker.onLinkLost()
++        }
+         sendStatePacket()
+         if (device.isReachable) {
+             scheduleReconnectIfEligible()
+@@ -474,7 +561,9 @@ class ScreenStreamPlugin : Plugin() {
+ 
+     private fun scheduleReconnectIfEligible() {
+         if (!isDeviceInitialized) return
+-        val delayMs = sessionTracker.consumeReconnectDelayMs() ?: return
++        val delayMs = synchronized(stateLock) {
++            sessionTracker.consumeReconnectDelayMs()
++        } ?: return
+         mainHandler.removeCallbacks(reconnectRunnable)
+         mainHandler.postDelayed(reconnectRunnable, delayMs.toLong())
+     }
+@@ -484,12 +573,12 @@ class ScreenStreamPlugin : Plugin() {
+             return
+         }
+         syncPreferencesIntoTracker()
+-        if (sessionTracker.explicitStop || !sessionTracker.autoStartEnabled) {
+-            return
++        val canStart = synchronized(stateLock) {
++            !sessionTracker.explicitStop &&
++                sessionTracker.autoStartEnabled &&
++                ScreenStreamProtocol.canInitiateStart(sessionTracker.state)
+         }
+-        if (sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING ||
+-            sessionTracker.state == ScreenStreamProtocol.SessionState.AWAITING_CONSENT
+-        ) {
++        if (!canStart) {
+             return
+         }
+         initiateCapture(
+@@ -568,19 +657,74 @@ class ScreenStreamPlugin : Plugin() {
+         return device.getPlugin(MouseReceiverPlugin::class.java) != null
+     }
+ 
++    private data class StateSnapshot(
++        val stateWire: String,
++        val explicitStop: Boolean,
++        val audioAvailable: Boolean,
++        val audioReason: String,
++        val displayWidth: Int,
++        val displayHeight: Int,
++        val rotationDegrees: Int,
++    )
++
++    private fun applyGeometryFields(np: NetworkPacket, fields: Map<String, Int>) {
++        fields.forEach { (key, value) ->
++            np[key] = value
++        }
++    }
++
++    private fun sendErrorStatePacket(reason: String) {
++        val snap = synchronized(stateLock) {
++            StateSnapshot(
++                stateWire = ScreenStreamProtocol.SessionState.ERROR.wireName,
++                explicitStop = sessionTracker.explicitStop,
++                audioAvailable = false,
++                audioReason = audioReason,
++                displayWidth = lastDisplayWidth,
++                displayHeight = lastDisplayHeight,
++                rotationDegrees = lastRotationDegrees,
++            )
++        }
++        device.sendPacket(
++            buildStatePacket(snap, KdeConnectAccessibilityService.instance != null, reason)
++        )
++    }
++
+     private fun sendStatePacket() {
+-        val np = NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
++        val remoteInputReady = isRemoteInputReady()
++        val snap = synchronized(stateLock) {
++            StateSnapshot(
++                stateWire = sessionTracker.state.wireName,
++                explicitStop = sessionTracker.explicitStop,
++                audioAvailable = audioAvailable,
++                audioReason = audioReason,
++                displayWidth = lastDisplayWidth,
++                displayHeight = lastDisplayHeight,
++                rotationDegrees = lastRotationDegrees,
++            )
++        }
++        device.sendPacket(buildStatePacket(snap, remoteInputReady, reason = null))
++    }
++
++    private fun buildStatePacket(
++        snap: StateSnapshot,
++        accessibilityEnabled: Boolean,
++        reason: String?,
++    ): NetworkPacket {
++        return NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
+             this["event"] = "state"
+-            this["state"] = sessionTracker.state.wireName
+-            this["explicitStop"] = sessionTracker.explicitStop
+-            this["audioAvailable"] = audioAvailable
+-            this["audioReason"] = audioReason
+-            this["accessibilityEnabled"] = isRemoteInputReady()
+-            this["displayWidth"] = lastDisplayWidth
+-            this["displayHeight"] = lastDisplayHeight
+-            this["rotation"] = lastRotationDegrees
++            this["state"] = snap.stateWire
++            this["explicitStop"] = snap.explicitStop
++            if (reason != null) {
++                this["reason"] = reason
++            }
++            this["audioAvailable"] = snap.audioAvailable
++            this["audioReason"] = snap.audioReason
++            this["accessibilityEnabled"] = accessibilityEnabled
++            this["displayWidth"] = snap.displayWidth
++            this["displayHeight"] = snap.displayHeight
++            this["rotation"] = snap.rotationDegrees
+         }
+-        device.sendPacket(np)
+     }
+ 
+     private fun sendStoppedPacketAndClose(
+@@ -616,7 +760,9 @@ class ScreenStreamPlugin : Plugin() {
+             context.getString(R.string.screenstream_pref_auto_start_key),
+             false,
+         )
+-        sessionTracker.configure(autoStart = autoStart, explicitStop = explicit)
++        synchronized(stateLock) {
++            sessionTracker.configure(autoStart = autoStart, explicitStop = explicit)
++        }
+     }
+ 
+     private fun persistExplicitStop(explicitStop: Boolean) {
+@@ -642,19 +788,27 @@ class ScreenStreamPlugin : Plugin() {
+     @Suppress("DEPRECATION")
+     private fun wakeDeviceScreen() {
+         mainHandler.removeCallbacks(releaseWakePulseRunnable)
+-        releaseWakePulseLock()
+         val pm = context.getSystemService(PowerManager::class.java) ?: return
+-        val lock = pm.newWakeLock(
+-            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE,
+-            "kdeconnect:screenstream_wake",
+-        )
+-        lock.setReferenceCounted(false)
+-        lock.acquire(WAKE_PULSE_TIMEOUT_MS)
+-        wakePulseLock = lock
++        synchronized(stateLock) {
++            releaseWakePulseLockLocked()
++            val lock = pm.newWakeLock(
++                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE,
++                "kdeconnect:screenstream_wake",
++            )
++            lock.setReferenceCounted(false)
++            lock.acquire(WAKE_PULSE_TIMEOUT_MS)
++            wakePulseLock = lock
++        }
+         mainHandler.postDelayed(releaseWakePulseRunnable, WAKE_PULSE_RELEASE_DELAY_MS)
+     }
+ 
+     private fun releaseWakePulseLock() {
++        synchronized(stateLock) {
++            releaseWakePulseLockLocked()
++        }
++    }
++
++    private fun releaseWakePulseLockLocked() {
+         val lock = wakePulseLock ?: return
+         wakePulseLock = null
+         try {
+@@ -668,7 +822,7 @@ class ScreenStreamPlugin : Plugin() {
+     private fun refreshDefaultDisplayInfo() {
+         val displayManager = context.getSystemService(DisplayManager::class.java) ?: return
+         val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY) ?: return
+-        lastRotationDegrees = ScreenStreamProtocol.surfaceRotationToDegrees(display.rotation)
++        val rotDegrees = ScreenStreamProtocol.surfaceRotationToDegrees(display.rotation)
+         try {
+             val windowCtx = context.createDisplayContext(display).createWindowContext(
+                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+@@ -676,17 +830,23 @@ class ScreenStreamPlugin : Plugin() {
+             )
+             val bounds = windowCtx.getSystemService(WindowManager::class.java)?.maximumWindowMetrics?.bounds
+             if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
+-                lastDisplayWidth = bounds.width()
+-                lastDisplayHeight = bounds.height()
++                synchronized(stateLock) {
++                    lastRotationDegrees = rotDegrees
++                    lastDisplayWidth = bounds.width()
++                    lastDisplayHeight = bounds.height()
++                }
+                 return
+             }
+         } catch (_: RuntimeException) {
+         }
+ 
+         val mode = display.mode
+-        val swap = lastRotationDegrees == 90 || lastRotationDegrees == 270
+-        lastDisplayWidth = if (swap) mode.physicalHeight else mode.physicalWidth
+-        lastDisplayHeight = if (swap) mode.physicalWidth else mode.physicalHeight
++        val swap = rotDegrees == 90 || rotDegrees == 270
++        synchronized(stateLock) {
++            lastRotationDegrees = rotDegrees
++            lastDisplayWidth = if (swap) mode.physicalHeight else mode.physicalWidth
++            lastDisplayHeight = if (swap) mode.physicalWidth else mode.physicalHeight
++        }
+     }
+ 
+     companion object {
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt
+index 42093d30a5b275b2c13e05f988d1a83b7cd76b46..c28436f676b5e5b5b281ae737106a12616567b6f 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt
+@@ -191,6 +191,27 @@ object ScreenStreamProtocol {
+         return degrees == 0 || degrees == 90 || degrees == 180 || degrees == 270
+     }
+ 
++    fun canInitiateStart(state: SessionState): Boolean {
++        return state != SessionState.STREAMING && state != SessionState.AWAITING_CONSENT
++    }
++
++    fun buildGeometryFields(
++        displayWidth: Int,
++        displayHeight: Int,
++        streamWidth: Int,
++        streamHeight: Int,
++        rotationDegrees: Int,
++    ): Map<String, Int> {
++        val validRotation = if (isValidRotation(rotationDegrees)) rotationDegrees else 0
++        return linkedMapOf(
++            "width" to streamWidth,
++            "height" to streamHeight,
++            "displayWidth" to displayWidth,
++            "displayHeight" to displayHeight,
++            "rotation" to validRotation,
++        )
++    }
++
+     fun surfaceRotationToDegrees(surfaceRotation: Int): Int {
+         return when (surfaceRotation) {
+             1 -> 90
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+index 932913024b22e53cdb1d92ed6e50979a7dd46a71..ab65b39cf0a39e65f6a12e84767c49ac04e18658 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+@@ -68,6 +68,13 @@ class ScreenStreamService : Service() {
+     private var screenEncoder: ScreenEncoder? = null
+     private var audioCapturer: AudioPlaybackCapturer? = null
+     private var muxerQueue: StreamMuxerQueue? = null
++    private var activeProjectionCallback: MediaProjection.Callback? = null
++
++    @Volatile
++    private var sessionGeneration: Long = 0L
++
++    @Volatile
++    private var encoderGeneration: Long = 0L
+ 
+     private val screenStateReceiver = object : BroadcastReceiver() {
+         override fun onReceive(context: Context?, intent: Intent?) {
+@@ -81,33 +88,44 @@ class ScreenStreamService : Service() {
+         }
+     }
+ 
+-    private val virtualDisplayCallback = object : VirtualDisplay.Callback() {
+-        override fun onPaused() {
+-            Log.i(TAG, "VirtualDisplay paused")
+-        }
++    private fun createVirtualDisplayCallback(sessionGen: Long): VirtualDisplay.Callback {
++        return object : VirtualDisplay.Callback() {
++            override fun onPaused() {
++                Log.i(TAG, "VirtualDisplay paused")
++            }
+ 
+-        override fun onResumed() {
+-            Log.i(TAG, "VirtualDisplay resumed")
+-        }
++            override fun onResumed() {
++                Log.i(TAG, "VirtualDisplay resumed")
++            }
+ 
+-        override fun onStopped() {
+-            Log.w(TAG, "VirtualDisplay stopped by system")
+-            mainHandler.post {
+-                stopCaptureAndNotify(reason = "virtual_display_stopped", explicitStop = false)
++            override fun onStopped() {
++                Log.w(TAG, "VirtualDisplay stopped by system")
++                mainHandler.post {
++                    if (sessionGen == sessionGeneration && !stopping.get()) {
++                        stopCaptureAndNotify(reason = "virtual_display_stopped", explicitStop = false)
++                    }
++                }
+             }
+         }
+     }
+ 
+-    private val projectionCallback = object : MediaProjection.Callback() {
+-        override fun onStop() {
+-            mainHandler.post {
+-                stopCaptureAndNotify(reason = "projection_revoked", explicitStop = false)
++    private fun createProjectionCallback(sessionGen: Long): MediaProjection.Callback {
++        return object : MediaProjection.Callback() {
++            override fun onStop() {
++                mainHandler.post {
++                    if (sessionGen == sessionGeneration && !stopping.get()) {
++                        stopCaptureAndNotify(reason = "projection_revoked", explicitStop = false)
++                    }
++                }
+             }
+-        }
+ 
+-        override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
+-            protectedContentActive.set(!isVisible)
+-            Log.i(TAG, "Captured content visibility changed: isVisible=$isVisible")
++            override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
++                if (sessionGen != sessionGeneration) {
++                    return
++                }
++                protectedContentActive.set(!isVisible)
++                Log.i(TAG, "Captured content visibility changed: isVisible=$isVisible")
++            }
+         }
+     }
+ 
+@@ -172,13 +190,15 @@ class ScreenStreamService : Service() {
+                 )
+ 
+                 teardownResources()
++                val sessionGen = ++sessionGeneration
++                encoderGeneration += 1L
+                 stopping.set(false)
+                 protectedContentActive.set(false)
+                 lastPtsUs.set(System.nanoTime() / 1000L)
+                 activeDeviceId = deviceId
+                 startParams = params
+ 
+-                beginCaptureSession(deviceId, resultCode, consentData, params, keepScreenOn)
++                beginCaptureSession(deviceId, resultCode, consentData, params, keepScreenOn, sessionGen)
+                 return START_NOT_STICKY
+             }
+             else -> {
+@@ -194,6 +214,7 @@ class ScreenStreamService : Service() {
+         consentData: Intent,
+         params: ScreenStreamProtocol.StartParams,
+         keepScreenOn: Boolean,
++        sessionGen: Long,
+     ) {
+         val mgr = getSystemService(MediaProjectionManager::class.java)
+         val projection = mgr?.getMediaProjection(resultCode, consentData)
+@@ -211,7 +232,9 @@ class ScreenStreamService : Service() {
+ 
+         try {
+             mediaProjection = projection
+-            projection.registerCallback(projectionCallback, mainHandler)
++            val projCallback = createProjectionCallback(sessionGen)
++            activeProjectionCallback = projCallback
++            projection.registerCallback(projCallback, mainHandler)
+ 
+             val geom = queryDefaultDisplayGeometry()
+             currentDisplayGeometry = geom
+@@ -226,13 +249,14 @@ class ScreenStreamService : Service() {
+ 
+             val queue = StreamMuxerQueue(onClosedCallback = {
+                 mainHandler.post {
+-                    if (!stopping.get()) {
++                    if (sessionGen == sessionGeneration && !stopping.get()) {
+                         stopCaptureAndNotify(reason = "stream_closed", explicitStop = false)
+                     }
+                 }
+             })
+             muxerQueue = queue
+ 
++            val encGen = encoderGeneration
+             val encoder = ScreenEncoder(
+                 width = streamW,
+                 height = streamH,
+@@ -243,7 +267,12 @@ class ScreenStreamService : Service() {
+                 lastPtsUs = lastPtsUs,
+                 onFatalError = { errorMsg ->
+                     mainHandler.post {
+-                        failStart(deviceId, errorMsg)
++                        if (sessionGen == sessionGeneration &&
++                            encGen == encoderGeneration &&
++                            !stopping.get()
++                        ) {
++                            failStart(deviceId, errorMsg)
++                        }
+                     }
+                 },
+             )
+@@ -260,7 +289,7 @@ class ScreenStreamService : Service() {
+                 geom.densityDpi,
+                 DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                 surface,
+-                virtualDisplayCallback,
++                createVirtualDisplayCallback(sessionGen),
+                 mainHandler,
+             )
+ 
+@@ -342,8 +371,11 @@ class ScreenStreamService : Service() {
+         resizeVirtualDisplay: Boolean,
+         reason: String,
+     ) {
++        val sessionGen = sessionGeneration
+         val oldEncoder = screenEncoder
+         screenEncoder = null
++        oldEncoder?.markStopping()
++        val nextEncGen = ++encoderGeneration
+         vd.setSurface(null)
+         oldEncoder?.stop()
+ 
+@@ -357,7 +389,12 @@ class ScreenStreamService : Service() {
+             lastPtsUs = lastPtsUs,
+             onFatalError = { errorMsg ->
+                 mainHandler.post {
+-                    failStart(deviceId, errorMsg)
++                    if (sessionGen == sessionGeneration &&
++                        nextEncGen == encoderGeneration &&
++                        !stopping.get()
++                    ) {
++                        failStart(deviceId, errorMsg)
++                    }
+                 }
+             },
+         )
+@@ -567,6 +604,8 @@ class ScreenStreamService : Service() {
+     }
+ 
+     private fun teardownCaptureHardwareOnly() {
++        sessionGeneration += 1L
++        encoderGeneration += 1L
+         mainHandler.removeCallbacks(wakeRecoveryRunnable)
+         lastDisplayState = Display.STATE_UNKNOWN
+         if (screenStateReceiverRegistered) {
+@@ -587,18 +626,23 @@ class ScreenStreamService : Service() {
+ 
+         val encoder = screenEncoder
+         screenEncoder = null
++        encoder?.markStopping()
+ 
+         virtualDisplay?.release()
+         virtualDisplay = null
+ 
+         encoder?.stop()
+ 
++        val projCallback = activeProjectionCallback
++        activeProjectionCallback = null
+         val projection = mediaProjection
+         mediaProjection = null
+         if (projection != null) {
+-            try {
+-                projection.unregisterCallback(projectionCallback)
+-            } catch (_: RuntimeException) {
++            if (projCallback != null) {
++                try {
++                    projection.unregisterCallback(projCallback)
++                } catch (_: RuntimeException) {
++                }
+             }
+             try {
+                 projection.stop()
+@@ -743,7 +787,7 @@ class ScreenStreamService : Service() {
+             val active = currentInstance
+             if (active != null && active.activeDeviceId == deviceId) {
+                 active.mainHandler.post {
+-                    if (currentInstance === active) {
++                    if (currentInstance === active && active.activeDeviceId == deviceId) {
+                         active.stopping.set(true)
+                         if (closeQueueImmediately) {
+                             active.teardownResources()
+@@ -754,7 +798,7 @@ class ScreenStreamService : Service() {
+                         active.stopSelf()
+                     }
+                 }
+-            } else {
++            } else if (active == null) {
+                 context.stopService(Intent(context, ScreenStreamService::class.java))
+             }
+         }
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt b/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt
+index 8d5de747707673ba67ea7a69b9366e88ff6ff159..7e86f430b651078097eecb746496a620945d3d50 100644
+--- a/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt
++++ b/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt
+@@ -246,4 +246,51 @@ class ScreenStreamProtocolTest {
+         assertEquals(0, reader.bufferedBytes)
+         assertEquals(500L, parsed[0].ptsUs)
+     }
++
++    @Test
++    fun testBuildGeometryFieldsIncludesDisplayDimensionsAndNormalizesRotation() {
++        val portrait = ScreenStreamProtocol.buildGeometryFields(
++            displayWidth = 1080,
++            displayHeight = 2460,
++            streamWidth = 848,
++            streamHeight = 1920,
++            rotationDegrees = 180,
++        )
++        assertEquals(848, portrait["width"])
++        assertEquals(1920, portrait["height"])
++        assertEquals(1080, portrait["displayWidth"])
++        assertEquals(2460, portrait["displayHeight"])
++        assertEquals(180, portrait["rotation"])
++
++        val invalidRot = ScreenStreamProtocol.buildGeometryFields(
++            displayWidth = 2460,
++            displayHeight = 1080,
++            streamWidth = 1920,
++            streamHeight = 848,
++            rotationDegrees = 45,
++        )
++        assertEquals(0, invalidRot["rotation"])
++        assertEquals(2460, invalidRot["displayWidth"])
++        assertEquals(1080, invalidRot["displayHeight"])
++    }
++
++    @Test
++    fun testCanInitiateStartBlocksDuplicateConsentAndActiveStream() {
++        val tracker = ScreenStreamSessionTracker()
++        assertTrue(ScreenStreamProtocol.canInitiateStart(tracker.state))
++
++        tracker.onStartRequested()
++        assertEquals(ScreenStreamProtocol.SessionState.AWAITING_CONSENT, tracker.state)
++        assertFalse(ScreenStreamProtocol.canInitiateStart(tracker.state))
++
++        tracker.onStreamingStarted()
++        assertEquals(ScreenStreamProtocol.SessionState.STREAMING, tracker.state)
++        assertFalse(ScreenStreamProtocol.canInitiateStart(tracker.state))
++
++        tracker.onExplicitStop("consent_denied")
++        assertTrue(ScreenStreamProtocol.canInitiateStart(tracker.state))
++
++        tracker.onError()
++        assertTrue(ScreenStreamProtocol.canInitiateStart(tracker.state))
++    }
+ }

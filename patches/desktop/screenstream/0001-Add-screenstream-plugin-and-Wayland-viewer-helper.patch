@@ -1,0 +1,3497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 00:32:22 +0500
+Subject: [PATCH 1/8] Add screenstream plugin and Wayland viewer helper
+
+
+diff --git a/REUSE.toml b/REUSE.toml
+index ec1e3ef8d74a5f7a627e748cf00ffca0770c4fc0..da04df12d4d9db33f7e4b30eb58703444ef31d0e 100644
+--- a/REUSE.toml
++++ b/REUSE.toml
+@@ -19,3 +19,9 @@ SPDX-License-Identifier = "GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accept
+ path = "dbusinterfaces/systeminterfaces/org.freedesktop.portal.*.xml"
+ SPDX-FileCopyrightText = "Red Hat, Inc."
+ SPDX-License-Identifier = "LGPL-2.0-or-later"
++
++[[annotations]]
++path = "plugins/screenstream/kdeconnect_screenstream.json"
++SPDX-FileCopyrightText = "2026 Dmitriy Volkov <dennshield@duck.com>"
++SPDX-License-Identifier = "GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL"
++
+diff --git a/app/qml/DevicePage.qml b/app/qml/DevicePage.qml
+index 10ad0e82e7fc4fcf764da9a767e0c9298173134c..590bac191d220b8d6ca5f24d56f327878714bebb 100644
+--- a/app/qml/DevicePage.qml
++++ b/app/qml/DevicePage.qml
+@@ -259,6 +259,23 @@ Kirigami.ScrollablePage {
+                 section: "action"
+                 device: root.currentDevice
+             },
++            PluginItem {
++                readonly property QtObject screenStream: ScreenStreamDbusInterfaceFactory.create(root.currentDevice.id())
++                pluginName: "screenstream"
++                name: screenStream.active ? i18n("Stop screen stream") : i18n("View device screen")
++                onClick: () => {
++                    if (screenStream.active) {
++                        screenStream.stopStream();
++                    } else {
++                        screenStream.startStream();
++                        if (screenStream.lastError.length > 0) {
++                            showPassiveNotification(screenStream.lastError)
++                        }
++                    }
++                }
++                section: "action"
++                device: root.currentDevice
++            },
+             PluginItem {
+                 pluginName: "battery"
+                 name: batteryInfo.displayString
+diff --git a/dbusinterfaces/CMakeLists.txt b/dbusinterfaces/CMakeLists.txt
+index 622c506c265c813f71890f88e23a0010b5e4ee9c..9f76ae2e9b711cdf58f771cb258aca00731a5e6c 100644
+--- a/dbusinterfaces/CMakeLists.txt
++++ b/dbusinterfaces/CMakeLists.txt
+@@ -49,6 +49,7 @@ geninterface(${PROJECT_SOURCE_DIR}/plugins/sms/conversationsdbusinterface.h gene
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/share/shareplugin.h generated/shareinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/remotesystemvolume/remotesystemvolumeplugin.h generated/remotesystemvolumeinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/virtualmonitor/virtualmonitorplugin.h generated/virtualmonitorinterface)
++geninterface(${PROJECT_SOURCE_DIR}/plugins/screenstream/screenstreamplugin.h generated/screenstreaminterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/clipboard/clipboardplugin.h generated/deviceclipboardinterface)
+ 
+ # System dbus interfaces
+diff --git a/dbusinterfaces/dbusinterfaces.cpp b/dbusinterfaces/dbusinterfaces.cpp
+index 40374c314434af2c5ec49b1e2b6809294738b70a..c14e7450d5ff371129b70bbcb2e6299262bada37 100644
+--- a/dbusinterfaces/dbusinterfaces.cpp
++++ b/dbusinterfaces/dbusinterfaces.cpp
+@@ -191,6 +191,16 @@ VirtualmonitorDbusInterface::VirtualmonitorDbusInterface(const QString &deviceId
+     connect(this, &OrgKdeKdeconnectDeviceVirtualmonitorInterface::activeChanged, this, &VirtualmonitorDbusInterface::activeChanged);
+ }
+ 
++ScreenStreamDbusInterface::ScreenStreamDbusInterface(const QString &deviceId, QObject *parent)
++    : OrgKdeKdeconnectDeviceScreenstreamInterface(DaemonDbusInterface::activatedService(),
++                                                  QLatin1String("/modules/kdeconnect/devices/%1/screenstream").arg(deviceId),
++                                                  QDBusConnection::sessionBus(),
++                                                  parent)
++{
++    connect(this, &OrgKdeKdeconnectDeviceScreenstreamInterface::activeChanged, this, &ScreenStreamDbusInterface::activeChanged);
++    connect(this, &OrgKdeKdeconnectDeviceScreenstreamInterface::lastErrorChanged, this, &ScreenStreamDbusInterface::lastErrorChanged);
++}
++
+ ClipboardDbusInterface::ClipboardDbusInterface(const QString &deviceId, QObject *parent)
+     : OrgKdeKdeconnectDeviceClipboardInterface(DaemonDbusInterface::activatedService(),
+                                                QLatin1String("/modules/kdeconnect/devices/%1/clipboard").arg(deviceId),
+diff --git a/dbusinterfaces/dbusinterfaces.h b/dbusinterfaces/dbusinterfaces.h
+index f7ad3fa26c97673f400edf60481aa537f8c23f45..3f6719443174a76684520cf1ef144c44f8c085ce 100644
+--- a/dbusinterfaces/dbusinterfaces.h
++++ b/dbusinterfaces/dbusinterfaces.h
+@@ -27,6 +27,7 @@
+ #include "generated/remotesystemvolumeinterface.h"
+ #include "generated/shareinterface.h"
+ #include "generated/smsinterface.h"
++#include "generated/screenstreaminterface.h"
+ #include "generated/virtualmonitorinterface.h"
+ 
+ /**
+@@ -254,6 +255,18 @@ Q_SIGNALS:
+     void activeChanged();
+ };
+ 
++class KDECONNECTDBUSINTERFACES_EXPORT ScreenStreamDbusInterface : public OrgKdeKdeconnectDeviceScreenstreamInterface
++{
++    Q_OBJECT
++    Q_PROPERTY(bool active READ active NOTIFY activeChanged)
++    Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
++public:
++    explicit ScreenStreamDbusInterface(const QString &deviceId, QObject *parent = nullptr);
++Q_SIGNALS:
++    void activeChanged();
++    void lastErrorChanged();
++};
++
+ class KDECONNECTDBUSINTERFACES_EXPORT ClipboardDbusInterface : public OrgKdeKdeconnectDeviceClipboardInterface
+ {
+     Q_OBJECT
+diff --git a/declarativeplugin/kdeconnectdeclarativeplugin.h b/declarativeplugin/kdeconnectdeclarativeplugin.h
+index c0ab263ec7b0956541fe0eb50de8102ed295a1f2..4818565ef9e9f20e488b4a0f0bb1e842bfc5dc03 100644
+--- a/declarativeplugin/kdeconnectdeclarativeplugin.h
++++ b/declarativeplugin/kdeconnectdeclarativeplugin.h
+@@ -141,6 +141,14 @@ class VirtualmonitorDbusInterfaceForeign
+     QML_FOREIGN(VirtualmonitorDbusInterface)
+ };
+ 
++class ScreenStreamDbusInterfaceForeign
++{
++    Q_GADGET
++    QML_NAMED_ELEMENT(ScreenStreamDbusInterface)
++    QML_UNCREATABLE("")
++    QML_FOREIGN(ScreenStreamDbusInterface)
++};
++
+ class SftpDbusInterfaceForeign
+ {
+     Q_GADGET
+@@ -301,6 +309,18 @@ public:
+     }
+ };
+ 
++class ScreenStreamDbusInterfaceFactory : public QObject
++{
++    Q_OBJECT
++    QML_ELEMENT
++    QML_SINGLETON
++public:
++    Q_INVOKABLE ScreenStreamDbusInterface *create(const QString &deviceId)
++    {
++        return new ScreenStreamDbusInterface(deviceId);
++    }
++};
++
+ class SftpDbusInterfaceFactory : public QObject
+ {
+     Q_OBJECT
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 0afd522eaf6dfa35ffceff69e9b34070a09218bc..5822c10afb417ae9c63604ecf9b7722e5d8a6d47 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -30,6 +30,7 @@ if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+     endif()
+     add_subdirectory(shareinputdevices)
+     add_subdirectory(shareinputdevicesremote)
++    add_subdirectory(screenstream)
+ endif()
+ 
+ if(NOT APPLE)
+diff --git a/plugins/screenstream/CMakeLists.txt b/plugins/screenstream/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..40b73c62899b099da8678b31e2b7b025761ac39f
+--- /dev/null
++++ b/plugins/screenstream/CMakeLists.txt
+@@ -0,0 +1,50 @@
++# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Gui Widgets Network DBus)
++find_package(PkgConfig QUIET REQUIRED)
++pkg_check_modules(GStreamer REQUIRED IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0 gstreamer-video-1.0)
++
++add_library(kdeconnectscreenstreamcommon STATIC
++    screenstreamprotocol.cpp
++)
++set_property(TARGET kdeconnectscreenstreamcommon PROPERTY POSITION_INDEPENDENT_CODE ON)
++target_include_directories(kdeconnectscreenstreamcommon PUBLIC
++    ${PROJECT_SOURCE_DIR}
++    ${CMAKE_CURRENT_SOURCE_DIR}
++)
++target_link_libraries(kdeconnectscreenstreamcommon PUBLIC
++    Qt::Core
++)
++
++kdeconnect_add_plugin(kdeconnect_screenstream SOURCES
++    screenstreamplugin.cpp
++)
++target_link_libraries(kdeconnect_screenstream
++    kdeconnectcore
++    kdeconnectscreenstreamcommon
++    Qt::Core
++    Qt::Network
++    Qt::DBus
++    KF6::I18n
++)
++
++add_executable(kdeconnect-screenstream-viewer
++    viewer/main.cpp
++    viewer/viewerwindow.cpp
++    viewer/gstvideodecoder.cpp
++    viewer/pcmplayer.cpp
++)
++target_link_libraries(kdeconnect-screenstream-viewer PRIVATE
++    kdeconnectscreenstreamcommon
++    Qt::Core
++    Qt::Gui
++    Qt::Widgets
++    Qt::Network
++    Qt::DBus
++    KF6::I18n
++    PkgConfig::GStreamer
++)
++
++install(TARGETS kdeconnect-screenstream-viewer ${KDECONNECT_INSTALL_TARGETS_DEFAULT_ARGS})
++install(FILES "kdeconnect_screenstream_config.qml" DESTINATION ${KDE_INSTALL_DATADIR}/kdeconnect)
+diff --git a/plugins/screenstream/kdeconnect_screenstream.json b/plugins/screenstream/kdeconnect_screenstream.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..350a6afcc92578427eb51c8a2213e5c5d4ec8f53
+--- /dev/null
++++ b/plugins/screenstream/kdeconnect_screenstream.json
+@@ -0,0 +1,22 @@
++{
++    "$schema": "../kdeconnect.schema.json",
++    "KPlugin": {
++        "Authors": [
++            {
++                "Email": "dennshield@duck.com",
++                "Name": "Dmitriy Volkov"
++            }
++        ],
++        "Description": "View and control your Android device screen with playback audio",
++        "EnabledByDefault": true,
++        "Icon": "video-display",
++        "License": "GPL",
++        "Name": "Screen Stream"
++    },
++    "X-KdeConnect-OutgoingPacketType": [
++        "kdeconnect.screenstream.request"
++    ],
++    "X-KdeConnect-SupportedPacketType": [
++        "kdeconnect.screenstream"
++    ]
++}
+diff --git a/plugins/screenstream/kdeconnect_screenstream_config.qml b/plugins/screenstream/kdeconnect_screenstream_config.qml
+new file mode 100644
+index 0000000000000000000000000000000000000000..25e045a5a5d7da481f4207fb19ea1680219853e2
+--- /dev/null
++++ b/plugins/screenstream/kdeconnect_screenstream_config.qml
+@@ -0,0 +1,66 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++import QtQuick
++import QtQuick.Controls as QQC2
++import QtQuick.Layouts
++import org.kde.kdeconnect 1.0
++import org.kde.kirigami as Kirigami
++
++Kirigami.ScrollablePage {
++    id: root
++
++    property string device
++
++    Component.onCompleted: {
++        autoStartCheck.checked = config.getBool("autoStart", false)
++        requestAudioCheck.checked = config.getBool("requestAudio", true)
++        maxFpsSpin.value = config.getInt("maxFps", 60)
++        maxBitrateSpin.value = config.getInt("maxBitrateKbps", 8000)
++    }
++
++    Kirigami.FormLayout {
++        KdeConnectPluginConfig {
++            id: config
++            deviceId: root.device
++            pluginName: "kdeconnect_screenstream"
++        }
++
++        QQC2.CheckBox {
++            id: autoStartCheck
++            text: i18nd("kdeconnect-plugins", "Auto-start screen streaming when this device connects")
++            onClicked: {
++                config.set("autoStart", checked)
++                if (checked) {
++                    config.set("explicitStop", false)
++                }
++            }
++        }
++
++        QQC2.CheckBox {
++            id: requestAudioCheck
++            text: i18nd("kdeconnect-plugins", "Stream playback audio when supported")
++            onClicked: config.set("requestAudio", checked)
++        }
++
++        QQC2.SpinBox {
++            id: maxFpsSpin
++            Kirigami.FormData.label: i18nd("kdeconnect-plugins", "Maximum frame rate (FPS):")
++            from: 5
++            to: 60
++            onValueModified: config.set("maxFps", value)
++        }
++
++        QQC2.SpinBox {
++            id: maxBitrateSpin
++            Kirigami.FormData.label: i18nd("kdeconnect-plugins", "Maximum video bitrate (kbps):")
++            from: 500
++            to: 20000
++            stepSize: 500
++            onValueModified: config.set("maxBitrateKbps", value)
++        }
++    }
++}
+diff --git a/plugins/screenstream/screenstreamplugin.cpp b/plugins/screenstream/screenstreamplugin.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7692150ebf97c7cefc276986e4734dec8ac924e
+--- /dev/null
++++ b/plugins/screenstream/screenstreamplugin.cpp
+@@ -0,0 +1,741 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "screenstreamplugin.h"
++
++#include "plugin_screenstream_debug.h"
++
++#include <KLocalizedString>
++#include <KPluginFactory>
++
++#include <QAbstractSocket>
++#include <QCoreApplication>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QJsonDocument>
++#include <QLocalServer>
++#include <QLocalSocket>
++#include <QProcess>
++#include <QStandardPaths>
++#include <QTimer>
++#include <QUuid>
++
++#include <algorithm>
++
++K_PLUGIN_CLASS_WITH_JSON(ScreenStreamPlugin, "kdeconnect_screenstream.json")
++
++namespace
++{
++inline constexpr qsizetype kMaxPendingViewerFrames = 32;
++inline constexpr qint64 kMaxViewerWriteQueueBytes = 4LL * 1024LL * 1024LL;
++} // namespace
++
++ScreenStreamPlugin::ScreenStreamPlugin(QObject *parent, const QVariantList &args)
++    : KdeConnectPlugin(parent, args)
++    , m_reconnectTimer(new QTimer(this))
++{
++    m_reconnectTimer->setSingleShot(true);
++    connect(m_reconnectTimer, &QTimer::timeout, this, &ScreenStreamPlugin::onReconnectTimeout);
++    connect(config(), &KdeConnectPluginConfig::configChanged, this, &ScreenStreamPlugin::onConfigChanged);
++    onConfigChanged();
++}
++
++ScreenStreamPlugin::~ScreenStreamPlugin()
++{
++    m_stopping = true;
++    if (m_reconnectTimer) {
++        m_reconnectTimer->stop();
++    }
++    teardownSession(true);
++}
++
++bool ScreenStreamPlugin::active() const
++{
++    const auto st = m_session.state();
++    return st == ScreenStreamProtocol::ScreenStreamSessionMachine::State::AwaitingConsent
++        || st == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Streaming
++        || (m_viewerProcess != nullptr && m_viewerProcess->state() != QProcess::NotRunning);
++}
++
++bool ScreenStreamPlugin::isStreaming() const
++{
++    return m_session.state() == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Streaming;
++}
++
++QString ScreenStreamPlugin::state() const
++{
++    return ScreenStreamProtocol::ScreenStreamSessionMachine::stateToString(m_session.state());
++}
++
++QString ScreenStreamPlugin::lastError() const
++{
++    return m_lastError;
++}
++
++bool ScreenStreamPlugin::audioAvailable() const
++{
++    return m_audioAvailable;
++}
++
++QString ScreenStreamPlugin::audioReason() const
++{
++    return m_audioReason;
++}
++
++bool ScreenStreamPlugin::accessibilityEnabled() const
++{
++    return m_accessibilityEnabled;
++}
++
++int ScreenStreamPlugin::displayWidth() const
++{
++    return m_displayWidth;
++}
++
++int ScreenStreamPlugin::displayHeight() const
++{
++    return m_displayHeight;
++}
++
++int ScreenStreamPlugin::streamWidth() const
++{
++    return m_streamWidth;
++}
++
++int ScreenStreamPlugin::streamHeight() const
++{
++    return m_streamHeight;
++}
++
++int ScreenStreamPlugin::rotation() const
++{
++    return m_rotation;
++}
++
++QString ScreenStreamPlugin::dbusPath() const
++{
++    return QLatin1String("/modules/kdeconnect/devices/%1/screenstream").arg(device()->id());
++}
++
++void ScreenStreamPlugin::onConfigChanged()
++{
++    m_explicitStop = config()->getBool(QStringLiteral("explicitStop"), false);
++    m_autoStart = config()->getBool(QStringLiteral("autoStart"), false);
++    m_requestAudio = config()->getBool(QStringLiteral("requestAudio"), true);
++    m_maxWidth = std::clamp(config()->getInt(QStringLiteral("maxWidth"), 1920), 320, 3840);
++    m_maxHeight = std::clamp(config()->getInt(QStringLiteral("maxHeight"), 1920), 320, 3840);
++    m_maxFps = std::clamp(config()->getInt(QStringLiteral("maxFps"), 60), 5, 60);
++    m_maxBitrateKbps = std::clamp(config()->getInt(QStringLiteral("maxBitrateKbps"), 8000), 500, 20000);
++    m_session.configure(m_autoStart, m_explicitStop);
++}
++
++bool ScreenStreamPlugin::peerSupportsScreenStream() const
++{
++    const QSet<QString> caps = device()->incomingCapabilities();
++    if (caps.isEmpty()) {
++        return true;
++    }
++    return caps.contains(PACKET_TYPE_SCREENSTREAM_REQUEST);
++}
++
++void ScreenStreamPlugin::connected()
++{
++    onConfigChanged();
++    if (!peerSupportsScreenStream()) {
++        return;
++    }
++
++    NetworkPacket query(PACKET_TYPE_SCREENSTREAM_REQUEST, {{QStringLiteral("action"), QStringLiteral("query_state")}});
++    sendPacket(query);
++
++    if (m_session.state() == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Idle && m_session.shouldAutoStartOnConnect()) {
++        startStream();
++    }
++}
++
++bool ScreenStreamPlugin::startStream()
++{
++    if (!peerSupportsScreenStream()) {
++        setLastError(i18n("Screen streaming is not supported by this device."));
++        return false;
++    }
++
++    const bool wasActive = active();
++    const bool wasStreaming = isStreaming();
++
++    m_stopping = false;
++    m_reconnectTimer->stop();
++    setLastError(QString());
++    m_explicitStop = false;
++    config()->set(QStringLiteral("explicitStop"), false);
++
++    m_session.setRemoteControlAllowed(device()->isPluginEnabled(QStringLiteral("kdeconnect_remotecontrol")));
++    m_session.onExplicitStart();
++    sendStartPacket();
++
++    syncStateSignals(wasActive, wasStreaming);
++    Q_EMIT stateChanged();
++    return true;
++}
++
++void ScreenStreamPlugin::sendStartPacket()
++{
++    const QVariantMap body = ScreenStreamProtocol::buildStartRequestBody(m_maxWidth, m_maxHeight, m_maxFps, m_maxBitrateKbps, m_requestAudio);
++    NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST, body);
++    sendPacket(np);
++}
++
++void ScreenStreamPlugin::stopStream()
++{
++    const bool wasActive = active();
++    const bool wasStreaming = isStreaming();
++
++    m_stopping = true;
++    m_reconnectTimer->stop();
++    m_explicitStop = true;
++    config()->set(QStringLiteral("explicitStop"), true);
++    m_session.onLocalExplicitStop();
++
++    if (peerSupportsScreenStream()) {
++        NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST,
++                         {
++                             {QStringLiteral("action"), QStringLiteral("stop")},
++                             {QStringLiteral("explicitStop"), true},
++                         });
++        sendPacket(np);
++    }
++
++    teardownSession(true);
++    syncStateSignals(wasActive, wasStreaming);
++    Q_EMIT stateChanged();
++}
++
++void ScreenStreamPlugin::requestKeyframe()
++{
++    if (!isStreaming() || !peerSupportsScreenStream()) {
++        return;
++    }
++    NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST, {{QStringLiteral("action"), QStringLiteral("request_keyframe")}});
++    sendPacket(np);
++}
++
++void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
++{
++    if (np.type() != PACKET_TYPE_SCREENSTREAM) {
++        return;
++    }
++
++    const QByteArray compactJson = QJsonDocument::fromVariant(np.body()).toJson(QJsonDocument::Compact);
++    if (compactJson.size() > ScreenStreamProtocol::kMaxControlJsonBytes) {
++        qCWarning(KDECONNECT_PLUGIN_SCREENSTREAM) << "Rejecting oversized screenstream control packet";
++        return;
++    }
++
++    const QString event = np.get<QString>(QStringLiteral("event"));
++    const bool wasActive = active();
++    const bool wasStreaming = isStreaming();
++
++    if (event == QLatin1String("state")) {
++        const auto parsedState = ScreenStreamProtocol::ScreenStreamSessionMachine::stateFromString(np.get<QString>(QStringLiteral("state")));
++        if (!parsedState.has_value()) {
++            qCWarning(KDECONNECT_PLUGIN_SCREENSTREAM) << "Ignoring unknown state value in screenstream packet";
++            return;
++        }
++        const bool peerExplicitStop = np.get<bool>(QStringLiteral("explicitStop"), false);
++        if (peerExplicitStop != m_explicitStop) {
++            m_explicitStop = peerExplicitStop;
++            config()->set(QStringLiteral("explicitStop"), m_explicitStop);
++        }
++
++        m_audioAvailable = np.get<bool>(QStringLiteral("audioAvailable"), false);
++        m_audioReason = np.get<QString>(QStringLiteral("audioReason"));
++        m_accessibilityEnabled = np.get<bool>(QStringLiteral("accessibilityEnabled"), false);
++        const int dw = np.get<int>(QStringLiteral("displayWidth"), 0);
++        const int dh = np.get<int>(QStringLiteral("displayHeight"), 0);
++        const int rot = np.get<int>(QStringLiteral("rotation"), m_rotation);
++        if (dw > 0 && dh > 0 && ScreenStreamProtocol::isValidRotation(rot)) {
++            m_displayWidth = dw;
++            m_displayHeight = dh;
++            m_rotation = rot;
++            Q_EMIT geometryChanged(m_displayWidth, m_displayHeight, m_rotation);
++        }
++
++        m_session.onPeerState(*parsedState, peerExplicitStop);
++        if (*parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Stopped
++            || *parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error) {
++            teardownSession(true);
++            if (*parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error) {
++                setLastError(np.get<QString>(QStringLiteral("reason"), i18n("Screen streaming failed on the remote device.")));
++            }
++        }
++
++        Q_EMIT audioStatusChanged(m_audioAvailable, m_audioReason);
++        syncStateSignals(wasActive, wasStreaming);
++        Q_EMIT stateChanged();
++        return;
++    }
++
++    if (event == QLatin1String("geometry_changed")) {
++        const int w = np.get<int>(QStringLiteral("width"), 0);
++        const int h = np.get<int>(QStringLiteral("height"), 0);
++        const int rot = np.get<int>(QStringLiteral("rotation"), m_rotation);
++        if (w < 2 || h < 2 || !ScreenStreamProtocol::isValidRotation(rot)) {
++            qCWarning(KDECONNECT_PLUGIN_SCREENSTREAM) << "Ignoring invalid geometry_changed values";
++            return;
++        }
++        m_streamWidth = w;
++        m_streamHeight = h;
++        m_rotation = rot;
++        if (m_displayWidth <= 0 || m_displayHeight <= 0) {
++            m_displayWidth = w;
++            m_displayHeight = h;
++        }
++        Q_EMIT geometryChanged(w, h, rot);
++        return;
++    }
++
++    if (event == QLatin1String("stopped")) {
++        const bool peerExplicitStop = np.get<bool>(QStringLiteral("explicitStop"), false);
++        const QString reason = np.get<QString>(QStringLiteral("reason"));
++        if (peerExplicitStop) {
++            m_explicitStop = true;
++            config()->set(QStringLiteral("explicitStop"), true);
++        }
++        m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Stopped, peerExplicitStop);
++        teardownSession(true);
++        if (!reason.isEmpty() && reason != QLatin1String("user_stopped") && reason != QLatin1String("remote_stopped")) {
++            setLastError(reason);
++        }
++        syncStateSignals(wasActive, wasStreaming);
++        Q_EMIT stateChanged();
++        return;
++    }
++
++    if (event == QLatin1String("stream_open")) {
++        const QString videoCodec = np.get<QString>(QStringLiteral("videoCodec"));
++        const QString audioCodec = np.get<QString>(QStringLiteral("audioCodec"), QStringLiteral("none"));
++        const int w = np.get<int>(QStringLiteral("width"), 0);
++        const int h = np.get<int>(QStringLiteral("height"), 0);
++        const int rot = np.get<int>(QStringLiteral("rotation"), 0);
++        const int fps = np.get<int>(QStringLiteral("fps"), m_maxFps);
++
++        if (videoCodec != QLatin1String("h264-annexb") || w < 2 || h < 2 || !ScreenStreamProtocol::isValidRotation(rot)
++            || !np.hasPayload() || !np.payload()) {
++            setLastError(i18n("Received invalid screen stream open packet."));
++            m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error, false);
++            teardownSession(true);
++            syncStateSignals(wasActive, wasStreaming);
++            Q_EMIT stateChanged();
++            return;
++        }
++
++        teardownSession(true);
++        m_stopping = false;
++        m_reconnectTimer->stop();
++        m_parser.reset();
++        m_cachedCodecConfig.clear();
++        m_pendingViewerFrames.clear();
++
++        m_streamWidth = w;
++        m_streamHeight = h;
++        if (m_displayWidth <= 0 || m_displayHeight <= 0) {
++            m_displayWidth = w;
++            m_displayHeight = h;
++        }
++        m_rotation = rot;
++        m_fps = std::clamp(fps, 1, 120);
++        m_audioAvailable = (audioCodec == QLatin1String("pcm_s16le_48000_mono"));
++        if (!m_audioAvailable && m_audioReason.isEmpty()) {
++            m_audioReason = (audioCodec == QLatin1String("none")) ? i18n("Audio disabled for this session") : audioCodec;
++        }
++
++        if (!ensureLocalServer() || !launchViewer()) {
++            m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error, false);
++            if (np.payload()) {
++                np.payload()->close();
++            }
++            teardownSession(true);
++            syncStateSignals(wasActive, wasStreaming);
++            Q_EMIT stateChanged();
++            return;
++        }
++
++        m_payload = np.payload();
++        connect(m_payload.data(), &QIODevice::readyRead, this, &ScreenStreamPlugin::onPayloadReadyRead);
++        connect(m_payload.data(), &QIODevice::readChannelFinished, this, &ScreenStreamPlugin::onPayloadClosed);
++        if (auto *absSock = qobject_cast<QAbstractSocket *>(m_payload.data())) {
++            connect(absSock, &QAbstractSocket::disconnected, this, &ScreenStreamPlugin::onPayloadClosed);
++        }
++
++        m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Streaming, false);
++        setLastError(QString());
++
++        Q_EMIT geometryChanged(m_streamWidth, m_streamHeight, m_rotation);
++        Q_EMIT audioStatusChanged(m_audioAvailable, m_audioReason);
++        syncStateSignals(wasActive, wasStreaming);
++        Q_EMIT stateChanged();
++
++        if (m_payload->bytesAvailable() > 0) {
++            onPayloadReadyRead();
++        }
++        return;
++    }
++
++    qCDebug(KDECONNECT_PLUGIN_SCREENSTREAM) << "Ignoring unrecognized screenstream event:" << event;
++}
++
++bool ScreenStreamPlugin::ensureLocalServer()
++{
++    if (m_localServer) {
++        m_localServer->close();
++        m_localServer->deleteLater();
++        m_localServer = nullptr;
++    }
++    removeSocketFile();
++
++    QString baseDir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
++    if (baseDir.isEmpty() || !QDir().mkpath(baseDir)) {
++        m_fallbackSocketDir = QDir(QDir::tempPath()).filePath(
++            QStringLiteral("kdeconnect-screenstream-%1").arg(QUuid::createUuid().toString(QUuid::Id128).left(12)));
++        if (!QDir().mkpath(m_fallbackSocketDir)) {
++            setLastError(i18n("Unable to create local socket directory for screen stream viewer."));
++            return false;
++        }
++        QFile::setPermissions(m_fallbackSocketDir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
++        baseDir = m_fallbackSocketDir;
++    }
++
++    m_socketPath = QDir(baseDir).filePath(
++        QStringLiteral("kdeconnect-screenstream-%1-%2.sock")
++            .arg(QCoreApplication::applicationPid())
++            .arg(QUuid::createUuid().toString(QUuid::Id128).left(10)));
++    QLocalServer::removeServer(m_socketPath);
++
++    m_localServer = new QLocalServer(this);
++    m_localServer->setSocketOptions(QLocalServer::UserAccessOption);
++    connect(m_localServer, &QLocalServer::newConnection, this, &ScreenStreamPlugin::onNewViewerConnection);
++    if (!m_localServer->listen(m_socketPath)) {
++        setLastError(i18n("Failed to open local IPC socket for viewer: %1", m_localServer->errorString()));
++        return false;
++    }
++    return true;
++}
++
++bool ScreenStreamPlugin::launchViewer()
++{
++    QString viewerExe = QStandardPaths::findExecutable(QStringLiteral("kdeconnect-screenstream-viewer"));
++    if (viewerExe.isEmpty()) {
++        const QString sibling = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("kdeconnect-screenstream-viewer"));
++        if (QFileInfo::exists(sibling) && QFileInfo(sibling).isExecutable()) {
++            viewerExe = sibling;
++        }
++    }
++    if (viewerExe.isEmpty()) {
++        setLastError(i18n("kdeconnect-screenstream-viewer executable was not found."));
++        return false;
++    }
++
++    auto *process = new QProcess(this);
++#ifdef Q_OS_UNIX
++    process->setUnixProcessParameters(QProcess::UnixProcessFlag::CloseFileDescriptors);
++#endif
++    process->setProgram(viewerExe);
++    process->setArguments({
++        QStringLiteral("--device"),
++        device()->id(),
++        QStringLiteral("--device-name"),
++        device()->name(),
++        QStringLiteral("--socket"),
++        m_socketPath,
++        QStringLiteral("--display-width"),
++        QString::number(m_displayWidth),
++        QStringLiteral("--display-height"),
++        QString::number(m_displayHeight),
++        QStringLiteral("--stream-width"),
++        QString::number(m_streamWidth),
++        QStringLiteral("--stream-height"),
++        QString::number(m_streamHeight),
++        QStringLiteral("--rotation"),
++        QString::number(m_rotation),
++    });
++
++    connect(process, &QProcess::finished, this, &ScreenStreamPlugin::onViewerFinished);
++    m_viewerProcess = process;
++    process->start();
++    if (!process->waitForStarted(3000)) {
++        setLastError(i18n("Failed to launch kdeconnect-screenstream-viewer: %1", process->errorString()));
++        disconnect(process, &QProcess::finished, this, nullptr);
++        process->deleteLater();
++        m_viewerProcess = nullptr;
++        return false;
++    }
++    return true;
++}
++
++void ScreenStreamPlugin::onNewViewerConnection()
++{
++    if (!m_localServer) {
++        return;
++    }
++    while (QLocalSocket *sock = m_localServer->nextPendingConnection()) {
++        if (m_viewerSocket) {
++            sock->close();
++            sock->deleteLater();
++            continue;
++        }
++        m_viewerSocket = sock;
++        connect(sock, &QLocalSocket::disconnected, this, &ScreenStreamPlugin::onViewerSocketDisconnected);
++        flushPendingFrames();
++    }
++}
++
++void ScreenStreamPlugin::onViewerSocketDisconnected()
++{
++    if (m_viewerSocket) {
++        m_viewerSocket->deleteLater();
++        m_viewerSocket = nullptr;
++    }
++}
++
++void ScreenStreamPlugin::onViewerFinished()
++{
++    if (!m_viewerProcess) {
++        return;
++    }
++    QProcess *proc = m_viewerProcess;
++    const QProcess::ExitStatus exitStatus = proc->exitStatus();
++    const int exitCode = proc->exitCode();
++    m_viewerProcess = nullptr;
++    proc->deleteLater();
++
++    if (m_stopping) {
++        return;
++    }
++
++    if (exitStatus != QProcess::NormalExit || exitCode != 0) {
++        const bool wasActive = active();
++        const bool wasStreaming = isStreaming();
++        setLastError(i18n("Screen stream viewer exited unexpectedly (code %1).", exitCode));
++        m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error, false);
++        if (peerSupportsScreenStream()) {
++            NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST,
++                             {
++                                 {QStringLiteral("action"), QStringLiteral("stop")},
++                                 {QStringLiteral("explicitStop"), false},
++                             });
++            sendPacket(np);
++        }
++        teardownSession(false);
++        syncStateSignals(wasActive, wasStreaming);
++        Q_EMIT stateChanged();
++        return;
++    }
++
++    // If the user closed the viewer window directly, stop cleanly without auto-restarting.
++    stopStream();
++}
++
++void ScreenStreamPlugin::onPayloadReadyRead()
++{
++    if (!m_payload) {
++        return;
++    }
++    const QByteArray data = m_payload->readAll();
++    if (data.isEmpty()) {
++        return;
++    }
++
++    QList<ScreenStreamProtocol::ScreenStreamFrame> frames;
++    if (!m_parser.feed(data, &frames)) {
++        const QString err = m_parser.errorString();
++        qCWarning(KDECONNECT_PLUGIN_SCREENSTREAM) << "Closing corrupted stream payload:" << err;
++        const bool wasActive = active();
++        const bool wasStreaming = isStreaming();
++        setLastError(err);
++        m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error, false);
++        teardownSession(true);
++        syncStateSignals(wasActive, wasStreaming);
++        Q_EMIT stateChanged();
++        return;
++    }
++
++    for (const auto &frame : std::as_const(frames)) {
++        if (frame.kind == ScreenStreamProtocol::FrameKind::ControlEos) {
++            onPayloadClosed();
++            return;
++        }
++        enqueueOrSendFrame(frame);
++    }
++}
++
++void ScreenStreamPlugin::enqueueOrSendFrame(const ScreenStreamProtocol::ScreenStreamFrame &frame)
++{
++    const QByteArray encoded = ScreenStreamProtocol::encodeScreenStreamFrame(frame.kind, frame.flags, frame.ptsUs, frame.payload);
++    if (frame.kind == ScreenStreamProtocol::FrameKind::CodecConfig) {
++        m_cachedCodecConfig = encoded;
++    }
++
++    if (m_viewerSocket && m_viewerSocket->state() == QLocalSocket::ConnectedState) {
++        if (m_viewerSocket->bytesToWrite() < kMaxViewerWriteQueueBytes) {
++            m_viewerSocket->write(encoded);
++        } else if (frame.kind == ScreenStreamProtocol::FrameKind::CodecConfig
++                   || (frame.flags & ScreenStreamProtocol::FlagKeyframe) != 0) {
++            m_viewerSocket->write(encoded);
++        }
++        return;
++    }
++
++    if (frame.kind == ScreenStreamProtocol::FrameKind::VideoAccessUnit && (frame.flags & ScreenStreamProtocol::FlagKeyframe) != 0) {
++        // Trim stale pre-connect video deltas before an IDR so startup latency stays bounded.
++        m_pendingViewerFrames.clear();
++        if (!m_cachedCodecConfig.isEmpty()) {
++            m_pendingViewerFrames.append(m_cachedCodecConfig);
++        }
++    }
++    if (m_pendingViewerFrames.size() >= kMaxPendingViewerFrames) {
++        m_pendingViewerFrames.removeFirst();
++    }
++    m_pendingViewerFrames.append(encoded);
++}
++
++void ScreenStreamPlugin::flushPendingFrames()
++{
++    if (!m_viewerSocket || m_viewerSocket->state() != QLocalSocket::ConnectedState) {
++        return;
++    }
++    bool sentCodecConfig = false;
++    if (!m_cachedCodecConfig.isEmpty() && (m_pendingViewerFrames.isEmpty() || m_pendingViewerFrames.first() != m_cachedCodecConfig)) {
++        m_viewerSocket->write(m_cachedCodecConfig);
++        sentCodecConfig = true;
++    }
++    Q_UNUSED(sentCodecConfig)
++    for (const QByteArray &item : std::as_const(m_pendingViewerFrames)) {
++        m_viewerSocket->write(item);
++    }
++    m_pendingViewerFrames.clear();
++    m_viewerSocket->flush();
++}
++
++void ScreenStreamPlugin::onPayloadClosed()
++{
++    if (!m_payload) {
++        return;
++    }
++    const bool wasActive = active();
++    const bool wasStreaming = isStreaming();
++
++    teardownSession(true);
++    m_session.onTransportLost();
++    syncStateSignals(wasActive, wasStreaming);
++    Q_EMIT stateChanged();
++    scheduleReconnectIfNeeded();
++}
++
++void ScreenStreamPlugin::scheduleReconnectIfNeeded()
++{
++    const int delayMs = m_session.consumeReconnectDelayMs();
++    if (delayMs < 0) {
++        return;
++    }
++    m_reconnectTimer->start(delayMs);
++}
++
++void ScreenStreamPlugin::onReconnectTimeout()
++{
++    if (m_stopping || m_explicitStop || !m_autoStart || !device()->isReachable() || !peerSupportsScreenStream()) {
++        return;
++    }
++    const auto st = m_session.state();
++    if (st == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Streaming
++        || st == ScreenStreamProtocol::ScreenStreamSessionMachine::State::AwaitingConsent) {
++        return;
++    }
++
++    const bool wasActive = active();
++    const bool wasStreaming = isStreaming();
++
++    m_stopping = false;
++    setLastError(QString());
++    m_session.setRemoteControlAllowed(device()->isPluginEnabled(QStringLiteral("kdeconnect_remotecontrol")));
++    m_session.onReconnectStart();
++    sendStartPacket();
++
++    syncStateSignals(wasActive, wasStreaming);
++    Q_EMIT stateChanged();
++}
++
++void ScreenStreamPlugin::teardownSession(bool terminateViewer)
++{
++    ScreenStreamProtocol::releaseStreamPayloadSafely(m_payload, this);
++    if (m_viewerSocket) {
++        disconnect(m_viewerSocket.data(), nullptr, this, nullptr);
++        m_viewerSocket->close();
++        m_viewerSocket->deleteLater();
++        m_viewerSocket = nullptr;
++    }
++    if (m_localServer) {
++        m_localServer->close();
++        m_localServer->deleteLater();
++        m_localServer = nullptr;
++    }
++    removeSocketFile();
++
++    m_pendingViewerFrames.clear();
++    m_cachedCodecConfig.clear();
++    m_parser.reset();
++
++    if (terminateViewer && m_viewerProcess) {
++        QProcess *proc = m_viewerProcess;
++        m_viewerProcess = nullptr;
++        disconnect(proc, &QProcess::finished, this, nullptr);
++        if (proc->state() != QProcess::NotRunning) {
++            proc->terminate();
++            if (!proc->waitForFinished(1500)) {
++                proc->kill();
++                proc->waitForFinished(1000);
++            }
++        }
++        proc->deleteLater();
++    }
++}
++
++void ScreenStreamPlugin::removeSocketFile()
++{
++    if (!m_socketPath.isEmpty()) {
++        QLocalServer::removeServer(m_socketPath);
++        QFile::remove(m_socketPath);
++        m_socketPath.clear();
++    }
++    if (!m_fallbackSocketDir.isEmpty()) {
++        QDir(m_fallbackSocketDir).removeRecursively();
++        m_fallbackSocketDir.clear();
++    }
++}
++
++void ScreenStreamPlugin::setLastError(const QString &error)
++{
++    if (m_lastError == error) {
++        return;
++    }
++    m_lastError = error;
++    Q_EMIT lastErrorChanged();
++}
++
++void ScreenStreamPlugin::syncStateSignals(bool wasActive, bool wasStreaming)
++{
++    const bool nowActive = active();
++    const bool nowStreaming = isStreaming();
++    if (nowActive != wasActive) {
++        Q_EMIT activeChanged();
++    }
++    if (nowStreaming != wasStreaming) {
++        Q_EMIT streamingChanged(nowStreaming);
++    }
++}
++
++#include "moc_screenstreamplugin.cpp"
++#include "screenstreamplugin.moc"
+diff --git a/plugins/screenstream/screenstreamplugin.h b/plugins/screenstream/screenstreamplugin.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b59ca543ab58354560b71e77a7698847c2eb994
+--- /dev/null
++++ b/plugins/screenstream/screenstreamplugin.h
+@@ -0,0 +1,133 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QByteArray>
++#include <QList>
++#include <QPointer>
++#include <QSharedPointer>
++#include <QString>
++
++#include <core/kdeconnectplugin.h>
++
++#include "screenstreamprotocol.h"
++
++class QIODevice;
++class QLocalServer;
++class QLocalSocket;
++class QProcess;
++class QTimer;
++
++#define PACKET_TYPE_SCREENSTREAM QStringLiteral("kdeconnect.screenstream")
++#define PACKET_TYPE_SCREENSTREAM_REQUEST QStringLiteral("kdeconnect.screenstream.request")
++
++class ScreenStreamPlugin : public KdeConnectPlugin
++{
++    Q_OBJECT
++    Q_CLASSINFO("D-Bus Interface", "org.kde.kdeconnect.device.screenstream")
++    Q_PROPERTY(bool active READ active NOTIFY activeChanged)
++    Q_PROPERTY(bool isStreaming READ isStreaming NOTIFY streamingChanged)
++    Q_PROPERTY(QString state READ state NOTIFY stateChanged)
++    Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
++    Q_PROPERTY(bool audioAvailable READ audioAvailable NOTIFY audioStatusChanged)
++    Q_PROPERTY(QString audioReason READ audioReason NOTIFY audioStatusChanged)
++    Q_PROPERTY(bool accessibilityEnabled READ accessibilityEnabled NOTIFY stateChanged)
++    Q_PROPERTY(int displayWidth READ displayWidth NOTIFY geometryChanged)
++    Q_PROPERTY(int displayHeight READ displayHeight NOTIFY geometryChanged)
++    Q_PROPERTY(int streamWidth READ streamWidth NOTIFY geometryChanged)
++    Q_PROPERTY(int streamHeight READ streamHeight NOTIFY geometryChanged)
++    Q_PROPERTY(int rotation READ rotation NOTIFY geometryChanged)
++
++public:
++    explicit ScreenStreamPlugin(QObject *parent, const QVariantList &args);
++    ~ScreenStreamPlugin() override;
++
++    bool active() const;
++    bool isStreaming() const;
++    QString state() const;
++    QString lastError() const;
++    bool audioAvailable() const;
++    QString audioReason() const;
++    bool accessibilityEnabled() const;
++    int displayWidth() const;
++    int displayHeight() const;
++    int streamWidth() const;
++    int streamHeight() const;
++    int rotation() const;
++
++    void connected() override;
++    QString dbusPath() const override;
++    void receivePacket(const NetworkPacket &np) override;
++
++    Q_SCRIPTABLE bool startStream();
++    Q_SCRIPTABLE void stopStream();
++    Q_SCRIPTABLE void requestKeyframe();
++
++Q_SIGNALS:
++    Q_SCRIPTABLE void activeChanged();
++    Q_SCRIPTABLE void streamingChanged(bool streaming);
++    Q_SCRIPTABLE void stateChanged();
++    Q_SCRIPTABLE void lastErrorChanged();
++    Q_SCRIPTABLE void audioStatusChanged(bool available, const QString &reason);
++    Q_SCRIPTABLE void geometryChanged(int width, int height, int rotation);
++
++private Q_SLOTS:
++    void onConfigChanged();
++    void onPayloadReadyRead();
++    void onPayloadClosed();
++    void onNewViewerConnection();
++    void onViewerSocketDisconnected();
++    void onViewerFinished();
++    void onReconnectTimeout();
++
++private:
++    bool peerSupportsScreenStream() const;
++    bool ensureLocalServer();
++    bool launchViewer();
++    void teardownSession(bool terminateViewer);
++    void removeSocketFile();
++    void setLastError(const QString &error);
++    void syncStateSignals(bool wasActive, bool wasStreaming);
++    void scheduleReconnectIfNeeded();
++    void sendStartPacket();
++    void enqueueOrSendFrame(const ScreenStreamProtocol::ScreenStreamFrame &frame);
++    void flushPendingFrames();
++
++    ScreenStreamProtocol::ScreenStreamSessionMachine m_session;
++    ScreenStreamProtocol::ScreenStreamFrameParser m_parser;
++
++    QSharedPointer<QIODevice> m_payload;
++    QLocalServer *m_localServer = nullptr;
++    QPointer<QLocalSocket> m_viewerSocket;
++    QProcess *m_viewerProcess = nullptr;
++    QTimer *m_reconnectTimer = nullptr;
++
++    QString m_socketPath;
++    QString m_fallbackSocketDir;
++    QString m_lastError;
++    QString m_audioReason;
++    bool m_audioAvailable = false;
++    bool m_accessibilityEnabled = false;
++    bool m_explicitStop = false;
++    bool m_autoStart = false;
++    bool m_requestAudio = true;
++    bool m_stopping = false;
++
++    int m_displayWidth = 0;
++    int m_displayHeight = 0;
++    int m_streamWidth = 0;
++    int m_streamHeight = 0;
++    int m_rotation = 0;
++    int m_fps = 60;
++    int m_maxWidth = 1920;
++    int m_maxHeight = 1920;
++    int m_maxFps = 60;
++    int m_maxBitrateKbps = 8000;
++
++    QByteArray m_cachedCodecConfig;
++    QList<QByteArray> m_pendingViewerFrames;
++};
+diff --git a/plugins/screenstream/screenstreamprotocol.cpp b/plugins/screenstream/screenstreamprotocol.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..16487305897c59d78db4c94bf07f9bff5607c386
+--- /dev/null
++++ b/plugins/screenstream/screenstreamprotocol.cpp
+@@ -0,0 +1,389 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "screenstreamprotocol.h"
++
++#include <QCoreApplication>
++#include <QTimer>
++#include <QtEndian>
++
++#include <algorithm>
++#include <cmath>
++#include <utility>
++
++namespace ScreenStreamProtocol
++{
++namespace
++{
++inline constexpr int kReconnectDelaysMs[] = {2000, 4000, 8000};
++}
++
++bool isValidFrameKind(quint8 rawKind, FrameKind *outKind)
++{
++    switch (rawKind) {
++    case 0x01:
++        if (outKind) {
++            *outKind = FrameKind::CodecConfig;
++        }
++        return true;
++    case 0x02:
++        if (outKind) {
++            *outKind = FrameKind::VideoAccessUnit;
++        }
++        return true;
++    case 0x03:
++        if (outKind) {
++            *outKind = FrameKind::AudioPcmChunk;
++        }
++        return true;
++    case 0x04:
++        if (outKind) {
++            *outKind = FrameKind::ControlEos;
++        }
++        return true;
++    default:
++        return false;
++    }
++}
++
++bool isValidPayloadLength(FrameKind kind, quint32 length)
++{
++    switch (kind) {
++    case FrameKind::CodecConfig:
++    case FrameKind::VideoAccessUnit:
++        return length <= kMaxVideoFrameBytes;
++    case FrameKind::AudioPcmChunk:
++        return length <= kMaxAudioChunkBytes;
++    case FrameKind::ControlEos:
++        return length == 0;
++    }
++    return false;
++}
++
++QByteArray encodeScreenStreamFrame(FrameKind kind, quint8 flags, quint64 ptsUs, const QByteArray &payload)
++{
++    const quint32 payloadLen = static_cast<quint32>(payload.size());
++    QByteArray out;
++    out.resize(kScreenStreamHeaderBytes + payload.size());
++
++    auto *dst = reinterpret_cast<uchar *>(out.data());
++    qToBigEndian<quint16>(kScreenStreamMagic, dst);
++    dst[2] = static_cast<uchar>(kind);
++    dst[3] = static_cast<uchar>(flags & FlagValidMask);
++    qToBigEndian<quint32>(payloadLen, dst + 4);
++    qToBigEndian<quint64>(ptsUs, dst + 8);
++
++    if (!payload.isEmpty()) {
++        std::copy(payload.constBegin(), payload.constEnd(), out.data() + kScreenStreamHeaderBytes);
++    }
++    return out;
++}
++
++bool ScreenStreamFrameParser::feed(const QByteArray &chunk, QList<ScreenStreamFrame> *outFrames)
++{
++    if (m_hasError) {
++        return false;
++    }
++    if (!chunk.isEmpty()) {
++        m_buffer.append(chunk);
++    }
++
++    while (m_buffer.size() >= kScreenStreamHeaderBytes) {
++        const auto *hdr = reinterpret_cast<const uchar *>(m_buffer.constData());
++        const quint16 magic = qFromBigEndian<quint16>(hdr);
++        if (magic != kScreenStreamMagic) {
++            setError(QStringLiteral("Invalid stream frame magic header"));
++            return false;
++        }
++
++        FrameKind kind = FrameKind::ControlEos;
++        if (!isValidFrameKind(hdr[2], &kind)) {
++            setError(QStringLiteral("Unknown stream frame kind"));
++            return false;
++        }
++
++        const quint8 flags = hdr[3];
++        if ((flags & ~FlagValidMask) != 0) {
++            setError(QStringLiteral("Non-zero reserved flags in stream frame header"));
++            return false;
++        }
++
++        const quint32 payloadLength = qFromBigEndian<quint32>(hdr + 4);
++        if (!isValidPayloadLength(kind, payloadLength)) {
++            setError(QStringLiteral("Stream frame payload length exceeds protocol limit"));
++            return false;
++        }
++
++        const qsizetype totalNeeded = static_cast<qsizetype>(kScreenStreamHeaderBytes) + static_cast<qsizetype>(payloadLength);
++        if (m_buffer.size() < totalNeeded) {
++            break;
++        }
++
++        ScreenStreamFrame frame;
++        frame.kind = kind;
++        frame.flags = flags;
++        frame.ptsUs = qFromBigEndian<quint64>(hdr + 8);
++        if (payloadLength > 0) {
++            frame.payload = m_buffer.mid(kScreenStreamHeaderBytes, static_cast<qsizetype>(payloadLength));
++        }
++
++        m_buffer.remove(0, totalNeeded);
++        if (outFrames) {
++            outFrames->append(std::move(frame));
++        }
++    }
++
++    return true;
++}
++
++void ScreenStreamFrameParser::reset()
++{
++    m_buffer.clear();
++    m_hasError = false;
++    m_errorString.clear();
++}
++
++void ScreenStreamFrameParser::setError(const QString &message)
++{
++    m_hasError = true;
++    m_errorString = message;
++    m_buffer.clear();
++}
++
++QRectF ScreenStreamCoordinateMapper::computeRenderedRect(const QSizeF &viewportSize, const QSize &streamSize)
++{
++    if (viewportSize.width() <= 0.0 || viewportSize.height() <= 0.0 || streamSize.width() <= 0 || streamSize.height() <= 0) {
++        return {};
++    }
++
++    const qreal scale = std::min(viewportSize.width() / static_cast<qreal>(streamSize.width()),
++                                   viewportSize.height() / static_cast<qreal>(streamSize.height()));
++    const qreal width = static_cast<qreal>(streamSize.width()) * scale;
++    const qreal height = static_cast<qreal>(streamSize.height()) * scale;
++    const qreal x = (viewportSize.width() - width) * 0.5;
++    const qreal y = (viewportSize.height() - height) * 0.5;
++    return QRectF(x, y, width, height);
++}
++
++QSize ScreenStreamCoordinateMapper::computeTargetCanvasSize(const QSize &sourceSize, const QSize &maxCanvasSize, const QSize &minCanvasSize)
++{
++    if (sourceSize.width() <= 0 || sourceSize.height() <= 0 || maxCanvasSize.width() <= 0 || maxCanvasSize.height() <= 0) {
++        return {};
++    }
++
++    const qreal maxFitScale = std::min(static_cast<qreal>(maxCanvasSize.width()) / static_cast<qreal>(sourceSize.width()),
++                                       static_cast<qreal>(maxCanvasSize.height()) / static_cast<qreal>(sourceSize.height()));
++    qreal scale = std::min(qreal(1.0), maxFitScale);
++    if (minCanvasSize.width() > 0 && minCanvasSize.height() > 0) {
++        const qreal minScale = std::max(static_cast<qreal>(minCanvasSize.width()) / static_cast<qreal>(sourceSize.width()),
++                                        static_cast<qreal>(minCanvasSize.height()) / static_cast<qreal>(sourceSize.height()));
++        scale = std::clamp(scale, std::min(minScale, maxFitScale), maxFitScale);
++    }
++
++    return QSize(std::max(1, static_cast<int>(std::lround(static_cast<qreal>(sourceSize.width()) * scale))),
++                 std::max(1, static_cast<int>(std::lround(static_cast<qreal>(sourceSize.height()) * scale))));
++}
++
++std::optional<QPoint> ScreenStreamCoordinateMapper::mapViewportToRemote(
++    const QPointF &pos,
++    const QSizeF &viewportSize,
++    const QSize &streamSize,
++    const QSize &remoteDisplaySize)
++{
++    if (remoteDisplaySize.width() < 2 || remoteDisplaySize.height() < 2) {
++        return std::nullopt;
++    }
++
++    const QRectF rect = computeRenderedRect(viewportSize, streamSize);
++    if (rect.isEmpty() || rect.width() <= 0.0 || rect.height() <= 0.0) {
++        return std::nullopt;
++    }
++
++    if (!rect.contains(pos)) {
++        return std::nullopt;
++    }
++
++    const qreal u = (pos.x() - rect.left()) / rect.width();
++    const qreal v = (pos.y() - rect.top()) / rect.height();
++
++    // MouseReceiverPlugin treats x==0 && y==0 as no-op, so clamp inside [1, width-1] x [1, height-1].
++    const int mappedX = std::clamp(static_cast<int>(std::lround(u * static_cast<qreal>(remoteDisplaySize.width() - 1))),
++                                   1,
++                                   remoteDisplaySize.width() - 1);
++    const int mappedY = std::clamp(static_cast<int>(std::lround(v * static_cast<qreal>(remoteDisplaySize.height() - 1))),
++                                   1,
++                                   remoteDisplaySize.height() - 1);
++    return QPoint(mappedX, mappedY);
++}
++
++QString ScreenStreamSessionMachine::stateToString(State state)
++{
++    switch (state) {
++    case State::Idle:
++        return QStringLiteral("idle");
++    case State::AwaitingConsent:
++        return QStringLiteral("awaiting_consent");
++    case State::Streaming:
++        return QStringLiteral("streaming");
++    case State::Stopped:
++        return QStringLiteral("stopped");
++    case State::Error:
++        return QStringLiteral("error");
++    }
++    return QStringLiteral("idle");
++}
++
++std::optional<ScreenStreamSessionMachine::State> ScreenStreamSessionMachine::stateFromString(const QString &value)
++{
++    if (value == QLatin1String("idle")) {
++        return State::Idle;
++    }
++    if (value == QLatin1String("awaiting_consent")) {
++        return State::AwaitingConsent;
++    }
++    if (value == QLatin1String("streaming")) {
++        return State::Streaming;
++    }
++    if (value == QLatin1String("stopped")) {
++        return State::Stopped;
++    }
++    if (value == QLatin1String("error")) {
++        return State::Error;
++    }
++    return std::nullopt;
++}
++
++void ScreenStreamSessionMachine::configure(bool autoStartEnabled, bool explicitStop)
++{
++    m_autoStartEnabled = autoStartEnabled;
++    m_explicitStop = explicitStop;
++    if (m_explicitStop) {
++        m_shouldReconnect = false;
++        m_reconnectAttempt = 0;
++    }
++}
++
++void ScreenStreamSessionMachine::setRemoteControlAllowed(bool allowed)
++{
++    m_remoteControlAllowed = allowed;
++}
++
++void ScreenStreamSessionMachine::onExplicitStart()
++{
++    m_explicitStop = false;
++    m_shouldReconnect = false;
++    m_reconnectAttempt = 0;
++    m_state = State::AwaitingConsent;
++}
++
++void ScreenStreamSessionMachine::onReconnectStart()
++{
++    m_explicitStop = false;
++    m_state = State::AwaitingConsent;
++}
++
++void ScreenStreamSessionMachine::onLocalExplicitStop()
++{
++    m_explicitStop = true;
++    m_shouldReconnect = false;
++    m_reconnectAttempt = 0;
++    m_state = State::Stopped;
++}
++
++void ScreenStreamSessionMachine::onPeerState(State newState, bool peerExplicitStop)
++{
++    m_state = newState;
++    if (peerExplicitStop) {
++        m_explicitStop = true;
++        m_shouldReconnect = false;
++        m_reconnectAttempt = 0;
++    } else if (newState == State::Streaming) {
++        m_explicitStop = false;
++        m_shouldReconnect = false;
++        m_reconnectAttempt = 0;
++    }
++}
++
++void ScreenStreamSessionMachine::onTransportLost()
++{
++    const bool wasActive = (m_state == State::Streaming || m_state == State::AwaitingConsent);
++    if (wasActive && !m_explicitStop && m_autoStartEnabled) {
++        m_shouldReconnect = true;
++    } else {
++        m_shouldReconnect = false;
++    }
++    m_state = State::Idle;
++}
++
++bool ScreenStreamSessionMachine::shouldAutoStartOnConnect() const
++{
++    return m_autoStartEnabled && !m_explicitStop;
++}
++
++int ScreenStreamSessionMachine::consumeReconnectDelayMs()
++{
++    if (m_explicitStop) {
++        return -1;
++    }
++    if (!m_shouldReconnect && !shouldAutoStartOnConnect()) {
++        return -1;
++    }
++    if (m_reconnectAttempt < 0 || m_reconnectAttempt >= static_cast<int>(std::size(kReconnectDelaysMs))) {
++        m_shouldReconnect = false;
++        return -1;
++    }
++    const int delay = kReconnectDelaysMs[m_reconnectAttempt];
++    ++m_reconnectAttempt;
++    return delay;
++}
++
++bool ScreenStreamSessionMachine::canForwardInput() const
++{
++    return m_state == State::Streaming && m_remoteControlAllowed;
++}
++
++QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int maxBitrateKbps, bool requestAudio)
++{
++    return QVariantMap{
++        {QStringLiteral("action"), QStringLiteral("start")},
++        {QStringLiteral("maxWidth"), std::clamp(maxWidth, 320, 3840)},
++        {QStringLiteral("maxHeight"), std::clamp(maxHeight, 320, 3840)},
++        {QStringLiteral("maxFps"), std::clamp(maxFps, 5, 60)},
++        {QStringLiteral("maxBitrateKbps"), std::clamp(maxBitrateKbps, 500, 20000)},
++        {QStringLiteral("requestAudio"), requestAudio},
++    };
++}
++
++bool isValidRotation(int rotation)
++{
++    return rotation == 0 || rotation == 90 || rotation == 180 || rotation == 270;
++}
++
++void releaseStreamPayloadSafely(QSharedPointer<QIODevice> &payload, QObject *receiver)
++{
++    if (!payload) {
++        return;
++    }
++    QSharedPointer<QIODevice> closingPayload = std::move(payload);
++    if (receiver) {
++        QObject::disconnect(closingPayload.data(), nullptr, receiver, nullptr);
++    }
++    if (QCoreApplication::instance() && !QCoreApplication::closingDown()) {
++        QTimer::singleShot(0, QCoreApplication::instance(), [closingPayload = std::move(closingPayload)]() mutable {
++            if (closingPayload->isOpen()) {
++                closingPayload->close();
++            }
++            closingPayload.reset();
++        });
++    } else {
++        if (closingPayload->isOpen()) {
++            closingPayload->close();
++        }
++        closingPayload.reset();
++    }
++}
++
++} // namespace ScreenStreamProtocol
+diff --git a/plugins/screenstream/screenstreamprotocol.h b/plugins/screenstream/screenstreamprotocol.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..1824acf75f80999695ec08292a33c489574cf90a
+--- /dev/null
++++ b/plugins/screenstream/screenstreamprotocol.h
+@@ -0,0 +1,156 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QByteArray>
++#include <QIODevice>
++#include <QList>
++#include <QObject>
++#include <QPoint>
++#include <QPointF>
++#include <QRectF>
++#include <QSharedPointer>
++#include <QSize>
++#include <QSizeF>
++#include <QString>
++#include <QVariantMap>
++
++#include <optional>
++
++namespace ScreenStreamProtocol
++{
++inline constexpr quint16 kScreenStreamMagic = 0x4B53;
++inline constexpr int kScreenStreamHeaderBytes = 16;
++inline constexpr quint32 kMaxVideoFrameBytes = 4U * 1024U * 1024U;
++inline constexpr quint32 kMaxAudioChunkBytes = 65536U;
++inline constexpr int kMaxControlJsonBytes = 8192;
++
++enum class FrameKind : quint8 {
++    CodecConfig = 0x01,
++    VideoAccessUnit = 0x02,
++    AudioPcmChunk = 0x03,
++    ControlEos = 0x04,
++};
++
++enum FrameFlags : quint8 {
++    FlagNone = 0x00,
++    FlagKeyframe = 0x01,
++    FlagProtectedContent = 0x02,
++    FlagValidMask = 0x03,
++};
++
++struct ScreenStreamFrame {
++    FrameKind kind = FrameKind::ControlEos;
++    quint8 flags = FlagNone;
++    quint64 ptsUs = 0;
++    QByteArray payload;
++};
++
++QByteArray encodeScreenStreamFrame(FrameKind kind, quint8 flags, quint64 ptsUs, const QByteArray &payload);
++
++bool isValidFrameKind(quint8 rawKind, FrameKind *outKind);
++bool isValidPayloadLength(FrameKind kind, quint32 length);
++
++class ScreenStreamFrameParser
++{
++public:
++    ScreenStreamFrameParser() = default;
++
++    bool feed(const QByteArray &chunk, QList<ScreenStreamFrame> *outFrames);
++
++    bool hasError() const
++    {
++        return m_hasError;
++    }
++
++    QString errorString() const
++    {
++        return m_errorString;
++    }
++
++    void reset();
++
++private:
++    void setError(const QString &message);
++
++    QByteArray m_buffer;
++    bool m_hasError = false;
++    QString m_errorString;
++};
++
++class ScreenStreamCoordinateMapper
++{
++public:
++    static QRectF computeRenderedRect(const QSizeF &viewportSize, const QSize &streamSize);
++    static QSize computeTargetCanvasSize(const QSize &sourceSize, const QSize &maxCanvasSize, const QSize &minCanvasSize = QSize(240, 240));
++    static std::optional<QPoint> mapViewportToRemote(
++        const QPointF &pos,
++        const QSizeF &viewportSize,
++        const QSize &streamSize,
++        const QSize &remoteDisplaySize);
++};
++
++class ScreenStreamSessionMachine
++{
++public:
++    enum class State {
++        Idle,
++        AwaitingConsent,
++        Streaming,
++        Stopped,
++        Error,
++    };
++
++    static QString stateToString(State state);
++    static std::optional<State> stateFromString(const QString &value);
++
++    State state() const
++    {
++        return m_state;
++    }
++
++    bool explicitStop() const
++    {
++        return m_explicitStop;
++    }
++
++    bool autoStartEnabled() const
++    {
++        return m_autoStartEnabled;
++    }
++
++    bool remoteControlAllowed() const
++    {
++        return m_remoteControlAllowed;
++    }
++
++    void configure(bool autoStartEnabled, bool explicitStop);
++    void setRemoteControlAllowed(bool allowed);
++    void onExplicitStart();
++    void onReconnectStart();
++    void onLocalExplicitStop();
++    void onPeerState(State newState, bool peerExplicitStop);
++    void onTransportLost();
++
++    bool shouldAutoStartOnConnect() const;
++    int consumeReconnectDelayMs();
++    bool canForwardInput() const;
++
++private:
++    State m_state = State::Idle;
++    bool m_explicitStop = false;
++    bool m_autoStartEnabled = false;
++    bool m_remoteControlAllowed = false;
++    bool m_shouldReconnect = false;
++    int m_reconnectAttempt = 0;
++};
++
++QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int maxBitrateKbps, bool requestAudio);
++bool isValidRotation(int rotation);
++void releaseStreamPayloadSafely(QSharedPointer<QIODevice> &payload, QObject *receiver = nullptr);
++
++} // namespace ScreenStreamProtocol
+diff --git a/plugins/screenstream/viewer/gstvideodecoder.cpp b/plugins/screenstream/viewer/gstvideodecoder.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..994a13b1273f1abd3187f428c405f66cfce21528
+--- /dev/null
++++ b/plugins/screenstream/viewer/gstvideodecoder.cpp
+@@ -0,0 +1,285 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "gstvideodecoder.h"
++
++#include <QMetaObject>
++#include <QPointer>
++
++#include <atomic>
++#include <cstring>
++
++#include <gst/app/gstappsink.h>
++#include <gst/app/gstappsrc.h>
++#include <gst/gst.h>
++#include <gst/video/video.h>
++
++struct ScreenStreamVideoDecoder::Private {
++    ScreenStreamVideoDecoder *q = nullptr;
++    GstElement *pipeline = nullptr;
++    GstElement *appsrc = nullptr;
++    GstElement *videoconvert = nullptr;
++    GstElement *appsink = nullptr;
++    gulong decodebinPadSignal = 0;
++    GstElement *decodebin = nullptr;
++    std::atomic_bool alive{true};
++    bool initialized = false;
++
++    static void onDecodebinPadAdded(GstElement * /*src*/, GstPad *newPad, gpointer userData)
++    {
++        auto *self = static_cast<Private *>(userData);
++        if (!self || !self->alive.load() || !self->videoconvert) {
++            return;
++        }
++
++        GstPad *sinkPad = gst_element_get_static_pad(self->videoconvert, "sink");
++        if (!sinkPad) {
++            return;
++        }
++        if (gst_pad_is_linked(sinkPad)) {
++            gst_object_unref(sinkPad);
++            return;
++        }
++
++        GstCaps *caps = gst_pad_get_current_caps(newPad);
++        if (!caps) {
++            caps = gst_pad_query_caps(newPad, nullptr);
++        }
++        if (caps) {
++            const GstStructure *st = gst_caps_get_structure(caps, 0);
++            const char *name = st ? gst_structure_get_name(st) : nullptr;
++            if (name && g_str_has_prefix(name, "video/x-raw")) {
++                gst_pad_link(newPad, sinkPad);
++            }
++            gst_caps_unref(caps);
++        }
++        gst_object_unref(sinkPad);
++    }
++
++    static GstFlowReturn onNewSample(GstAppSink *sink, gpointer userData)
++    {
++        auto *self = static_cast<Private *>(userData);
++        if (!self || !self->alive.load()) {
++            return GST_FLOW_OK;
++        }
++
++        GstSample *sample = gst_app_sink_pull_sample(sink);
++        if (!sample) {
++            return GST_FLOW_OK;
++        }
++
++        GstCaps *caps = gst_sample_get_caps(sample);
++        GstBuffer *buffer = gst_sample_get_buffer(sample);
++        if (caps && buffer) {
++            GstVideoInfo vinfo;
++            if (gst_video_info_from_caps(&vinfo, caps) && GST_VIDEO_INFO_WIDTH(&vinfo) > 0 && GST_VIDEO_INFO_HEIGHT(&vinfo) > 0) {
++                GstMapInfo map;
++                if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
++                    const int width = GST_VIDEO_INFO_WIDTH(&vinfo);
++                    const int height = GST_VIDEO_INFO_HEIGHT(&vinfo);
++                    const int stride = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0);
++                    QImage img(map.data, width, height, stride, QImage::Format_RGBA8888);
++                    QImage detached = img.copy();
++                    gst_buffer_unmap(buffer, &map);
++
++                    QPointer<ScreenStreamVideoDecoder> target(self->q);
++                    if (target) {
++                        QMetaObject::invokeMethod(
++                            target.data(),
++                            [target, detached]() {
++                                if (target) {
++                                    Q_EMIT target->frameDecoded(detached);
++                                }
++                            },
++                            Qt::QueuedConnection);
++                    }
++                }
++            }
++        }
++
++        gst_sample_unref(sample);
++        return GST_FLOW_OK;
++    }
++};
++
++ScreenStreamVideoDecoder::ScreenStreamVideoDecoder(QObject *parent)
++    : QObject(parent)
++    , d(std::make_unique<Private>())
++{
++    d->q = this;
++}
++
++ScreenStreamVideoDecoder::~ScreenStreamVideoDecoder()
++{
++    shutdown();
++}
++
++bool ScreenStreamVideoDecoder::initialize(QString *errorOut)
++{
++    shutdown();
++    d->alive.store(true);
++
++    GError *gerr = nullptr;
++    if (!gst_init_check(nullptr, nullptr, &gerr)) {
++        const QString msg = gerr ? QString::fromUtf8(gerr->message) : QStringLiteral("Failed to initialize GStreamer");
++        if (gerr) {
++            g_error_free(gerr);
++        }
++        if (errorOut) {
++            *errorOut = msg;
++        }
++        Q_EMIT decoderError(msg);
++        return false;
++    }
++
++    d->pipeline = gst_pipeline_new("screenstream-decoder");
++    d->appsrc = gst_element_factory_make("appsrc", "src");
++    GstElement *parser = gst_element_factory_make("h264parse", "parser");
++    d->decodebin = gst_element_factory_make("decodebin", "decoder");
++    d->videoconvert = gst_element_factory_make("videoconvert", "convert");
++    GstElement *capsfilter = gst_element_factory_make("capsfilter", "rgba_filter");
++    d->appsink = gst_element_factory_make("appsink", "sink");
++
++    if (!d->pipeline || !d->appsrc || !parser || !d->decodebin || !d->videoconvert || !capsfilter || !d->appsink) {
++        const QString msg = QStringLiteral("Missing required GStreamer elements (appsrc, h264parse, decodebin, videoconvert, appsink)");
++        if (errorOut) {
++            *errorOut = msg;
++        }
++        Q_EMIT decoderError(msg);
++        if (d->appsrc && !GST_OBJECT_PARENT(d->appsrc)) gst_object_unref(d->appsrc);
++        if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
++        if (d->decodebin && !GST_OBJECT_PARENT(d->decodebin)) gst_object_unref(d->decodebin);
++        if (d->videoconvert && !GST_OBJECT_PARENT(d->videoconvert)) gst_object_unref(d->videoconvert);
++        if (capsfilter && !GST_OBJECT_PARENT(capsfilter)) gst_object_unref(capsfilter);
++        if (d->appsink && !GST_OBJECT_PARENT(d->appsink)) gst_object_unref(d->appsink);
++        if (d->pipeline) {
++            gst_object_unref(d->pipeline);
++            d->pipeline = nullptr;
++        }
++        d->appsrc = nullptr;
++        d->decodebin = nullptr;
++        d->videoconvert = nullptr;
++        d->appsink = nullptr;
++        return false;
++    }
++
++    GstCaps *srcCaps = gst_caps_from_string("video/x-h264,stream-format=(string)byte-stream");
++    g_object_set(d->appsrc,
++                 "is-live",
++                 TRUE,
++                 "format",
++                 GST_FORMAT_TIME,
++                 "stream-type",
++                 GST_APP_STREAM_TYPE_STREAM,
++                 "max-bytes",
++                 static_cast<guint64>(2U * 1024U * 1024U),
++                 "caps",
++                 srcCaps,
++                 nullptr);
++    gst_caps_unref(srcCaps);
++
++    GstCaps *rawCaps = gst_caps_from_string("video/x-raw,format=(string)RGBA");
++    g_object_set(capsfilter, "caps", rawCaps, nullptr);
++    gst_caps_unref(rawCaps);
++
++    g_object_set(d->appsink,
++                 "emit-signals",
++                 FALSE,
++                 "sync",
++                 FALSE,
++                 "max-buffers",
++                 static_cast<guint>(2),
++                 "drop",
++                 TRUE,
++                 nullptr);
++
++    GstAppSinkCallbacks callbacks{};
++    callbacks.new_sample = &Private::onNewSample;
++    gst_app_sink_set_callbacks(GST_APP_SINK(d->appsink), &callbacks, d.get(), nullptr);
++
++    gst_bin_add_many(GST_BIN(d->pipeline), d->appsrc, parser, d->decodebin, d->videoconvert, capsfilter, d->appsink, nullptr);
++    if (!gst_element_link_many(d->appsrc, parser, d->decodebin, nullptr)
++        || !gst_element_link_many(d->videoconvert, capsfilter, d->appsink, nullptr)) {
++        const QString msg = QStringLiteral("Failed to link GStreamer video decoding pipeline");
++        if (errorOut) {
++            *errorOut = msg;
++        }
++        Q_EMIT decoderError(msg);
++        shutdown();
++        return false;
++    }
++
++    d->decodebinPadSignal = g_signal_connect(d->decodebin, "pad-added", G_CALLBACK(&Private::onDecodebinPadAdded), d.get());
++
++    const GstStateChangeReturn stateRet = gst_element_set_state(d->pipeline, GST_STATE_PLAYING);
++    if (stateRet == GST_STATE_CHANGE_FAILURE) {
++        const QString msg = QStringLiteral("Failed to start GStreamer pipeline");
++        if (errorOut) {
++            *errorOut = msg;
++        }
++        Q_EMIT decoderError(msg);
++        shutdown();
++        return false;
++    }
++
++    d->initialized = true;
++    return true;
++}
++
++void ScreenStreamVideoDecoder::shutdown()
++{
++    d->alive.store(false);
++    d->initialized = false;
++
++    if (d->decodebin && d->decodebinPadSignal != 0) {
++        g_signal_handler_disconnect(d->decodebin, d->decodebinPadSignal);
++        d->decodebinPadSignal = 0;
++    }
++    if (d->appsink) {
++        GstAppSinkCallbacks empty{};
++        gst_app_sink_set_callbacks(GST_APP_SINK(d->appsink), &empty, nullptr, nullptr);
++    }
++    if (d->pipeline) {
++        gst_element_set_state(d->pipeline, GST_STATE_NULL);
++        gst_object_unref(d->pipeline);
++        d->pipeline = nullptr;
++    }
++    d->appsrc = nullptr;
++    d->decodebin = nullptr;
++    d->videoconvert = nullptr;
++    d->appsink = nullptr;
++}
++
++bool ScreenStreamVideoDecoder::pushAccessUnit(const QByteArray &annexB, quint64 ptsUs, bool isKeyframe)
++{
++    if (!d->initialized || !d->appsrc || annexB.isEmpty()) {
++        return false;
++    }
++
++    GstBuffer *buf = gst_buffer_new_allocate(nullptr, static_cast<gsize>(annexB.size()), nullptr);
++    if (!buf) {
++        return false;
++    }
++
++    GstMapInfo map;
++    if (!gst_buffer_map(buf, &map, GST_MAP_WRITE)) {
++        gst_buffer_unref(buf);
++        return false;
++    }
++    std::memcpy(map.data, annexB.constData(), static_cast<size_t>(annexB.size()));
++    gst_buffer_unmap(buf, &map);
++
++    GST_BUFFER_PTS(buf) = static_cast<GstClockTime>(ptsUs) * 1000ULL;
++    GST_BUFFER_DTS(buf) = GST_CLOCK_TIME_NONE;
++    if (isKeyframe) {
++        GST_BUFFER_FLAG_UNSET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
++    } else {
++        GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
++    }
++
++    const GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), buf);
++    return ret == GST_FLOW_OK;
++}
+diff --git a/plugins/screenstream/viewer/gstvideodecoder.h b/plugins/screenstream/viewer/gstvideodecoder.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d7e7c2a0625fb756fcfc11cb9999b5fa53422cc
+--- /dev/null
++++ b/plugins/screenstream/viewer/gstvideodecoder.h
+@@ -0,0 +1,36 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QByteArray>
++#include <QImage>
++#include <QObject>
++#include <QString>
++
++#include <memory>
++
++class ScreenStreamVideoDecoder : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit ScreenStreamVideoDecoder(QObject *parent = nullptr);
++    ~ScreenStreamVideoDecoder() override;
++
++    bool initialize(QString *errorOut = nullptr);
++    void shutdown();
++
++    bool pushAccessUnit(const QByteArray &annexB, quint64 ptsUs, bool isKeyframe);
++
++Q_SIGNALS:
++    void frameDecoded(const QImage &frame);
++    void decoderError(const QString &message);
++
++private:
++    struct Private;
++    std::unique_ptr<Private> d;
++};
+diff --git a/plugins/screenstream/viewer/main.cpp b/plugins/screenstream/viewer/main.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b6d685f2f097eb33b72e0b7c2a34bce304326b9
+--- /dev/null
++++ b/plugins/screenstream/viewer/main.cpp
+@@ -0,0 +1,85 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "gstvideodecoder.h"
++#include "viewerwindow.h"
++
++#include <KLocalizedString>
++
++#include <QApplication>
++#include <QCommandLineOption>
++#include <QCommandLineParser>
++#include <QCoreApplication>
++
++#include <iostream>
++#include <memory>
++
++int main(int argc, char **argv)
++{
++    bool selfTest = false;
++    for (int i = 1; i < argc; ++i) {
++        if (qstrcmp(argv[i], "--self-test") == 0) {
++            selfTest = true;
++            break;
++        }
++    }
++
++    std::unique_ptr<QCoreApplication> app;
++    if (selfTest) {
++        app = std::make_unique<QCoreApplication>(argc, argv);
++    } else {
++        app = std::make_unique<QApplication>(argc, argv);
++    }
++
++    QCoreApplication::setApplicationName(QStringLiteral("kdeconnect-screenstream-viewer"));
++    QCoreApplication::setOrganizationDomain(QStringLiteral("kde.org"));
++    KLocalizedString::setApplicationDomain("kdeconnect-plugins");
++
++    if (selfTest) {
++        ScreenStreamVideoDecoder decoder;
++        QString err;
++        if (!decoder.initialize(&err)) {
++            std::cerr << "Self-test failed: " << err.toStdString() << std::endl;
++            return 1;
++        }
++        decoder.shutdown();
++        std::cout << "GStreamer pipeline self-test OK" << std::endl;
++        return 0;
++    }
++
++    QCommandLineParser parser;
++    parser.addHelpOption();
++    QCommandLineOption deviceOpt(QStringLiteral("device"), i18n("KDE Connect device ID"), QStringLiteral("id"));
++    QCommandLineOption nameOpt(QStringLiteral("device-name"), i18n("Display name of the device"), QStringLiteral("name"));
++    QCommandLineOption socketOpt(QStringLiteral("socket"), i18n("Local IPC socket path"), QStringLiteral("path"));
++    QCommandLineOption dwOpt(QStringLiteral("display-width"), i18n("Display width"), QStringLiteral("px"), QStringLiteral("0"));
++    QCommandLineOption dhOpt(QStringLiteral("display-height"), i18n("Display height"), QStringLiteral("px"), QStringLiteral("0"));
++    QCommandLineOption swOpt(QStringLiteral("stream-width"), i18n("Stream width"), QStringLiteral("px"), QStringLiteral("0"));
++    QCommandLineOption shOpt(QStringLiteral("stream-height"), i18n("Stream height"), QStringLiteral("px"), QStringLiteral("0"));
++    QCommandLineOption rotOpt(QStringLiteral("rotation"), i18n("Display rotation"), QStringLiteral("deg"), QStringLiteral("0"));
++
++    parser.addOptions({deviceOpt, nameOpt, socketOpt, dwOpt, dhOpt, swOpt, shOpt, rotOpt});
++    parser.process(*app);
++
++    ViewerLaunchConfig config;
++    config.deviceId = parser.value(deviceOpt);
++    config.deviceName = parser.value(nameOpt);
++    config.socketPath = parser.value(socketOpt);
++    config.displayWidth = parser.value(dwOpt).toInt();
++    config.displayHeight = parser.value(dhOpt).toInt();
++    config.streamWidth = parser.value(swOpt).toInt();
++    config.streamHeight = parser.value(shOpt).toInt();
++    config.rotation = parser.value(rotOpt).toInt();
++
++    if (config.deviceId.isEmpty() || config.socketPath.isEmpty()) {
++        std::cerr << "Both --device and --socket are required" << std::endl;
++        return 2;
++    }
++
++    ViewerWindow window(config);
++    window.show();
++    return app->exec();
++}
+diff --git a/plugins/screenstream/viewer/pcmplayer.cpp b/plugins/screenstream/viewer/pcmplayer.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..486074eff2663be73c3bfb2c554f66f6933b8abd
+--- /dev/null
++++ b/plugins/screenstream/viewer/pcmplayer.cpp
+@@ -0,0 +1,151 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "pcmplayer.h"
++
++#include <cstring>
++
++#include <gst/app/gstappsrc.h>
++#include <gst/gst.h>
++
++namespace
++{
++inline constexpr qsizetype kMaxBufferBytes = 7680; // 80 ms of 48 kHz mono s16le
++} // namespace
++
++struct PcmPlayer::Private {
++    GstElement *pipeline = nullptr;
++    GstElement *appsrc = nullptr;
++    bool muted = false;
++    bool unavailable = false;
++};
++
++PcmPlayer::PcmPlayer(QObject *parent)
++    : QObject(parent)
++    , d(std::make_unique<Private>())
++{
++}
++
++PcmPlayer::~PcmPlayer()
++{
++    stop();
++}
++
++bool PcmPlayer::ensureStarted()
++{
++    if (d->unavailable) {
++        return false;
++    }
++    if (d->pipeline && d->appsrc) {
++        return true;
++    }
++
++    if (!gst_init_check(nullptr, nullptr, nullptr)) {
++        d->unavailable = true;
++        return false;
++    }
++
++    GstElement *pipeline = gst_pipeline_new("screenstream-audio");
++    GstElement *appsrc = gst_element_factory_make("appsrc", "audio_src");
++    GstElement *convert = gst_element_factory_make("audioconvert", "audio_convert");
++    GstElement *resample = gst_element_factory_make("audioresample", "audio_resample");
++    GstElement *sink = gst_element_factory_make("autoaudiosink", "audio_sink");
++
++    if (!pipeline || !appsrc || !convert || !resample || !sink) {
++        if (appsrc) gst_object_unref(appsrc);
++        if (convert) gst_object_unref(convert);
++        if (resample) gst_object_unref(resample);
++        if (sink) gst_object_unref(sink);
++        if (pipeline) gst_object_unref(pipeline);
++        d->unavailable = true;
++        return false;
++    }
++
++    GstCaps *caps = gst_caps_from_string("audio/x-raw,format=(string)S16LE,layout=(string)interleaved,rate=(int)48000,channels=(int)1");
++    g_object_set(appsrc,
++                 "is-live",
++                 TRUE,
++                 "format",
++                 GST_FORMAT_TIME,
++                 "do-timestamp",
++                 TRUE,
++                 "stream-type",
++                 GST_APP_STREAM_TYPE_STREAM,
++                 "block",
++                 FALSE,
++                 "leaky-type",
++                 2,
++                 "max-bytes",
++                 static_cast<guint64>(kMaxBufferBytes),
++                 "caps",
++                 caps,
++                 nullptr);
++    gst_caps_unref(caps);
++
++    gst_bin_add_many(GST_BIN(pipeline), appsrc, convert, resample, sink, nullptr);
++    if (!gst_element_link_many(appsrc, convert, resample, sink, nullptr)) {
++        gst_object_unref(pipeline);
++        d->unavailable = true;
++        return false;
++    }
++
++    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
++        gst_element_set_state(pipeline, GST_STATE_NULL);
++        gst_object_unref(pipeline);
++        d->unavailable = true;
++        return false;
++    }
++
++    d->pipeline = pipeline;
++    d->appsrc = appsrc;
++    return true;
++}
++
++void PcmPlayer::writePcm(const QByteArray &pcmBytes)
++{
++    const qsizetype aligned = pcmBytes.size() - (pcmBytes.size() % 2);
++    if (d->muted || aligned <= 0 || !ensureStarted()) {
++        return;
++    }
++
++    GstBuffer *buf = gst_buffer_new_allocate(nullptr, static_cast<gsize>(aligned), nullptr);
++    if (!buf) {
++        return;
++    }
++
++    GstMapInfo map;
++    if (!gst_buffer_map(buf, &map, GST_MAP_WRITE)) {
++        gst_buffer_unref(buf);
++        return;
++    }
++    std::memcpy(map.data, pcmBytes.constData(), static_cast<size_t>(aligned));
++    gst_buffer_unmap(buf, &map);
++
++    gst_app_src_push_buffer(GST_APP_SRC(d->appsrc), buf);
++}
++
++void PcmPlayer::setMuted(bool muted)
++{
++    d->muted = muted;
++    if (d->muted && d->pipeline) {
++        stop();
++    }
++}
++
++bool PcmPlayer::isMuted() const
++{
++    return d->muted;
++}
++
++void PcmPlayer::stop()
++{
++    if (d->pipeline) {
++        gst_element_set_state(d->pipeline, GST_STATE_NULL);
++        gst_object_unref(d->pipeline);
++        d->pipeline = nullptr;
++        d->appsrc = nullptr;
++    }
++}
+diff --git a/plugins/screenstream/viewer/pcmplayer.h b/plugins/screenstream/viewer/pcmplayer.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..a10df6f35c0aca006329e3d70ec9ea3af4f0390b
+--- /dev/null
++++ b/plugins/screenstream/viewer/pcmplayer.h
+@@ -0,0 +1,32 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QByteArray>
++#include <QObject>
++
++#include <memory>
++
++class PcmPlayer : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit PcmPlayer(QObject *parent = nullptr);
++    ~PcmPlayer() override;
++
++    void writePcm(const QByteArray &pcmBytes);
++    void setMuted(bool muted);
++    bool isMuted() const;
++    void stop();
++
++private:
++    bool ensureStarted();
++
++    struct Private;
++    std::unique_ptr<Private> d;
++};
+diff --git a/plugins/screenstream/viewer/viewerwindow.cpp b/plugins/screenstream/viewer/viewerwindow.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2aa001297402a7f051ad97cd4911289909d0ddac
+--- /dev/null
++++ b/plugins/screenstream/viewer/viewerwindow.cpp
+@@ -0,0 +1,649 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "viewerwindow.h"
++
++#include "gstvideodecoder.h"
++#include "pcmplayer.h"
++
++#include <KLocalizedString>
++
++#include <QAction>
++#include <QCloseEvent>
++#include <QDBusConnection>
++#include <QDBusInterface>
++#include <QFileDialog>
++#include <QGuiApplication>
++#include <QIcon>
++#include <QKeyEvent>
++#include <QLabel>
++#include <QLocalSocket>
++#include <QMouseEvent>
++#include <QPainter>
++#include <QPalette>
++#include <QScreen>
++#include <QStandardPaths>
++#include <QToolBar>
++#include <QVBoxLayout>
++#include <QWheelEvent>
++
++#include <algorithm>
++
++ScreenCanvasWidget::ScreenCanvasWidget(QWidget *parent)
++    : QWidget(parent)
++{
++    setFocusPolicy(Qt::StrongFocus);
++    setMouseTracking(true);
++    setMinimumSize(240, 240);
++    setAutoFillBackground(true);
++    QPalette pal = palette();
++    pal.setColor(QPalette::Window, Qt::black);
++    setPalette(pal);
++}
++
++void ScreenCanvasWidget::setFrame(const QImage &frame)
++{
++    m_frame = frame;
++    update();
++}
++
++void ScreenCanvasWidget::setRemoteDisplaySize(const QSize &size)
++{
++    m_remoteDisplaySize = size;
++}
++
++void ScreenCanvasWidget::setInputEnabled(bool enabled)
++{
++    m_inputEnabled = enabled;
++    setCursor(enabled ? Qt::CrossCursor : Qt::ArrowCursor);
++}
++
++std::optional<QPoint> ScreenCanvasWidget::mapEventPos(const QPointF &pos) const
++{
++    if (m_frame.isNull()) {
++        return std::nullopt;
++    }
++    const QSize targetDisplay = m_remoteDisplaySize.isValid() ? m_remoteDisplaySize : m_frame.size();
++    return ScreenStreamProtocol::ScreenStreamCoordinateMapper::mapViewportToRemote(pos, size(), m_frame.size(), targetDisplay);
++}
++
++void ScreenCanvasWidget::paintEvent(QPaintEvent * /*event*/)
++{
++    QPainter painter(this);
++    painter.fillRect(rect(), Qt::black);
++    if (m_frame.isNull()) {
++        painter.setPen(Qt::white);
++        painter.drawText(rect(), Qt::AlignCenter, i18n("Waiting for Android screen frame..."));
++        return;
++    }
++
++    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
++    const QRectF dstRect = ScreenStreamProtocol::ScreenStreamCoordinateMapper::computeRenderedRect(size(), m_frame.size());
++    if (!dstRect.isEmpty()) {
++        painter.drawImage(dstRect, m_frame);
++    }
++}
++
++void ScreenCanvasWidget::mousePressEvent(QMouseEvent *event)
++{
++    setFocus();
++    if (!m_inputEnabled) {
++        return;
++    }
++    if (event->button() == Qt::LeftButton) {
++        const auto mapped = mapEventPos(event->position());
++        if (!mapped.has_value()) {
++            return;
++        }
++        m_leftButtonDown = true;
++        m_dragging = false;
++        m_pressPos = event->position();
++        Q_EMIT pointerMoved(*mapped);
++    }
++}
++
++void ScreenCanvasWidget::mouseMoveEvent(QMouseEvent *event)
++{
++    if (!m_inputEnabled) {
++        return;
++    }
++    const auto mapped = mapEventPos(event->position());
++    if (!mapped.has_value()) {
++        return;
++    }
++    if (m_leftButtonDown && !m_dragging) {
++        if ((event->position() - m_pressPos).manhattanLength() < 8.0) {
++            return;
++        }
++        m_dragging = true;
++        Q_EMIT dragStarted(*mapped);
++        Q_EMIT pointerMoved(*mapped);
++        return;
++    }
++    Q_EMIT pointerMoved(*mapped);
++}
++
++void ScreenCanvasWidget::mouseReleaseEvent(QMouseEvent *event)
++{
++    if (!m_inputEnabled) {
++        m_leftButtonDown = false;
++        m_dragging = false;
++        return;
++    }
++    if (event->button() == Qt::LeftButton) {
++        const auto mapped = mapEventPos(event->position());
++        if (m_dragging) {
++            if (mapped.has_value()) {
++                Q_EMIT pointerMoved(*mapped);
++                Q_EMIT dragEnded(*mapped);
++            } else {
++                Q_EMIT dragEnded(QPoint(1, 1));
++            }
++        } else if (mapped.has_value()) {
++            Q_EMIT pointerMoved(*mapped);
++            Q_EMIT pointerClicked(*mapped);
++        }
++        m_leftButtonDown = false;
++        m_dragging = false;
++        return;
++    }
++    if (event->button() == Qt::RightButton) {
++        Q_EMIT rightClicked();
++        return;
++    }
++    if (event->button() == Qt::MiddleButton) {
++        Q_EMIT middleClicked();
++    }
++}
++
++void ScreenCanvasWidget::wheelEvent(QWheelEvent *event)
++{
++    if (!m_inputEnabled) {
++        return;
++    }
++    if (!mapEventPos(event->position()).has_value()) {
++        return;
++    }
++    const QPoint angle = event->angleDelta();
++    if (angle.y() != 0) {
++        // KdeConnectAccessibilityService accumulates |dy| >= 500 per scroll gesture.
++        const int scaledDy = -angle.y() * 5;
++        Q_EMIT wheelScrolled(0, scaledDy);
++    }
++}
++
++void ScreenCanvasWidget::keyPressEvent(QKeyEvent *event)
++{
++    if (!m_inputEnabled) {
++        return;
++    }
++    QVariantMap payload;
++    payload.insert(QStringLiteral("key"), event->key());
++    payload.insert(QStringLiteral("modifiers"), static_cast<int>(event->modifiers()));
++    payload.insert(QStringLiteral("text"), event->text());
++    Q_EMIT keyEventCaptured(payload);
++}
++
++ViewerWindow::ViewerWindow(const ViewerLaunchConfig &config, QWidget *parent)
++    : QMainWindow(parent)
++    , m_config(config)
++    , m_decoder(new ScreenStreamVideoDecoder(this))
++    , m_audioPlayer(new PcmPlayer(this))
++    , m_socket(new QLocalSocket(this))
++{
++    if (m_config.displayWidth > 1 && m_config.displayHeight > 1) {
++        m_displaySize = QSize(m_config.displayWidth, m_config.displayHeight);
++    } else if (m_config.streamWidth > 1 && m_config.streamHeight > 1) {
++        m_displaySize = QSize(m_config.streamWidth, m_config.streamHeight);
++    }
++    if (m_config.streamWidth > 1 && m_config.streamHeight > 1) {
++        m_streamSize = QSize(m_config.streamWidth, m_config.streamHeight);
++    }
++
++    setupUi();
++    setupDbus();
++    refreshDbusProperties();
++
++    QString gstErr;
++    if (!m_decoder->initialize(&gstErr)) {
++        m_decoderError = gstErr;
++    }
++
++    connect(m_decoder, &ScreenStreamVideoDecoder::frameDecoded, this, &ViewerWindow::onFrameDecoded);
++    connect(m_decoder, &ScreenStreamVideoDecoder::decoderError, this, &ViewerWindow::onDecoderError);
++
++    connect(m_socket, &QLocalSocket::connected, this, &ViewerWindow::onSocketConnected);
++    connect(m_socket, &QLocalSocket::readyRead, this, &ViewerWindow::onSocketReadyRead);
++    connect(m_socket, &QLocalSocket::disconnected, this, &ViewerWindow::onSocketDisconnected);
++
++    updateBannerAndInputGate();
++    m_socket->connectToServer(m_config.socketPath);
++}
++
++ViewerWindow::~ViewerWindow() = default;
++
++void ViewerWindow::setupUi()
++{
++    const QString titleName = m_config.deviceName.isEmpty() ? m_config.deviceId : m_config.deviceName;
++    setWindowTitle(i18n("Screen Stream - %1", titleName));
++
++    m_toolbar = addToolBar(i18n("Screen Stream Controls"));
++    m_toolbar->setMovable(false);
++
++    auto *stopAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("media-playback-stop")), i18n("Stop"));
++    connect(stopAct, &QAction::triggered, this, &ViewerWindow::onStopClicked);
++
++    m_muteAction = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("audio-volume-muted")), i18n("Mute Audio"));
++    m_muteAction->setCheckable(true);
++    connect(m_muteAction, &QAction::toggled, this, &ViewerWindow::onMuteToggled);
++
++    auto *keyframeAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("view-refresh")), i18n("Refresh Keyframe"));
++    connect(keyframeAct, &QAction::triggered, this, &ViewerWindow::onKeyframeClicked);
++
++    auto *fitWindowAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("zoom-fit-best")), i18n("Fit Window"));
++    connect(fitWindowAct, &QAction::triggered, this, &ViewerWindow::onFitWindowClicked);
++
++    auto *clipboardAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("edit-paste")), i18n("Send Clipboard"));
++    connect(clipboardAct, &QAction::triggered, this, &ViewerWindow::onClipboardClicked);
++
++    auto *shareAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("document-send")), i18n("Share File..."));
++    connect(shareAct, &QAction::triggered, this, &ViewerWindow::onShareFileClicked);
++
++    m_toolbar->addSeparator();
++
++    m_backAction = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("go-previous")), i18n("Back"));
++    connect(m_backAction, &QAction::triggered, this, [this]() {
++        sendRemoteControlCommand({{QStringLiteral("backclick"), true}});
++    });
++
++    m_homeAction = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("go-home")), i18n("Home"));
++    connect(m_homeAction, &QAction::triggered, this, [this]() {
++        sendRemoteControlCommand({{QStringLiteral("middleclick"), true}});
++    });
++
++    m_recentsAction = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("view-grid")), i18n("Recents"));
++    connect(m_recentsAction, &QAction::triggered, this, [this]() {
++        sendRemoteControlCommand({{QStringLiteral("forwardclick"), true}});
++    });
++
++    auto *central = new QWidget(this);
++    auto *layout = new QVBoxLayout(central);
++    layout->setContentsMargins(0, 0, 0, 0);
++    layout->setSpacing(0);
++
++    m_banner = new QLabel(central);
++    m_banner->setWordWrap(true);
++    m_banner->setMargin(6);
++    m_banner->hide();
++    layout->addWidget(m_banner);
++
++    m_canvas = new ScreenCanvasWidget(central);
++    if (m_displaySize.isValid()) {
++        m_canvas->setRemoteDisplaySize(m_displaySize);
++    }
++    layout->addWidget(m_canvas, 1);
++
++    setCentralWidget(central);
++    fitWindowToStream(false);
++
++    connect(m_canvas, &ScreenCanvasWidget::pointerMoved, this, [this](const QPoint &pt) {
++        sendRemoteControlCommand({{QStringLiteral("x"), pt.x()}, {QStringLiteral("y"), pt.y()}});
++    });
++    connect(m_canvas, &ScreenCanvasWidget::pointerClicked, this, [this](const QPoint & /*pt*/) {
++        sendRemoteControlCommand({{QStringLiteral("singleclick"), true}});
++    });
++    connect(m_canvas, &ScreenCanvasWidget::dragStarted, this, [this](const QPoint & /*pt*/) {
++        sendRemoteControlCommand({{QStringLiteral("singlehold"), true}});
++    });
++    connect(m_canvas, &ScreenCanvasWidget::dragEnded, this, [this](const QPoint & /*pt*/) {
++        sendRemoteControlCommand({{QStringLiteral("singlerelease"), true}});
++    });
++    connect(m_canvas, &ScreenCanvasWidget::rightClicked, this, [this]() {
++        sendRemoteControlCommand({{QStringLiteral("backclick"), true}});
++    });
++    connect(m_canvas, &ScreenCanvasWidget::middleClicked, this, [this]() {
++        sendRemoteControlCommand({{QStringLiteral("middleclick"), true}});
++    });
++    connect(m_canvas, &ScreenCanvasWidget::wheelScrolled, this, [this](int dx, int dy) {
++        sendRemoteControlCommand({{QStringLiteral("scroll"), true}, {QStringLiteral("dx"), dx}, {QStringLiteral("dy"), dy}});
++    });
++    connect(m_canvas, &ScreenCanvasWidget::keyEventCaptured, this, [this](const QVariantMap &keyEvent) {
++        if (m_sessionActive && m_remoteKeyboardIface && m_remoteKeyboardIface->isValid()) {
++            m_remoteKeyboardIface->asyncCall(QStringLiteral("sendQKeyEvent"), keyEvent, false);
++        }
++    });
++}
++
++void ViewerWindow::setupDbus()
++{
++    QDBusConnection bus = QDBusConnection::sessionBus();
++    const QString service = QStringLiteral("org.kde.kdeconnect");
++    const QString basePath = QStringLiteral("/modules/kdeconnect/devices/%1").arg(m_config.deviceId);
++
++    m_screenstreamIface = new QDBusInterface(service, basePath + QStringLiteral("/screenstream"), QStringLiteral("org.kde.kdeconnect.device.screenstream"), bus, this);
++    m_remoteControlIface = new QDBusInterface(service, basePath + QStringLiteral("/remotecontrol"), QStringLiteral("org.kde.kdeconnect.device.remotecontrol"), bus, this);
++    m_remoteKeyboardIface = new QDBusInterface(service, basePath + QStringLiteral("/remotekeyboard"), QStringLiteral("org.kde.kdeconnect.device.remotekeyboard"), bus, this);
++    m_clipboardIface = new QDBusInterface(service, basePath + QStringLiteral("/clipboard"), QStringLiteral("org.kde.kdeconnect.device.clipboard"), bus, this);
++    m_shareIface = new QDBusInterface(service, basePath + QStringLiteral("/share"), QStringLiteral("org.kde.kdeconnect.device.share"), bus, this);
++
++    bus.connect(service,
++                basePath + QStringLiteral("/screenstream"),
++                QStringLiteral("org.kde.kdeconnect.device.screenstream"),
++                QStringLiteral("geometryChanged"),
++                this,
++                SLOT(onDbusGeometryChanged(int,int,int)));
++    bus.connect(service,
++                basePath + QStringLiteral("/screenstream"),
++                QStringLiteral("org.kde.kdeconnect.device.screenstream"),
++                QStringLiteral("audioStatusChanged"),
++                this,
++                SLOT(onDbusAudioStatusChanged(bool,QString)));
++    bus.connect(service,
++                basePath + QStringLiteral("/screenstream"),
++                QStringLiteral("org.kde.kdeconnect.device.screenstream"),
++                QStringLiteral("stateChanged"),
++                this,
++                SLOT(onDbusStateChanged()));
++    bus.connect(service,
++                basePath + QStringLiteral("/screenstream"),
++                QStringLiteral("org.kde.kdeconnect.device.screenstream"),
++                QStringLiteral("streamingChanged"),
++                this,
++                SLOT(onDbusStreamingChanged(bool)));
++}
++
++void ViewerWindow::refreshDbusProperties()
++{
++    if (!m_screenstreamIface || !m_screenstreamIface->isValid()) {
++        return;
++    }
++    m_accessibilityEnabled = m_screenstreamIface->property("accessibilityEnabled").toBool();
++    m_audioAvailable = m_screenstreamIface->property("audioAvailable").toBool();
++    m_audioReason = m_screenstreamIface->property("audioReason").toString();
++
++    const int dw = m_screenstreamIface->property("displayWidth").toInt();
++    const int dh = m_screenstreamIface->property("displayHeight").toInt();
++    if (dw > 1 && dh > 1) {
++        m_displaySize = QSize(dw, dh);
++        m_canvas->setRemoteDisplaySize(m_displaySize);
++    }
++    const int sw = m_screenstreamIface->property("streamWidth").toInt();
++    const int sh = m_screenstreamIface->property("streamHeight").toInt();
++    if (sw > 1 && sh > 1) {
++        m_streamSize = QSize(sw, sh);
++    }
++    updateBannerAndInputGate();
++}
++
++void ViewerWindow::updateBannerAndInputGate()
++{
++    const bool remoteCtrlValid = m_remoteControlIface && m_remoteControlIface->isValid();
++    const bool allowInput = m_sessionActive && remoteCtrlValid && m_accessibilityEnabled;
++    m_canvas->setInputEnabled(allowInput);
++    if (m_backAction) {
++        m_backAction->setEnabled(allowInput);
++    }
++    if (m_homeAction) {
++        m_homeAction->setEnabled(allowInput);
++    }
++    if (m_recentsAction) {
++        m_recentsAction->setEnabled(allowInput);
++    }
++
++    QStringList notices;
++    if (!m_decoderError.isEmpty()) {
++        notices << m_decoderError;
++    }
++    if (m_protectedContentActive) {
++        notices << i18n("Protected content is currently displayed on Android and masked from capture.");
++    }
++    if (!m_audioAvailable && !m_audioReason.isEmpty()) {
++        notices << i18n("Audio unavailable: %1", m_audioReason);
++    }
++    if (!allowInput && m_sessionActive) {
++        if (!remoteCtrlValid) {
++            notices << i18n("Remote input disabled: KDE Connect remotecontrol plugin is not active.");
++        } else if (!m_accessibilityEnabled) {
++            notices << i18n("Remote touch/key control disabled: enable KDE Connect Accessibility Service on Android.");
++        }
++    }
++
++    if (notices.isEmpty()) {
++        m_banner->hide();
++    } else {
++        m_banner->setText(notices.join(QStringLiteral(" | ")));
++        m_banner->show();
++    }
++}
++
++void ViewerWindow::sendRemoteControlCommand(const QVariantMap &body)
++{
++    if (!m_sessionActive || !m_accessibilityEnabled || !m_remoteControlIface || !m_remoteControlIface->isValid()) {
++        return;
++    }
++    m_remoteControlIface->asyncCall(QStringLiteral("sendCommand"), body);
++}
++
++QSize ViewerWindow::effectiveStreamSize() const
++{
++    if (m_lastFrameSize.width() > 1 && m_lastFrameSize.height() > 1) {
++        return m_lastFrameSize;
++    }
++    if (m_streamSize.width() > 1 && m_streamSize.height() > 1) {
++        return m_streamSize;
++    }
++    if (m_displaySize.width() > 1 && m_displaySize.height() > 1) {
++        return m_displaySize;
++    }
++    return QSize(540, 960);
++}
++
++void ViewerWindow::fitWindowToStream(bool force)
++{
++    if (!force && (isMaximized() || isFullScreen())) {
++        return;
++    }
++    if (force && (isMaximized() || isFullScreen())) {
++        showNormal();
++    }
++
++    QScreen *scr = screen() ? screen() : QGuiApplication::primaryScreen();
++    const QSize avail = scr ? scr->availableGeometry().size() : QSize(1920, 1080);
++    const int chromeHeight = (isVisible() && m_canvas && m_canvas->height() > 0 && height() >= m_canvas->height())
++        ? (height() - m_canvas->height())
++        : ((m_toolbar ? m_toolbar->sizeHint().height() : 40) + ((m_banner && !m_banner->isHidden()) ? m_banner->sizeHint().height() : 0));
++
++    const int maxCanvasW = std::max(240, static_cast<int>(avail.width() * 0.85));
++    const int maxCanvasH = std::max(240, static_cast<int>(avail.height() * 0.85) - chromeHeight);
++    const QSize targetCanvas = ScreenStreamProtocol::ScreenStreamCoordinateMapper::computeTargetCanvasSize(
++        effectiveStreamSize(),
++        QSize(maxCanvasW, maxCanvasH),
++        QSize(240, 240));
++    if (targetCanvas.isValid()) {
++        resize(targetCanvas.width(), targetCanvas.height() + chromeHeight);
++    }
++}
++
++void ViewerWindow::onSocketConnected()
++{
++    updateBannerAndInputGate();
++}
++
++void ViewerWindow::onSocketReadyRead()
++{
++    const QByteArray bytes = m_socket->readAll();
++    if (bytes.isEmpty()) {
++        return;
++    }
++
++    QList<ScreenStreamProtocol::ScreenStreamFrame> frames;
++    if (!m_parser.feed(bytes, &frames)) {
++        m_sessionActive = false;
++        m_decoderError = m_parser.errorString();
++        updateBannerAndInputGate();
++        m_socket->close();
++        return;
++    }
++
++    for (const auto &frame : std::as_const(frames)) {
++        const bool isProtected = (frame.flags & ScreenStreamProtocol::FlagProtectedContent) != 0;
++        if (isProtected != m_protectedContentActive) {
++            m_protectedContentActive = isProtected;
++            updateBannerAndInputGate();
++        }
++
++        switch (frame.kind) {
++        case ScreenStreamProtocol::FrameKind::CodecConfig:
++        case ScreenStreamProtocol::FrameKind::VideoAccessUnit: {
++            const bool isKey = (frame.kind == ScreenStreamProtocol::FrameKind::CodecConfig)
++                || ((frame.flags & ScreenStreamProtocol::FlagKeyframe) != 0);
++            m_decoder->pushAccessUnit(frame.payload, frame.ptsUs, isKey);
++            break;
++        }
++        case ScreenStreamProtocol::FrameKind::AudioPcmChunk:
++            m_audioPlayer->writePcm(frame.payload);
++            break;
++        case ScreenStreamProtocol::FrameKind::ControlEos:
++            onSocketDisconnected();
++            return;
++        }
++    }
++}
++
++void ViewerWindow::onSocketDisconnected()
++{
++    m_sessionActive = false;
++    updateBannerAndInputGate();
++    m_audioPlayer->stop();
++}
++
++void ViewerWindow::onFrameDecoded(const QImage &frame)
++{
++    if (!frame.isNull() && frame.size() != m_lastFrameSize) {
++        m_lastFrameSize = frame.size();
++        m_canvas->setFrame(frame);
++        fitWindowToStream(false);
++        return;
++    }
++    m_canvas->setFrame(frame);
++}
++
++void ViewerWindow::onDecoderError(const QString &message)
++{
++    m_decoderError = message;
++    updateBannerAndInputGate();
++}
++
++void ViewerWindow::onStopClicked()
++{
++    m_sessionActive = false;
++    updateBannerAndInputGate();
++    if (m_screenstreamIface && m_screenstreamIface->isValid()) {
++        m_screenstreamIface->asyncCall(QStringLiteral("stopStream"));
++    }
++    close();
++}
++
++void ViewerWindow::onMuteToggled(bool checked)
++{
++    m_audioPlayer->setMuted(checked);
++}
++
++void ViewerWindow::onKeyframeClicked()
++{
++    if (m_screenstreamIface && m_screenstreamIface->isValid()) {
++        m_screenstreamIface->asyncCall(QStringLiteral("requestKeyframe"));
++    }
++}
++
++void ViewerWindow::onFitWindowClicked()
++{
++    fitWindowToStream(true);
++}
++
++void ViewerWindow::onClipboardClicked()
++{
++    if (m_clipboardIface && m_clipboardIface->isValid()) {
++        m_clipboardIface->asyncCall(QStringLiteral("sendClipboard"));
++    }
++}
++
++void ViewerWindow::onShareFileClicked()
++{
++    if (!m_shareIface || !m_shareIface->isValid()) {
++        return;
++    }
++    const QList<QUrl> urls = QFileDialog::getOpenFileUrls(
++        this,
++        i18n("Select Files to Send to Android"),
++        QUrl::fromLocalFile(QStandardPaths::writableLocation(QStandardPaths::HomeLocation)));
++    if (urls.isEmpty()) {
++        return;
++    }
++    QStringList rawUrls;
++    rawUrls.reserve(urls.size());
++    for (const QUrl &url : urls) {
++        rawUrls.append(url.toString());
++    }
++    m_shareIface->asyncCall(QStringLiteral("shareUrls"), rawUrls);
++}
++
++void ViewerWindow::onDbusGeometryChanged(int width, int height, int rotation)
++{
++    Q_UNUSED(rotation)
++    if (width > 1 && height > 1) {
++        m_displaySize = QSize(width, height);
++        m_canvas->setRemoteDisplaySize(m_displaySize);
++        if (m_screenstreamIface && m_screenstreamIface->isValid()) {
++            const int sw = m_screenstreamIface->property("streamWidth").toInt();
++            const int sh = m_screenstreamIface->property("streamHeight").toInt();
++            if (sw > 1 && sh > 1) {
++                m_streamSize = QSize(sw, sh);
++            }
++        }
++        if (m_streamSize.isValid() && (width > height) != (m_streamSize.width() > m_streamSize.height())) {
++            m_streamSize = QSize();
++        }
++        if (m_lastFrameSize.isValid() && (width > height) != (m_lastFrameSize.width() > m_lastFrameSize.height())) {
++            m_lastFrameSize = QSize();
++        }
++        fitWindowToStream(false);
++    }
++}
++
++void ViewerWindow::onDbusAudioStatusChanged(bool available, const QString &reason)
++{
++    m_audioAvailable = available;
++    m_audioReason = reason;
++    updateBannerAndInputGate();
++}
++
++void ViewerWindow::onDbusStateChanged()
++{
++    refreshDbusProperties();
++}
++
++void ViewerWindow::onDbusStreamingChanged(bool streaming)
++{
++    m_sessionActive = streaming;
++    updateBannerAndInputGate();
++    if (!streaming) {
++        m_audioPlayer->stop();
++    }
++}
++
++void ViewerWindow::closeEvent(QCloseEvent *event)
++{
++    if (m_sessionActive && m_screenstreamIface && m_screenstreamIface->isValid()) {
++        m_sessionActive = false;
++        m_screenstreamIface->call(QDBus::NoBlock, QStringLiteral("stopStream"));
++    }
++    m_audioPlayer->stop();
++    m_decoder->shutdown();
++    QMainWindow::closeEvent(event);
++}
++
++#include "moc_viewerwindow.cpp"
+diff --git a/plugins/screenstream/viewer/viewerwindow.h b/plugins/screenstream/viewer/viewerwindow.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..3dc9defedd2c3a5a88be82e42a7cca9f3a729dc1
+--- /dev/null
++++ b/plugins/screenstream/viewer/viewerwindow.h
+@@ -0,0 +1,150 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QImage>
++#include <QMainWindow>
++#include <QPointF>
++#include <QSize>
++#include <QString>
++#include <QWidget>
++
++#include "screenstreamprotocol.h"
++
++class ScreenStreamVideoDecoder;
++class PcmPlayer;
++class QAction;
++class QCloseEvent;
++class QDBusInterface;
++class QKeyEvent;
++class QLabel;
++class QLocalSocket;
++class QMouseEvent;
++class QPaintEvent;
++class QToolBar;
++class QWheelEvent;
++
++struct ViewerLaunchConfig {
++    QString deviceId;
++    QString deviceName;
++    QString socketPath;
++    int displayWidth = 0;
++    int displayHeight = 0;
++    int streamWidth = 0;
++    int streamHeight = 0;
++    int rotation = 0;
++};
++
++class ScreenCanvasWidget : public QWidget
++{
++    Q_OBJECT
++
++public:
++    explicit ScreenCanvasWidget(QWidget *parent = nullptr);
++
++    void setFrame(const QImage &frame);
++    void setRemoteDisplaySize(const QSize &size);
++    void setInputEnabled(bool enabled);
++
++Q_SIGNALS:
++    void pointerMoved(const QPoint &remotePos);
++    void pointerClicked(const QPoint &remotePos);
++    void dragStarted(const QPoint &remotePos);
++    void dragEnded(const QPoint &remotePos);
++    void rightClicked();
++    void middleClicked();
++    void wheelScrolled(int dx, int dy);
++    void keyEventCaptured(const QVariantMap &keyEvent);
++
++protected:
++    void paintEvent(QPaintEvent *event) override;
++    void mousePressEvent(QMouseEvent *event) override;
++    void mouseMoveEvent(QMouseEvent *event) override;
++    void mouseReleaseEvent(QMouseEvent *event) override;
++    void wheelEvent(QWheelEvent *event) override;
++    void keyPressEvent(QKeyEvent *event) override;
++
++private:
++    std::optional<QPoint> mapEventPos(const QPointF &pos) const;
++
++    QImage m_frame;
++    QSize m_remoteDisplaySize;
++    QPointF m_pressPos;
++    bool m_leftButtonDown = false;
++    bool m_dragging = false;
++    bool m_inputEnabled = false;
++};
++
++class ViewerWindow : public QMainWindow
++{
++    Q_OBJECT
++
++public:
++    explicit ViewerWindow(const ViewerLaunchConfig &config, QWidget *parent = nullptr);
++    ~ViewerWindow() override;
++
++protected:
++    void closeEvent(QCloseEvent *event) override;
++
++private Q_SLOTS:
++    void onSocketConnected();
++    void onSocketReadyRead();
++    void onSocketDisconnected();
++    void onFrameDecoded(const QImage &frame);
++    void onDecoderError(const QString &message);
++
++    void onStopClicked();
++    void onMuteToggled(bool checked);
++    void onKeyframeClicked();
++    void onFitWindowClicked();
++    void onClipboardClicked();
++    void onShareFileClicked();
++
++    void onDbusGeometryChanged(int width, int height, int rotation);
++    void onDbusAudioStatusChanged(bool available, const QString &reason);
++    void onDbusStateChanged();
++    void onDbusStreamingChanged(bool streaming);
++
++private:
++    void setupUi();
++    void setupDbus();
++    void refreshDbusProperties();
++    void updateBannerAndInputGate();
++    QSize effectiveStreamSize() const;
++    void fitWindowToStream(bool force = false);
++    void sendRemoteControlCommand(const QVariantMap &body);
++
++    ViewerLaunchConfig m_config;
++    ScreenStreamProtocol::ScreenStreamFrameParser m_parser;
++
++    ScreenStreamVideoDecoder *m_decoder = nullptr;
++    PcmPlayer *m_audioPlayer = nullptr;
++    QLocalSocket *m_socket = nullptr;
++    ScreenCanvasWidget *m_canvas = nullptr;
++    QToolBar *m_toolbar = nullptr;
++    QLabel *m_banner = nullptr;
++    QAction *m_muteAction = nullptr;
++    QAction *m_backAction = nullptr;
++    QAction *m_homeAction = nullptr;
++    QAction *m_recentsAction = nullptr;
++
++    QDBusInterface *m_screenstreamIface = nullptr;
++    QDBusInterface *m_remoteControlIface = nullptr;
++    QDBusInterface *m_remoteKeyboardIface = nullptr;
++    QDBusInterface *m_clipboardIface = nullptr;
++    QDBusInterface *m_shareIface = nullptr;
++
++    bool m_sessionActive = true;
++    bool m_accessibilityEnabled = false;
++    bool m_audioAvailable = false;
++    bool m_protectedContentActive = false;
++    QString m_audioReason;
++    QString m_decoderError;
++    QSize m_displaySize;
++    QSize m_streamSize;
++    QSize m_lastFrameSize;
++};
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f3ab3ac91a4651b6d9125a9c0d76181063bff85b..08af421f978c7180c57ed2a82663b4832c1c9277 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -24,6 +24,10 @@ target_sources(sendfiletest PRIVATE testdevice.cpp)
+ ecm_add_test(smshelpertest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+ ecm_add_test(lanratelimittest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+ ecm_add_test(lanipv6test.cpp LINK_LIBRARIES ${kdeconnect_libraries})
++if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
++    ecm_add_test(screenstreamtest.cpp LINK_LIBRARIES ${kdeconnect_libraries} kdeconnectscreenstreamcommon)
++    set_tests_properties(screenstreamtest PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
++endif()
+ if (WIN32 OR APPLE)
+     ecm_add_test(mdnstest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+ endif()
+diff --git a/tests/screenstreamtest.cpp b/tests/screenstreamtest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..735537bc647a04171f212daf4aaf5a4e4898cabd
+--- /dev/null
++++ b/tests/screenstreamtest.cpp
+@@ -0,0 +1,285 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include <KPluginMetaData>
++#include <QHostAddress>
++#include <QList>
++#include <QPointer>
++#include <QStandardPaths>
++#include <QTcpServer>
++#include <QTcpSocket>
++#include <QTest>
++#include <QtEndian>
++
++#include "plugins/screenstream/screenstreamprotocol.h"
++
++using namespace ScreenStreamProtocol;
++
++class ScreenStreamTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void initTestCase()
++    {
++        QStandardPaths::setTestModeEnabled(true);
++    }
++
++    void testFrameRoundtripAndChunkSplits()
++    {
++        const QByteArray spsPps = QByteArrayLiteral("\x00\x00\x00\x01\x67\x42\x00\x1e\x00\x00\x00\x01\x68\xce\x38\x80");
++        const QByteArray idr = QByteArrayLiteral("\x00\x00\x00\x01\x65\x88\x84\x21");
++        const QByteArray pcm(1920, '\x2a');
++
++        QByteArray combined;
++        combined.append(encodeScreenStreamFrame(FrameKind::CodecConfig, FlagNone, 1000ULL, spsPps));
++        combined.append(encodeScreenStreamFrame(FrameKind::VideoAccessUnit, FlagKeyframe | FlagProtectedContent, 2000ULL, idr));
++        combined.append(encodeScreenStreamFrame(FrameKind::AudioPcmChunk, FlagNone, 3000ULL, pcm));
++        combined.append(encodeScreenStreamFrame(FrameKind::ControlEos, FlagNone, 4000ULL, {}));
++
++        ScreenStreamFrameParser parser;
++        QList<ScreenStreamFrame> frames;
++        for (qsizetype i = 0; i < combined.size(); ++i) {
++            QVERIFY(parser.feed(combined.mid(i, 1), &frames));
++        }
++
++        QVERIFY(!parser.hasError());
++        QCOMPARE(frames.size(), 4);
++
++        QCOMPARE(frames[0].kind, FrameKind::CodecConfig);
++        QCOMPARE(frames[0].flags, static_cast<quint8>(FlagNone));
++        QCOMPARE(frames[0].ptsUs, quint64(1000));
++        QCOMPARE(frames[0].payload, spsPps);
++
++        QCOMPARE(frames[1].kind, FrameKind::VideoAccessUnit);
++        QCOMPARE(frames[1].flags, static_cast<quint8>(FlagKeyframe | FlagProtectedContent));
++        QCOMPARE(frames[1].ptsUs, quint64(2000));
++        QCOMPARE(frames[1].payload, idr);
++
++        QCOMPARE(frames[2].kind, FrameKind::AudioPcmChunk);
++        QCOMPARE(frames[2].flags, static_cast<quint8>(FlagNone));
++        QCOMPARE(frames[2].ptsUs, quint64(3000));
++        QCOMPARE(frames[2].payload, pcm);
++
++        QCOMPARE(frames[3].kind, FrameKind::ControlEos);
++        QCOMPARE(frames[3].flags, static_cast<quint8>(FlagNone));
++        QCOMPARE(frames[3].ptsUs, quint64(4000));
++        QVERIFY(frames[3].payload.isEmpty());
++    }
++
++    void testFrameParserRejectsMalformedHeaders()
++    {
++        auto makeHeader = [](quint16 magic, quint8 kind, quint8 flags, quint32 len, quint64 pts) {
++            QByteArray hdr(kScreenStreamHeaderBytes, '\0');
++            auto *dst = reinterpret_cast<uchar *>(hdr.data());
++            qToBigEndian<quint16>(magic, dst);
++            dst[2] = kind;
++            dst[3] = flags;
++            qToBigEndian<quint32>(len, dst + 4);
++            qToBigEndian<quint64>(pts, dst + 8);
++            return hdr;
++        };
++
++        {
++            ScreenStreamFrameParser parser;
++            QList<ScreenStreamFrame> out;
++            QVERIFY(!parser.feed(makeHeader(0x1234, 0x02, 0x00, 4, 0), &out));
++            QVERIFY(parser.hasError());
++            QVERIFY(out.isEmpty());
++        }
++        {
++            ScreenStreamFrameParser parser;
++            QList<ScreenStreamFrame> out;
++            QVERIFY(!parser.feed(makeHeader(kScreenStreamMagic, 0x09, 0x00, 0, 0), &out));
++            QVERIFY(parser.hasError());
++        }
++        {
++            ScreenStreamFrameParser parser;
++            QList<ScreenStreamFrame> out;
++            QVERIFY(!parser.feed(makeHeader(kScreenStreamMagic, 0x04, 0x00, 1, 0), &out));
++            QVERIFY(parser.hasError());
++        }
++        {
++            ScreenStreamFrameParser parser;
++            QList<ScreenStreamFrame> out;
++            QVERIFY(!parser.feed(makeHeader(kScreenStreamMagic, 0x02, 0x00, kMaxVideoFrameBytes + 1U, 0), &out));
++            QVERIFY(parser.hasError());
++        }
++        {
++            ScreenStreamFrameParser parser;
++            QList<ScreenStreamFrame> out;
++            QVERIFY(!parser.feed(makeHeader(kScreenStreamMagic, 0x03, 0x00, kMaxAudioChunkBytes + 1U, 0), &out));
++            QVERIFY(parser.hasError());
++        }
++        {
++            ScreenStreamFrameParser parser;
++            QList<ScreenStreamFrame> out;
++            QVERIFY(!parser.feed(makeHeader(kScreenStreamMagic, 0x02, 0x04, 4, 0), &out));
++            QVERIFY(parser.hasError());
++        }
++    }
++
++    void testCoordinateMapperLetterboxPillarboxAndClamp()
++    {
++        // Portrait 1080x2460 stream in wide 1000x800 viewport -> centered vertically scaled rect with pillarbox bars.
++        const QSizeF wideViewport(1000.0, 800.0);
++        const QSize streamPortrait(540, 1230);
++        const QSize displayPortrait(1080, 2460);
++
++        const QRectF rendered = ScreenStreamCoordinateMapper::computeRenderedRect(wideViewport, streamPortrait);
++        QCOMPARE(rendered.height(), 800.0);
++        QVERIFY(rendered.left() > 0.0);
++
++        // Points in left/right pillarbox bars return std::nullopt.
++        QVERIFY(!ScreenStreamCoordinateMapper::mapViewportToRemote(QPointF(5.0, 400.0), wideViewport, streamPortrait, displayPortrait).has_value());
++        QVERIFY(!ScreenStreamCoordinateMapper::mapViewportToRemote(QPointF(995.0, 400.0), wideViewport, streamPortrait, displayPortrait).has_value());
++
++        // Top-left corner inside rendered rect clamps to >= (1, 1) to avoid MouseReceiverPlugin (0, 0) no-op.
++        const auto topLeft = ScreenStreamCoordinateMapper::mapViewportToRemote(rendered.topLeft(), wideViewport, streamPortrait, displayPortrait);
++        QVERIFY(topLeft.has_value());
++        QCOMPARE(*topLeft, QPoint(1, 1));
++
++        // Center maps near display center.
++        const auto center = ScreenStreamCoordinateMapper::mapViewportToRemote(rendered.center(), wideViewport, streamPortrait, displayPortrait);
++        QVERIFY(center.has_value());
++        QVERIFY(qAbs(center->x() - 540) <= 2);
++        QVERIFY(qAbs(center->y() - 1230) <= 2);
++
++        // Landscape rotation case: 1920x840 inside 800x1000 viewport (letterbox top/bottom bars) clamps inside [1, w-1] x [1, h-1].
++        const QSizeF tallViewport(800.0, 1000.0);
++        const QSize streamLandscape(1920, 840);
++        const QSize displayLandscape(2460, 1080);
++        const QRectF landRect = ScreenStreamCoordinateMapper::computeRenderedRect(tallViewport, streamLandscape);
++        QVERIFY(landRect.top() > 0.0);
++        QVERIFY(!ScreenStreamCoordinateMapper::mapViewportToRemote(QPointF(400.0, 5.0), tallViewport, streamLandscape, displayLandscape).has_value());
++
++        const QPointF bottomRightInside(landRect.right() - 0.001, landRect.bottom() - 0.001);
++        const auto br = ScreenStreamCoordinateMapper::mapViewportToRemote(bottomRightInside, tallViewport, streamLandscape, displayLandscape);
++        QVERIFY(br.has_value());
++        QCOMPARE(*br, QPoint(displayLandscape.width() - 1, displayLandscape.height() - 1));
++    }
++
++    void testComputeTargetCanvasSizeAutoFit()
++    {
++        QCOMPARE(ScreenStreamCoordinateMapper::computeTargetCanvasSize(QSize(864, 1920), QSize(1088, 602)), QSize(271, 602));
++        QCOMPARE(ScreenStreamCoordinateMapper::computeTargetCanvasSize(QSize(1920, 864), QSize(1088, 602)), QSize(1088, 490));
++        QCOMPARE(ScreenStreamCoordinateMapper::computeTargetCanvasSize(QSize(360, 640), QSize(1600, 1000)), QSize(360, 640));
++        QCOMPARE(ScreenStreamCoordinateMapper::computeTargetCanvasSize(QSize(120, 200), QSize(1000, 1000), QSize(240, 240)), QSize(240, 400));
++        QVERIFY(!ScreenStreamCoordinateMapper::computeTargetCanvasSize(QSize(0, 100), QSize(1000, 1000)).isValid());
++    }
++
++    void testSessionStateMachineAndReconnectSuppression()
++    {
++        ScreenStreamSessionMachine sm;
++        sm.configure(true, false);
++        QVERIFY(sm.shouldAutoStartOnConnect());
++        QVERIFY(!sm.canForwardInput());
++
++        sm.onExplicitStart();
++        QCOMPARE(sm.state(), ScreenStreamSessionMachine::State::AwaitingConsent);
++        QVERIFY(!sm.canForwardInput());
++
++        sm.onPeerState(ScreenStreamSessionMachine::State::Streaming, false);
++        QCOMPARE(sm.state(), ScreenStreamSessionMachine::State::Streaming);
++        QVERIFY(!sm.canForwardInput());
++
++        sm.setRemoteControlAllowed(true);
++        QVERIFY(sm.canForwardInput());
++
++        // Accidental transport loss with autoStart enabled schedules bounded reconnect delays (2s, 4s, 8s, then stop).
++        sm.onTransportLost();
++        QCOMPARE(sm.state(), ScreenStreamSessionMachine::State::Idle);
++        QVERIFY(!sm.canForwardInput());
++        QCOMPARE(sm.consumeReconnectDelayMs(), 2000);
++        sm.onReconnectStart();
++        QCOMPARE(sm.state(), ScreenStreamSessionMachine::State::AwaitingConsent);
++        sm.onTransportLost();
++        QCOMPARE(sm.consumeReconnectDelayMs(), 4000);
++        sm.onReconnectStart();
++        QCOMPARE(sm.state(), ScreenStreamSessionMachine::State::AwaitingConsent);
++        sm.onTransportLost();
++        QCOMPARE(sm.consumeReconnectDelayMs(), 8000);
++        sm.onReconnectStart();
++        QCOMPARE(sm.state(), ScreenStreamSessionMachine::State::AwaitingConsent);
++        sm.onTransportLost();
++        QCOMPARE(sm.consumeReconnectDelayMs(), -1);
++
++        // Explicit stop persists across reconnect and suppresses auto-start until manual start.
++        sm.onExplicitStart();
++        sm.onPeerState(ScreenStreamSessionMachine::State::Streaming, false);
++        QVERIFY(sm.canForwardInput());
++        sm.onLocalExplicitStop();
++        QCOMPARE(sm.state(), ScreenStreamSessionMachine::State::Stopped);
++        QVERIFY(sm.explicitStop());
++        QVERIFY(!sm.canForwardInput());
++        QVERIFY(!sm.shouldAutoStartOnConnect());
++        QCOMPARE(sm.consumeReconnectDelayMs(), -1);
++
++        // Simulated disconnect/reconnect cycle keeping persisted explicitStop=true.
++        ScreenStreamSessionMachine reconnected;
++        reconnected.configure(true, sm.explicitStop());
++        QVERIFY(!reconnected.shouldAutoStartOnConnect());
++        QCOMPARE(reconnected.consumeReconnectDelayMs(), -1);
++    }
++
++    void testSafePayloadReleaseDuringSignalEmission()
++    {
++        QTcpServer server;
++        QVERIFY(server.listen(QHostAddress::LocalHost, 0));
++
++        auto client = QSharedPointer<QTcpSocket>::create();
++        client->connectToHost(QHostAddress::LocalHost, server.serverPort());
++        QVERIFY(server.waitForNewConnection(2000));
++        QTcpSocket *peer = server.nextPendingConnection();
++        QVERIFY(peer != nullptr);
++        QVERIFY(client->waitForConnected(2000));
++
++        QObject::connect(client.data(), &QAbstractSocket::disconnected, client.data(), &QAbstractSocket::readChannelFinished);
++        QSharedPointer<QIODevice> payload = client;
++        client.reset();
++        QPointer<QIODevice> guard(payload.data());
++
++        QObject receiver;
++        bool trailingSlotSawAliveSender = false;
++        QObject::connect(payload.data(), &QIODevice::readChannelFinished, &receiver, [&payload, &receiver]() {
++            releaseStreamPayloadSafely(payload, &receiver);
++        });
++        auto *absSock = qobject_cast<QAbstractSocket *>(payload.data());
++        QVERIFY(absSock != nullptr);
++        QObject::connect(absSock, &QAbstractSocket::disconnected, &receiver, [&payload, &receiver]() {
++            releaseStreamPayloadSafely(payload, &receiver);
++        });
++        QObject::connect(payload.data(), &QIODevice::readChannelFinished, this, [&trailingSlotSawAliveSender, &guard]() {
++            trailingSlotSawAliveSender = !guard.isNull();
++        });
++
++        peer->abort();
++        QTRY_VERIFY(payload.isNull());
++        QVERIFY(trailingSlotSawAliveSender);
++        QTRY_VERIFY(guard.isNull());
++    }
++
++    void testPluginMetadataDiscovery()
++    {
++        const QList<KPluginMetaData> plugins = KPluginMetaData::findPlugins(QStringLiteral("kdeconnect"));
++        bool found = false;
++        for (const KPluginMetaData &meta : plugins) {
++            if (meta.pluginId() == QLatin1String("kdeconnect_screenstream")) {
++                found = true;
++                const QStringList incoming = meta.value(QStringLiteral("X-KdeConnect-SupportedPacketType"), QStringList());
++                const QStringList outgoing = meta.value(QStringLiteral("X-KdeConnect-OutgoingPacketType"), QStringList());
++                QVERIFY(incoming.contains(QStringLiteral("kdeconnect.screenstream")));
++                QVERIFY(outgoing.contains(QStringLiteral("kdeconnect.screenstream.request")));
++                break;
++            }
++        }
++        QVERIFY(found);
++    }
++};
++
++QTEST_MAIN(ScreenStreamTest)
++
++#include "screenstreamtest.moc"

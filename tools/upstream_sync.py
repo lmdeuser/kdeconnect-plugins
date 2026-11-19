@@ -189,6 +189,7 @@ def run_git_hardened(
     check: bool = True,
     timeout: int = 300,
     extra_config: tuple[tuple[str, str], ...] = (),
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess:
     """Run Git with hardened flags and a scrubbed environment."""
     config_args: list[str] = []
@@ -198,9 +199,12 @@ def run_git_hardened(
     prefix_args = config_args + list(git_args)
     cmd = build_hardened_git_command(repo_dir, *prefix_args, allow_file_protocol=allow_file_protocol)
     allow_proto = "https:file" if allow_file_protocol else "https"
+    env = build_scrubbed_env(allow_protocol=allow_proto)
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         cmd,
-        env=build_scrubbed_env(allow_protocol=allow_proto),
+        env=env,
         capture_output=True,
         text=True,
         check=check,

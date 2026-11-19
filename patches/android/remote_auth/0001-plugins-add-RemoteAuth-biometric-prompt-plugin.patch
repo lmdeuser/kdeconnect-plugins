@@ -1,0 +1,605 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:51:34 +0500
+Subject: [PATCH 1/2] plugins: add RemoteAuth biometric prompt plugin
+
+
+diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
+index 8bf7ff8c5a43384bd29a33261942d580d5b4e0ce..50f740ea47319e248564ca14346792274938e6ac 100644
+--- a/src/main/AndroidManifest.xml
++++ b/src/main/AndroidManifest.xml
+@@ -39,6 +39,7 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
++    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+     <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+@@ -287,6 +288,13 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+                 android:name="android.support.PARENT_ACTIVITY"
+                 android:value="org.kde.kdeconnect.ui.MainActivity" />
+         </activity>
++        <activity
++            android:name="org.kde.kdeconnect.plugins.remoteauth.RemoteAuthPromptActivity"
++            android:exported="false"
++            android:excludeFromRecents="true"
++            android:noHistory="true"
++            android:theme="@style/Theme.Transparent"
++            tools:targetApi="r" />
+         <activity
+             android:name="org.kde.kdeconnect.plugins.mousepad.MousePadActivity"
+             android:label="@string/pref_plugin_mousepad"
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPlugin.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..59f53d84dfea13aeb66d3c38769e33734555e98c
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPlugin.kt
+@@ -0,0 +1,167 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.remoteauth
++
++import android.Manifest
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import androidx.annotation.RequiresApi
++import androidx.core.app.NotificationCompat
++import androidx.core.content.getSystemService
++import org.kde.kdeconnect.NetworkPacket
++import org.kde.kdeconnect.helpers.NotificationHelper
++import org.kde.kdeconnect.plugins.Plugin
++import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
++import org.kde.kdeconnect_tp.R
++import kotlin.math.abs
++
++@LoadablePlugin
++@RequiresApi(Build.VERSION_CODES.R)
++class RemoteAuthPlugin : Plugin() {
++
++    private val mainHandler = Handler(Looper.getMainLooper())
++    private var activeChallenge: RemoteAuthProtocol.Challenge? = null
++    private var timeoutRunnable: Runnable? = null
++
++    override val minSdk: Int = Build.VERSION_CODES.R
++
++    override val displayName: String
++        get() = context.getString(R.string.pref_plugin_remoteauth)
++
++    override val description: String
++        get() = context.getString(R.string.pref_plugin_remoteauth_desc)
++
++    override val supportedPacketTypes: Array<String>
++        get() = arrayOf(RemoteAuthProtocol.PACKET_TYPE_REMOTEAUTH_REQUEST)
++
++    override val outgoingPacketTypes: Array<String>
++        get() = arrayOf(RemoteAuthProtocol.PACKET_TYPE_REMOTEAUTH)
++
++    override val optionalPermissions: Array<String>
++        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            arrayOf(Manifest.permission.POST_NOTIFICATIONS)
++        } else {
++            emptyArray()
++        }
++
++    override fun onDestroy() {
++        cancelTimeout()
++        activeChallenge = null
++        cancelNotification()
++        super.onDestroy()
++    }
++
++    override fun onPacketReceived(np: NetworkPacket): Boolean {
++        if (np.type != RemoteAuthProtocol.PACKET_TYPE_REMOTEAUTH_REQUEST) {
++            return false
++        }
++        val challenge = RemoteAuthProtocol.parseChallenge(np) ?: return false
++
++        synchronized(this) {
++            cancelTimeoutLocked()
++            activeChallenge = challenge
++            val expireTask = Runnable {
++                submitPromptResult(
++                    challengeId = challenge.challengeId,
++                    nonceBase64 = challenge.nonceBase64,
++                    approved = false,
++                    authType = "denied",
++                )
++            }
++            timeoutRunnable = expireTask
++            mainHandler.postDelayed(expireTask, challenge.ttlMs.toLong())
++        }
++
++        postPromptNotification(challenge)
++        return true
++    }
++
++    fun submitPromptResult(
++        challengeId: String,
++        nonceBase64: String,
++        approved: Boolean,
++        authType: String,
++    ) {
++        synchronized(this) {
++            val current = activeChallenge ?: return
++            if (current.challengeId != challengeId) {
++                return
++            }
++            activeChallenge = null
++            cancelTimeoutLocked()
++        }
++
++        cancelNotification()
++        val packet = RemoteAuthProtocol.buildResponsePacket(
++            challengeId = challengeId,
++            nonceBase64 = nonceBase64,
++            approved = approved,
++            authType = authType,
++        )
++        device.sendPacket(packet)
++    }
++
++    private fun postPromptNotification(challenge: RemoteAuthProtocol.Challenge) {
++        val nm = context.getSystemService<NotificationManager>() ?: return
++        val promptIntent = RemoteAuthPromptActivity.createIntent(
++            context = context,
++            deviceId = device.deviceId,
++            deviceName = device.name,
++            challenge = challenge,
++        )
++        val pending = PendingIntent.getActivity(
++            context,
++            notificationId(),
++            promptIntent,
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
++        )
++        val body = if (challenge.purpose == "unlock") {
++            context.getString(R.string.remoteauth_notif_body_unlock)
++        } else {
++            context.getString(R.string.remoteauth_notif_body_confirm, challenge.summary)
++        }
++        val notification = NotificationCompat.Builder(context, NotificationHelper.Channels.HIGHPRIORITY)
++            .setSmallIcon(R.drawable.ic_key)
++            .setContentTitle(context.getString(R.string.remoteauth_notif_title, device.name))
++            .setContentText(body)
++            .setPriority(NotificationCompat.PRIORITY_HIGH)
++            .setCategory(NotificationCompat.CATEGORY_CALL)
++            .setAutoCancel(true)
++            .setTimeoutAfter(challenge.ttlMs.toLong())
++            .setContentIntent(pending)
++            .setFullScreenIntent(pending, true)
++            .build()
++
++        nm.notify(notificationId(), notification)
++    }
++
++    private fun cancelNotification() {
++        context.getSystemService<NotificationManager>()?.cancel(notificationId())
++    }
++
++    private fun notificationId(): Int {
++        return NOTIFICATION_ID_BASE + (abs(device.deviceId.hashCode()) % 10000)
++    }
++
++    private fun cancelTimeout() {
++        synchronized(this) {
++            cancelTimeoutLocked()
++        }
++    }
++
++    private fun cancelTimeoutLocked() {
++        timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
++        timeoutRunnable = null
++    }
++
++    companion object {
++        private const val NOTIFICATION_ID_BASE = 48100
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPromptActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPromptActivity.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb361a325c21a0c6ae60069424c0aee0ad88a4ea
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPromptActivity.kt
+@@ -0,0 +1,147 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.remoteauth
++
++import android.content.Context
++import android.content.Intent
++import android.hardware.biometrics.BiometricManager
++import android.hardware.biometrics.BiometricPrompt
++import android.os.Build
++import android.os.Bundle
++import android.os.CancellationSignal
++import android.os.Handler
++import android.os.Looper
++import androidx.annotation.RequiresApi
++import androidx.appcompat.app.AppCompatActivity
++import org.kde.kdeconnect.KdeConnect
++import org.kde.kdeconnect_tp.R
++
++@RequiresApi(Build.VERSION_CODES.R)
++class RemoteAuthPromptActivity : AppCompatActivity() {
++
++    private var deviceId: String = ""
++    private var challengeId: String = ""
++    private var nonceBase64: String = ""
++    private var delivered: Boolean = false
++    private val mainHandler = Handler(Looper.getMainLooper())
++    private var cancellationSignal: CancellationSignal? = null
++    private val timeoutRunnable = Runnable {
++        cancellationSignal?.cancel()
++        deliverOutcome(approved = false, authType = "denied")
++        finish()
++    }
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        setTurnScreenOn(true)
++        super.onCreate(savedInstanceState)
++
++        deviceId = intent.getStringExtra(EXTRA_DEVICE_ID).orEmpty()
++        challengeId = intent.getStringExtra(EXTRA_CHALLENGE_ID).orEmpty()
++        nonceBase64 = intent.getStringExtra(EXTRA_NONCE_B64).orEmpty()
++        val purpose = intent.getStringExtra(EXTRA_PURPOSE) ?: "confirm"
++        val summary = intent.getStringExtra(EXTRA_SUMMARY).orEmpty()
++        val deviceName = intent.getStringExtra(EXTRA_DEVICE_NAME).orEmpty().ifEmpty { "KDE Connect" }
++        val ttlMs = intent.getIntExtra(EXTRA_TTL_MS, RemoteAuthProtocol.DEFAULT_TTL_MS)
++            .coerceIn(RemoteAuthProtocol.MIN_TTL_MS, RemoteAuthProtocol.MAX_TTL_MS)
++
++        if (deviceId.isEmpty() || challengeId.isEmpty() || nonceBase64.isEmpty()) {
++            finish()
++            return
++        }
++
++        val authenticators =
++            BiometricManager.Authenticators.BIOMETRIC_STRONG or
++                BiometricManager.Authenticators.DEVICE_CREDENTIAL
++        val bm = getSystemService(BiometricManager::class.java)
++        if (bm == null || bm.canAuthenticate(authenticators) != BiometricManager.BIOMETRIC_SUCCESS) {
++            deliverOutcome(approved = false, authType = "denied")
++            finish()
++            return
++        }
++
++        val title = if (purpose == "unlock") {
++            getString(R.string.remoteauth_prompt_title_unlock, deviceName)
++        } else {
++            getString(R.string.remoteauth_prompt_title_confirm, deviceName)
++        }
++
++        val prompt = BiometricPrompt.Builder(this)
++            .setTitle(title)
++            .setSubtitle(getString(R.string.remoteauth_prompt_subtitle, deviceName))
++            .setDescription(summary)
++            .setAllowedAuthenticators(authenticators)
++            .build()
++
++        val signal = CancellationSignal()
++        cancellationSignal = signal
++        mainHandler.postDelayed(timeoutRunnable, ttlMs.toLong())
++
++        prompt.authenticate(
++            signal,
++            mainExecutor,
++            object : BiometricPrompt.AuthenticationCallback() {
++                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
++                    val authType = when (result.authenticationType) {
++                        BiometricPrompt.AUTHENTICATION_RESULT_TYPE_DEVICE_CREDENTIAL -> "credential"
++                        else -> "biometric"
++                    }
++                    deliverOutcome(approved = true, authType = authType)
++                    finish()
++                }
++
++                override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
++                    deliverOutcome(approved = false, authType = "denied")
++                    finish()
++                }
++            },
++        )
++    }
++
++    override fun onDestroy() {
++        mainHandler.removeCallbacks(timeoutRunnable)
++        cancellationSignal?.cancel()
++        cancellationSignal = null
++        super.onDestroy()
++    }
++
++    private fun deliverOutcome(approved: Boolean, authType: String) {
++        if (delivered) {
++            return
++        }
++        delivered = true
++        mainHandler.removeCallbacks(timeoutRunnable)
++        KdeConnect.getInstance()
++            .getDevicePlugin(deviceId, RemoteAuthPlugin::class.java)
++            ?.submitPromptResult(challengeId, nonceBase64, approved, authType)
++    }
++
++    companion object {
++        private const val EXTRA_DEVICE_ID = "deviceId"
++        private const val EXTRA_DEVICE_NAME = "deviceName"
++        private const val EXTRA_CHALLENGE_ID = "challengeId"
++        private const val EXTRA_NONCE_B64 = "nonceBase64"
++        private const val EXTRA_PURPOSE = "purpose"
++        private const val EXTRA_SUMMARY = "summary"
++        private const val EXTRA_TTL_MS = "ttlMs"
++
++        fun createIntent(
++            context: Context,
++            deviceId: String,
++            deviceName: String,
++            challenge: RemoteAuthProtocol.Challenge,
++        ): Intent = Intent(context, RemoteAuthPromptActivity::class.java).apply {
++            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++            putExtra(EXTRA_DEVICE_ID, deviceId)
++            putExtra(EXTRA_DEVICE_NAME, deviceName)
++            putExtra(EXTRA_CHALLENGE_ID, challenge.challengeId)
++            putExtra(EXTRA_NONCE_B64, challenge.nonceBase64)
++            putExtra(EXTRA_PURPOSE, challenge.purpose)
++            putExtra(EXTRA_SUMMARY, challenge.summary)
++            putExtra(EXTRA_TTL_MS, challenge.ttlMs)
++        }
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocol.kt b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocol.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..9b3dcd01b0813c98c5a861a63726be6c1675abae
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocol.kt
+@@ -0,0 +1,142 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.remoteauth
++
++import org.kde.kdeconnect.NetworkPacket
++
++object RemoteAuthProtocol {
++    const val PACKET_TYPE_REMOTEAUTH_REQUEST = "kdeconnect.remoteauth.request"
++    const val PACKET_TYPE_REMOTEAUTH = "kdeconnect.remoteauth"
++
++    const val NONCE_BYTES = 32
++    const val DEFAULT_TTL_MS = 30_000
++    const val MIN_TTL_MS = 5_000
++    const val MAX_TTL_MS = 60_000
++    const val MAX_SUMMARY_LENGTH = 240
++    const val MIN_CHALLENGE_ID_LENGTH = 8
++    const val MAX_CHALLENGE_ID_LENGTH = 128
++
++    private val CHALLENGE_ID_REGEX = Regex("^[A-Za-z0-9_-]{8,128}$")
++
++    data class Challenge(
++        val challengeId: String,
++        val nonceBase64: String,
++        val purpose: String,
++        val summary: String,
++        val ttlMs: Int,
++    )
++
++    fun parseChallenge(np: NetworkPacket): Challenge? {
++        val challengeId = np.getStringOrNull("challengeId")?.trim() ?: return null
++        if (!CHALLENGE_ID_REGEX.matches(challengeId)) {
++            return null
++        }
++
++        val nonceBase64 = np.getStringOrNull("nonce")?.trim() ?: return null
++        val decoded = decodeBase64Strict(nonceBase64) ?: return null
++        if (decoded.size != NONCE_BYTES) {
++            return null
++        }
++
++        val purpose = np.getStringOrNull("purpose")?.trim() ?: return null
++        if (purpose != "confirm" && purpose != "unlock") {
++            return null
++        }
++
++        val summary = sanitizeSummary(np.getStringOrNull("summary"), purpose)
++        val rawTtl = np.getInt("ttlMs", DEFAULT_TTL_MS)
++        val ttlMs = if (rawTtl <= 0) DEFAULT_TTL_MS else rawTtl.coerceIn(MIN_TTL_MS, MAX_TTL_MS)
++
++        return Challenge(
++            challengeId = challengeId,
++            nonceBase64 = nonceBase64,
++            purpose = purpose,
++            summary = summary,
++            ttlMs = ttlMs,
++        )
++    }
++
++    fun sanitizeSummary(raw: String?, purpose: String): String {
++        val cleaned = buildString {
++            for (ch in raw.orEmpty()) {
++                if (ch.code < 0x20 || ch.code == 0x7F) {
++                    append(' ')
++                } else {
++                    append(ch)
++                }
++            }
++        }.trim().replace(Regex("\\s+"), " ")
++
++        val truncated = if (cleaned.length > MAX_SUMMARY_LENGTH) {
++            cleaned.substring(0, MAX_SUMMARY_LENGTH)
++        } else {
++            cleaned
++        }
++        if (truncated.isNotEmpty()) {
++            return truncated
++        }
++        return if (purpose == "unlock") "Unlock desktop session" else "Confirm desktop operation"
++    }
++
++    fun buildResponsePacket(
++        challengeId: String,
++        nonceBase64: String,
++        approved: Boolean,
++        authType: String,
++    ): NetworkPacket {
++        val safeAuthType = when (authType) {
++            "biometric", "credential", "denied" -> authType
++            else -> if (approved) "biometric" else "denied"
++        }
++        return NetworkPacket(PACKET_TYPE_REMOTEAUTH).apply {
++            set("challengeId", challengeId)
++            set("nonce", nonceBase64)
++            set("approved", approved)
++            set("authType", safeAuthType)
++        }
++    }
++
++    internal fun decodeBase64Strict(input: String): ByteArray? {
++        if (input.isEmpty() || input.length % 4 != 0) {
++            return null
++        }
++        val out = ArrayList<Byte>((input.length * 3) / 4)
++        var i = 0
++        while (i < input.length) {
++            val c0 = decodeBase64Char(input[i])
++            val c1 = decodeBase64Char(input[i + 1])
++            val ch2 = input[i + 2]
++            val ch3 = input[i + 3]
++            if (c0 < 0 || c1 < 0) return null
++
++            val c2 = if (ch2 == '=') -2 else decodeBase64Char(ch2)
++            val c3 = if (ch3 == '=') -2 else decodeBase64Char(ch3)
++            if (c2 == -1 || c3 == -1) return null
++            if (c2 == -2 && c3 != -2) return null
++            if ((c2 == -2 || c3 == -2) && i + 4 != input.length) return null
++
++            out.add((((c0 shl 2) or (c1 shr 4)) and 0xFF).toByte())
++            if (c2 >= 0) {
++                out.add((((c1 shl 4) or (c2 shr 2)) and 0xFF).toByte())
++                if (c3 >= 0) {
++                    out.add((((c2 shl 6) or c3) and 0xFF).toByte())
++                }
++            }
++            i += 4
++        }
++        return out.toByteArray()
++    }
++
++    private fun decodeBase64Char(ch: Char): Int = when (ch) {
++        in 'A'..'Z' -> ch.code - 'A'.code
++        in 'a'..'z' -> ch.code - 'a'.code + 26
++        in '0'..'9' -> ch.code - '0'.code + 52
++        '+' -> 62
++        '/' -> 63
++        else -> -1
++    }
++}
+diff --git a/src/main/res/values/strings_remote_auth.xml b/src/main/res/values/strings_remote_auth.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..0b1df33261de084b223d70acba74c8afab317727
+--- /dev/null
++++ b/src/main/res/values/strings_remote_auth.xml
+@@ -0,0 +1,16 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++
++SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++-->
++<resources>
++    <string name="pref_plugin_remoteauth">Remote biometric confirmation</string>
++    <string name="pref_plugin_remoteauth_desc">Approve sensitive desktop actions and session unlock using phone biometrics</string>
++    <string name="remoteauth_notif_title">Confirmation requested by %s</string>
++    <string name="remoteauth_notif_body_confirm">Tap to verify: %s</string>
++    <string name="remoteauth_notif_body_unlock">Tap to unlock desktop session</string>
++    <string name="remoteauth_prompt_title_confirm">Approve on %s</string>
++    <string name="remoteauth_prompt_title_unlock">Unlock %s</string>
++    <string name="remoteauth_prompt_subtitle">Requested by %s</string>
++</resources>
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocolTest.kt b/src/test/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocolTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..01384f380ac722eedbd307fa9e1395a36036b28f
+--- /dev/null
++++ b/src/test/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocolTest.kt
+@@ -0,0 +1,71 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.remoteauth
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.kde.kdeconnect.NetworkPacket
++import org.junit.Test
++import java.util.Base64
++
++class RemoteAuthProtocolTest {
++
++    private fun validNonceBase64(): String {
++        val bytes = ByteArray(RemoteAuthProtocol.NONCE_BYTES) { idx -> (idx + 1).toByte() }
++        return Base64.getEncoder().encodeToString(bytes)
++    }
++
++    @Test
++    fun parseChallengeAcceptsValidPacketAndClampsFields() {
++        val np = NetworkPacket(RemoteAuthProtocol.PACKET_TYPE_REMOTEAUTH_REQUEST).apply {
++            set("challengeId", "abc123def456")
++            set("nonce", validNonceBase64())
++            set("purpose", "confirm")
++            set("summary", "Authorize\n\t " + "A".repeat(300))
++            set("ttlMs", 999_999)
++        }
++        val ch = RemoteAuthProtocol.parseChallenge(np)
++        assertNotNull(ch)
++        assertEquals("abc123def456", ch!!.challengeId)
++        assertEquals("confirm", ch.purpose)
++        assertEquals(RemoteAuthProtocol.MAX_SUMMARY_LENGTH, ch.summary.length)
++        assertEquals(RemoteAuthProtocol.MAX_TTL_MS, ch.ttlMs)
++    }
++
++    @Test
++    fun parseChallengeRejectsInvalidIdsPurposesAndNonces() {
++        val badId = NetworkPacket(RemoteAuthProtocol.PACKET_TYPE_REMOTEAUTH_REQUEST).apply {
++            set("challengeId", "bad/id")
++            set("nonce", validNonceBase64())
++            set("purpose", "confirm")
++        }
++        assertNull(RemoteAuthProtocol.parseChallenge(badId))
++
++        val badPurpose = NetworkPacket(RemoteAuthProtocol.PACKET_TYPE_REMOTEAUTH_REQUEST).apply {
++            set("challengeId", "valid_id_123")
++            set("nonce", validNonceBase64())
++            set("purpose", "sudo_root")
++        }
++        assertNull(RemoteAuthProtocol.parseChallenge(badPurpose))
++
++        val shortNonce = NetworkPacket(RemoteAuthProtocol.PACKET_TYPE_REMOTEAUTH_REQUEST).apply {
++            set("challengeId", "valid_id_123")
++            set("nonce", Base64.getEncoder().encodeToString(ByteArray(16)))
++            set("purpose", "unlock")
++        }
++        assertNull(RemoteAuthProtocol.parseChallenge(shortNonce))
++    }
++
++    @Test
++    fun buildResponsePacketSanitizesAuthType() {
++        val np = RemoteAuthProtocol.buildResponsePacket("id_123456", validNonceBase64(), true, "unknown")
++        assertEquals(RemoteAuthProtocol.PACKET_TYPE_REMOTEAUTH, np.type)
++        assertEquals(true, np.getBoolean("approved", false))
++        assertEquals("biometric", np.getString("authType"))
++    }
++}

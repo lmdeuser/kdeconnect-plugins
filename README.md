@@ -5,7 +5,7 @@
 
 This project extends [KDE Connect](https://kdeconnect.kde.org/) into a six-plugin continuity stack between Android (11-15+) and Ubuntu 26.04 LTS ([Wayland](https://wayland.freedesktop.org/), `x86_64`) over KDE Connect's paired LAN mutual-[TLS](https://datatracker.ietf.org/doc/html/rfc8446) connection. It requires no USB cable, no ADB in daily use, and no third-party screen or webcam server.
 
-This repository (`lmdeuser/kdeconnect-plugins`) does not fork the desktop or Android codebases. It owns the multi-plugin registry ([plugins.toml](plugins.toml)), protocol and security specifications under `docs/plugins/`, Ubuntu 26.04 packaging overlays under [obs/](obs/), build and compliance automation under [tools/](tools/), and the Python test suite under [tests/](tests/). The C++/Qt desktop plugins and Kotlin Android plugins live on single-purpose `work/<plugin_id>` branches targeting upstream [kdeconnect-kde](https://invent.kde.org/network/kdeconnect-kde) and [kdeconnect-android](https://invent.kde.org/network/kdeconnect-android).
+This repository (`lmdeuser/kdeconnect-plugins`) does not fork the desktop or Android codebases. Instead, it ships the SHA-256-locked patch series under [patches/](patches/), pinned base and result hashes in [stack.lock.json](stack.lock.json), a hardened reproducer ([tools/reproduce_stack.py](tools/reproduce_stack.py)), the multi-plugin registry ([plugins.toml](plugins.toml)), protocol specifications under `docs/plugins/`, Ubuntu 26.04 packaging overlays under [obs/](obs/), and verification tests under [tests/](tests/). Anyone cloning this repository can reconstruct the exact 6-plugin desktop and Android source trees from pinned commits on [kdeconnect-kde](https://invent.kde.org/network/kdeconnect-kde) and [kdeconnect-android](https://invent.kde.org/network/kdeconnect-android) without trusting third-party mirrors.
 
 ## Included plugins and enhancements
 
@@ -89,12 +89,43 @@ sudo apt install --allow-downgrades kdeconnect=25.12.3-0ubuntu1 kdeconnect-libs=
 pkill -x kdeconnectd || true
 ```
 
-## Build and install on Android (11-15+)
+## Reproduce and build from source
 
-Desktop OBS builds do not compile the Android app. Build the side-by-side debug APK (`Debug KDE Connect`, application ID `org.kde.kdeconnect_tp.debug`) by synthesizing the active `work/<plugin_id>` branches from [plugins.toml](plugins.toml) onto `work/continuity-stack` inside your local `kdeconnect-android` checkout, then verify the signed APK with [apksigner](https://developer.android.com/tools/apksigner):
+Anyone with a clone of this repository can verify every patch and reconstruct both codebases directly from pinned official KDE Invent commits. Set a disk-backed `TMPDIR` (never `tmpfs`) before running reproduction commands:
 
 ```bash
-python3 tools/synthesize_android_stack.py
+export TMPDIR="${TMPDIR:-$PWD/.state/tmp}"
+mkdir -p "$TMPDIR"
+python3 tools/reproduce_stack.py verify-lock
+```
+
+### Desktop packages on Ubuntu 26.04 (`x86_64`)
+
+Reproduce the pinned desktop tree (`repro/continuity-stack`) and emit deterministic [`3.0 (quilt)`](https://manpages.debian.org/unstable/dpkg-dev/dpkg-source.1.en.html) Debian source bundles for `kdeconnect` and `libei` `1.6.0` (verified via SHA-256 against upstream archives), then build `.deb` packages locally or inside an Ubuntu 26.04 container without needing maintainer OBS credentials:
+
+```bash
+python3 tools/reproduce_stack.py checkout \
+  --target desktop \
+  --out ../repro/kdeconnect-kde \
+  --emit-deb-source ../repro/kdeconnect-deb-src
+python3 tools/obs_packaging.py build-libei --output-dir ../repro/libei-deb-src
+
+# Inside an Ubuntu 26.04 build environment (install libei 1.6.0 build deps first):
+dpkg-source -x ../repro/libei-deb-src/libei_*.dsc ../repro/build-libei
+dpkg-source -x ../repro/kdeconnect-deb-src/kdeconnect_*.dsc ../repro/build-kdeconnect
+```
+
+From `../repro/build-libei` and then `../repro/build-kdeconnect`, install build dependencies (`sudo apt build-dep .`) and build binary packages with `dpkg-buildpackage -us -uc`. See [obs/kdeconnect/debian/](obs/kdeconnect/debian/) for exact Debian build flags and `ctest` / `lintian` hooks.
+
+### Android APK (Android 11-15+)
+
+Desktop OBS builds do not compile Android. Reproduce the pinned `kdeconnect-android` tree, compile the side-by-side debug APK (`Debug KDE Connect`, application ID `org.kde.kdeconnect_tp.debug`), run unit tests and lint, and verify the APK signature with [apksigner](https://developer.android.com/tools/apksigner):
+
+```bash
+python3 tools/reproduce_stack.py checkout \
+  --target android \
+  --out ../repro/kdeconnect-android
+cd ../repro/kdeconnect-android
 ./gradlew --no-daemon --max-workers=2 assembleDebug lintDebug testDebugUnitTest
 apksigner verify --verbose build/outputs/apk/debug/kdeconnect-android-debug.apk
 ```
@@ -107,6 +138,12 @@ Because of the `.debug` suffix, `Debug KDE Connect` installs alongside the Googl
 - **Camera (`CAMERA`):** required for Continuity Camera streaming and photo/PDF capture.
 - **Bluetooth Connect (`BLUETOOTH_CONNECT`):** required on Android 12+ for Bluetooth headset handoff (`bt_audio_switch`).
 - **Notification Listener + SMS (`READ_SMS`, `SEND_SMS`, `RECEIVE_SMS`, `READ_PHONE_STATE`):** required only if using notifications sync or Android 15 SMS-delta OTP fallback when notifications redact 2FA codes.
+
+### Reproducibility and security model
+
+- **What is byte-for-bit reproducible:** Upstream `base_sha` checkout -> per-patch SHA-256 verification -> deterministic Git `HEAD^{tree}` and `HEAD` commits (fixed author/committer metadata, verified against [stack.lock.json](stack.lock.json)) -> byte-for-byte identical Debian `3.0 (quilt)` source bundles (`.orig.tar.xz`, `.debian.tar.xz`, `.dsc`, `manifest.json`). Upstream `libei` archives (`1.6.0`, `munit`, and `1.5.0-3.debian.tar.xz`) are verified over HTTPS with pinned SHA-256 digests.
+- **Honest scope limits:** Bit-for-bit binary `.deb` equivalence across independent build machines (`reprotest`) is not yet certified. Android `assembleDebug` APKs are signed with each developer's local debug keystore, and upstream `kdeconnect-android` does not ship Gradle dependency lockfiles.
+- **Repository attack-surface defenses:** Only exact HTTPS URLs on `invent.kde.org` are allowed; Git executes with hooks, symlinks, submodules, LFS filters, and `ext::` protocols disabled (`fsckObjects=true`); symlinks and unreferenced files under [patches/](patches/) are rejected; public tree scans block symlinks in Git index and worktree; zero `.github/workflows/` runners exist; and maintainer OBS promotion stays isolated from untrusted external inputs.
 
 ## Using the main features
 
@@ -164,11 +201,13 @@ See [obs/README.md](obs/README.md) for `status`, `cleanup`, and `--remove` cron 
 | --- | --- |
 | [AGENTS.md](AGENTS.md) | Engineering standards, CI/build boundaries, six-gate lifecycle, and KDE Invent policy |
 | [plugins.toml](plugins.toml) | Authoritative registry of active plugin branches, specs, and `.deb`/ELF/GStreamer checks |
+| [stack.lock.json](stack.lock.json) | Cryptographic lockfile pinning upstream SHAs, patch SHA-256 digests, and expected trees/commits |
+| [patches/](patches/) | Exported per-plugin Git patch series for `desktop` and `android` targets |
 | [docs/WORKFLOW.md](docs/WORKFLOW.md) | Detailed Gate 0 to Gate 5 acceptance criteria and handoff checklist |
 | `docs/plugins/` | Per-plugin specifications linked in the plugin table above |
 | [obs/](obs/) | Ubuntu 26.04 Debian overlays, OBS project/package XMLs, `*.prjconf`, and [verifier.Dockerfile](obs/verifier.Dockerfile) |
-| [tools/](tools/) | Stack synthesis, upstream sync, OBS controller/packaging, Docker `.deb` verifier, and hygiene checks |
-| [tests/](tests/) | Python `unittest` suite covering registry schema, packaging, runner safety gates, and tree hygiene |
+| [tools/](tools/) | Lockfile reproducer, patch exporter, stack synthesis, OBS controller/packaging, Docker verifier, and hygiene checks |
+| [tests/](tests/) | Python `unittest` suite covering reproducer integrity, registry schema, packaging, runner safety gates, and tree hygiene |
 | [prototype/](prototype/) | Initial standalone Android `MediaProjection` probe; see [prototype/README.md](prototype/README.md) |
 | [LICENSES/](LICENSES/) | License texts referenced by [REUSE.toml](REUSE.toml) |
 
@@ -176,11 +215,10 @@ Run Gate 1 checks from the repository root with a disk-backed `TMPDIR` (no deskt
 
 ```bash
 python3 tools/plugin_registry.py validate
+python3 tools/reproduce_stack.py verify-lock
 python3 tools/check_public_tree.py --worktree
 python3 tools/check_kde_compliance.py
 python3 -m unittest discover -s tests -v
-python3 tools/synthesize_android_stack.py --desktop --dry-run
-python3 tools/synthesize_android_stack.py --dry-run
 ```
 
 ## Terms and primary sources

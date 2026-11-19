@@ -1,0 +1,460 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 20:54:00 +0500
+Subject: [PATCH 4/4] continuity_camera: add QML/D-Bus webcam controls and
+ PipeWire node names
+
+
+diff --git a/app/qml/DevicePage.qml b/app/qml/DevicePage.qml
+index 10ad0e82e7fc4fcf764da9a767e0c9298173134c..0b56f8121a4835898f20caa91327bce5c595b9cc 100644
+--- a/app/qml/DevicePage.qml
++++ b/app/qml/DevicePage.qml
+@@ -234,6 +234,50 @@ Kirigami.ScrollablePage {
+                 section: "action"
+                 device: root.currentDevice
+             },
++            PluginItem {
++                id: continuityCameraPlugin
++                readonly property QtObject continuityCamera: ContinuityCameraDbusInterfaceFactory.create(root.currentDevice.id())
++                pluginName: "continuitycamera"
++                iconNameOverride: continuityCamera.active ? "media-playback-stop" : "camera-video"
++                name: continuityCamera.active ? i18n("Stop phone webcam") : i18n("Use phone as webcam")
++                onClick: () => {
++                    if (continuityCamera.active) {
++                        continuityCamera.stopCamera();
++                    } else {
++                        continuityCamera.startDefaultCamera();
++                        if (continuityCamera.lastError.length > 0) {
++                            showPassiveNotification(continuityCamera.lastError)
++                        }
++                    }
++                }
++                section: "action"
++                device: root.currentDevice
++            },
++            PluginItem {
++                pluginName: "continuitycamera"
++                iconNameOverride: "view-refresh"
++                hidden: !continuityCameraPlugin.continuityCamera.active
++                name: continuityCameraPlugin.continuityCamera.currentLens === "front" ? i18n("Switch webcam to rear camera") : i18n("Switch webcam to front camera")
++                onClick: () => continuityCameraPlugin.continuityCamera.toggleLens()
++                section: "action"
++                device: root.currentDevice
++            },
++            PluginItem {
++                pluginName: "continuitycamera"
++                iconNameOverride: "camera-photo"
++                name: i18n("Take photo with phone")
++                onClick: () => continuityCameraPlugin.continuityCamera.requestPhotoCapture()
++                section: "action"
++                device: root.currentDevice
++            },
++            PluginItem {
++                pluginName: "continuitycamera"
++                iconNameOverride: "scanner"
++                name: i18n("Scan document with phone")
++                onClick: () => continuityCameraPlugin.continuityCamera.requestDocumentScan()
++                section: "action"
++                device: root.currentDevice
++            },
+             PluginItem {
+                 readonly property QtObject sftp: SftpDbusInterfaceFactory.create(root.currentDevice.id())
+                 pluginName: "sftp"
+diff --git a/dbusinterfaces/CMakeLists.txt b/dbusinterfaces/CMakeLists.txt
+index 622c506c265c813f71890f88e23a0010b5e4ee9c..1c39716752faaeaa49b7ea67dcbcf7818e40b91d 100644
+--- a/dbusinterfaces/CMakeLists.txt
++++ b/dbusinterfaces/CMakeLists.txt
+@@ -46,6 +46,7 @@ geninterface(${PROJECT_SOURCE_DIR}/plugins/remotecommands/remotecommandsplugin.h
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/remotekeyboard/remotekeyboardplugin.h generated/remotekeyboardinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/sms/smsplugin.h generated/smsinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/sms/conversationsdbusinterface.h generated/conversationsinterface)
++geninterface(${PROJECT_SOURCE_DIR}/plugins/continuity_camera/continuitycameraplugin.h generated/continuitycamerainterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/share/shareplugin.h generated/shareinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/remotesystemvolume/remotesystemvolumeplugin.h generated/remotesystemvolumeinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/virtualmonitor/virtualmonitorplugin.h generated/virtualmonitorinterface)
+diff --git a/dbusinterfaces/dbusinterfaces.cpp b/dbusinterfaces/dbusinterfaces.cpp
+index 40374c314434af2c5ec49b1e2b6809294738b70a..cfe6e97be87b2e2a117de5de961637aa8d63fe1f 100644
+--- a/dbusinterfaces/dbusinterfaces.cpp
++++ b/dbusinterfaces/dbusinterfaces.cpp
+@@ -165,6 +165,17 @@ SmsDbusInterface::SmsDbusInterface(const QString &deviceId, QObject *parent)
+ {
+ }
+ 
++ContinuityCameraDbusInterface::ContinuityCameraDbusInterface(const QString &deviceId, QObject *parent)
++    : OrgKdeKdeconnectDeviceContinuitycameraInterface(DaemonDbusInterface::activatedService(),
++                                                      QLatin1String("/modules/kdeconnect/devices/%1/continuitycamera").arg(deviceId),
++                                                      QDBusConnection::sessionBus(),
++                                                      parent)
++{
++    connect(this, &OrgKdeKdeconnectDeviceContinuitycameraInterface::activeChanged, this, &ContinuityCameraDbusInterface::activeChanged);
++    connect(this, &OrgKdeKdeconnectDeviceContinuitycameraInterface::lensChanged, this, &ContinuityCameraDbusInterface::lensChanged);
++    connect(this, &OrgKdeKdeconnectDeviceContinuitycameraInterface::lastErrorChanged, this, &ContinuityCameraDbusInterface::lastErrorChanged);
++}
++
+ ShareDbusInterface::ShareDbusInterface(const QString &deviceId, QObject *parent)
+     : OrgKdeKdeconnectDeviceShareInterface(DaemonDbusInterface::activatedService(),
+                                            QLatin1String("/modules/kdeconnect/devices/%1/share").arg(deviceId),
+diff --git a/dbusinterfaces/dbusinterfaces.h b/dbusinterfaces/dbusinterfaces.h
+index f7ad3fa26c97673f400edf60481aa537f8c23f45..e2ac182f0882a9bb73b37b51f607f24adc1b28f5 100644
+--- a/dbusinterfaces/dbusinterfaces.h
++++ b/dbusinterfaces/dbusinterfaces.h
+@@ -11,6 +11,7 @@
+ 
+ #include "generated/batteryinterface.h"
+ #include "generated/connectivityinterface.h"
++#include "generated/continuitycamerainterface.h"
+ #include "generated/conversationsinterface.h"
+ #include "generated/daemoninterface.h"
+ #include "generated/deviceclipboardinterface.h"
+@@ -225,6 +226,20 @@ public:
+     explicit SmsDbusInterface(const QString &deviceId, QObject *parent = nullptr);
+ };
+ 
++class KDECONNECTDBUSINTERFACES_EXPORT ContinuityCameraDbusInterface : public OrgKdeKdeconnectDeviceContinuitycameraInterface
++{
++    Q_OBJECT
++    Q_PROPERTY(bool active READ active NOTIFY activeChanged)
++    Q_PROPERTY(QString currentLens READ currentLens NOTIFY lensChanged)
++    Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
++public:
++    explicit ContinuityCameraDbusInterface(const QString &deviceId, QObject *parent = nullptr);
++Q_SIGNALS:
++    void activeChanged();
++    void lensChanged();
++    void lastErrorChanged();
++};
++
+ class KDECONNECTDBUSINTERFACES_EXPORT ShareDbusInterface : public OrgKdeKdeconnectDeviceShareInterface
+ {
+     Q_OBJECT
+diff --git a/declarativeplugin/kdeconnectdeclarativeplugin.h b/declarativeplugin/kdeconnectdeclarativeplugin.h
+index c0ab263ec7b0956541fe0eb50de8102ed295a1f2..039a1e4bfdc450e5ad8168d0d2dc18337bbf9c39 100644
+--- a/declarativeplugin/kdeconnectdeclarativeplugin.h
++++ b/declarativeplugin/kdeconnectdeclarativeplugin.h
+@@ -197,6 +197,14 @@ class SmsDbusInterfaceForeign
+     QML_FOREIGN(SmsDbusInterface)
+ };
+ 
++class ContinuityCameraDbusInterfaceForeign
++{
++    Q_GADGET
++    QML_NAMED_ELEMENT(ContinuityCameraDbusInterface)
++    QML_UNCREATABLE("")
++    QML_FOREIGN(ContinuityCameraDbusInterface)
++};
++
+ class RemoteCommandsDbusInterfaceForeign
+ {
+     Q_GADGET
+@@ -325,6 +333,18 @@ public:
+     }
+ };
+ 
++class ContinuityCameraDbusInterfaceFactory : public QObject
++{
++    Q_OBJECT
++    QML_ELEMENT
++    QML_SINGLETON
++public:
++    Q_INVOKABLE ContinuityCameraDbusInterface *create(const QString &deviceId)
++    {
++        return new ContinuityCameraDbusInterface(deviceId);
++    }
++};
++
+ class ClipboardDbusInterfaceFactory : public QObject
+ {
+     Q_OBJECT
+diff --git a/plugins/continuity_camera/bridge/pipewirebridge.cpp b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+index d04c0456df0f0d282469fc43fb2fb26f30d1b795..7ce94a7c496932ec1e0f6ce7c7e7e377ae579f5a 100644
+--- a/plugins/continuity_camera/bridge/pipewirebridge.cpp
++++ b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+@@ -46,6 +46,7 @@ void configurePipeWireProvideSink(
+     const char *mediaType,
+     const char *mediaRole,
+     const char *mediaClass,
++    const char *nodeName,
+     const QByteArray &nodeDesc)
+ {
+     GstStructure *props = gst_structure_new("props",
+@@ -61,6 +62,12 @@ void configurePipeWireProvideSink(
+                                             "media.class",
+                                             G_TYPE_STRING,
+                                             mediaClass,
++                                            "node.name",
++                                            G_TYPE_STRING,
++                                            nodeName,
++                                            "node.nick",
++                                            G_TYPE_STRING,
++                                            nodeDesc.constData(),
+                                             "node.description",
+                                             G_TYPE_STRING,
+                                             nodeDesc.constData(),
+@@ -202,7 +209,7 @@ bool PipeWireBridge::initPipelines(QString *errorOut)
+ 
+     const QByteArray clientName = QByteArrayLiteral("KDE Connect Continuity Camera");
+     const QByteArray camDesc = QStringLiteral("KDE Connect Camera (%1)").arg(m_deviceName).toUtf8();
+-    configurePipeWireProvideSink(pwSink, clientName, "Video", "Camera", "Video/Source", camDesc);
++    configurePipeWireProvideSink(pwSink, clientName, "Video", "Camera", "Video/Source", "kdeconnect_continuity_camera", camDesc);
+ 
+     gst_bin_add_many(GST_BIN(d->videoPipeline), d->videoAppSrc, parser, decoder, convert, pwSink, nullptr);
+     if (!gst_element_link_many(d->videoAppSrc, parser, decoder, convert, pwSink, nullptr)) {
+@@ -231,7 +238,7 @@ bool PipeWireBridge::initPipelines(QString *errorOut)
+         if (d->audioPipeline && d->audioAppSrc && aconv && aresamp && apwSink) {
+             configureLiveAppSrc(d->audioAppSrc, "audio/x-raw,format=(string)S16LE,channels=(int)1,rate=(int)48000,layout=(string)interleaved", 512U * 1024U);
+             const QByteArray micDesc = QStringLiteral("KDE Connect Mic (%1)").arg(m_deviceName).toUtf8();
+-            configurePipeWireProvideSink(apwSink, clientName, "Audio", "Communication", "Audio/Source", micDesc);
++            configurePipeWireProvideSink(apwSink, clientName, "Audio", "Communication", "Audio/Source", "kdeconnect_continuity_mic", micDesc);
+             gst_bin_add_many(GST_BIN(d->audioPipeline), d->audioAppSrc, aconv, aresamp, apwSink, nullptr);
+             if (!gst_element_link_many(d->audioAppSrc, aconv, aresamp, apwSink, nullptr)
+                 || gst_element_set_state(d->audioPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
+diff --git a/plugins/continuity_camera/continuitycameraplugin.cpp b/plugins/continuity_camera/continuitycameraplugin.cpp
+index 2cd803eeb770de9c5b556b691198a25adf32f657..0e80865a302984f98d0d15feacc68690a6150454 100644
+--- a/plugins/continuity_camera/continuitycameraplugin.cpp
++++ b/plugins/continuity_camera/continuitycameraplugin.cpp
+@@ -50,6 +50,14 @@ ContinuityCameraPlugin::~ContinuityCameraPlugin()
+     teardownSession(true, false);
+ }
+ 
++bool ContinuityCameraPlugin::active() const
++{
++    const auto st = m_session.state();
++    return st == ContinuityCameraProtocol::CameraSessionMachine::State::Starting
++        || st == ContinuityCameraProtocol::CameraSessionMachine::State::Streaming
++        || (m_bridgeProcess != nullptr && m_bridgeProcess->state() != QProcess::NotRunning);
++}
++
+ bool ContinuityCameraPlugin::isStreaming() const
+ {
+     return m_session.state() == ContinuityCameraProtocol::CameraSessionMachine::State::Streaming;
+@@ -60,16 +68,54 @@ QString ContinuityCameraPlugin::state() const
+     return m_session.stateName();
+ }
+ 
++QString ContinuityCameraPlugin::currentLens() const
++{
++    return m_currentLens;
++}
++
++QString ContinuityCameraPlugin::lastError() const
++{
++    return m_lastError;
++}
++
++void ContinuityCameraPlugin::setLastError(const QString &error)
++{
++    if (m_lastError != error) {
++        m_lastError = error;
++        Q_EMIT lastErrorChanged();
++    }
++}
++
++void ContinuityCameraPlugin::syncActiveSignal(bool wasActive)
++{
++    if (active() != wasActive) {
++        Q_EMIT activeChanged();
++    }
++}
++
+ QString ContinuityCameraPlugin::dbusPath() const
+ {
+     return QLatin1String("/modules/kdeconnect/devices/%1/continuitycamera").arg(device()->id());
+ }
+ 
++bool ContinuityCameraPlugin::startDefaultCamera()
++{
++    return startCamera(1280, 720, 30, true, m_currentLens);
++}
++
+ bool ContinuityCameraPlugin::startCamera(int maxWidth, int maxHeight, int fps, bool includeMic, const QString &lens)
+ {
+     const ContinuityCameraProtocol::StreamConfig cfg = ContinuityCameraProtocol::clampStreamConfig(maxWidth, maxHeight, fps);
++    const QString normalizedLens = ContinuityCameraProtocol::normalizeLens(lens);
++    const bool wasActive = active();
+     const bool wasStreaming = isStreaming();
+     m_stopping = false;
++    setLastError(QString());
++
++    if (m_currentLens != normalizedLens) {
++        m_currentLens = normalizedLens;
++        Q_EMIT lensChanged();
++    }
+ 
+     NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST);
+     np.set(QStringLiteral("action"), QStringLiteral("start_stream"));
+@@ -77,12 +123,14 @@ bool ContinuityCameraPlugin::startCamera(int maxWidth, int maxHeight, int fps, b
+     np.set(QStringLiteral("maxHeight"), cfg.height);
+     np.set(QStringLiteral("fps"), cfg.fps);
+     np.set(QStringLiteral("includeMic"), includeMic);
+-    np.set(QStringLiteral("lens"), ContinuityCameraProtocol::normalizeLens(lens));
++    np.set(QStringLiteral("lens"), normalizedLens);
+     if (!sendPacket(np)) {
+         m_session.onTeardown(true);
++        setLastError(i18n("Failed to send camera stream request."));
+         if (wasStreaming) {
+             Q_EMIT streamingChanged(false);
+         }
++        syncActiveSignal(wasActive);
+         Q_EMIT stateChanged();
+         return false;
+     }
+@@ -91,27 +139,47 @@ bool ContinuityCameraPlugin::startCamera(int maxWidth, int maxHeight, int fps, b
+     if (wasStreaming && !isStreaming()) {
+         Q_EMIT streamingChanged(false);
+     }
++    syncActiveSignal(wasActive);
+     Q_EMIT stateChanged();
+     return true;
+ }
+ 
+ void ContinuityCameraPlugin::stopCamera()
+ {
++    const bool wasActive = active();
+     m_stopping = true;
+     m_session.beginStop();
+     NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST, {{QStringLiteral("action"), QStringLiteral("stop_stream")}});
+     sendPacket(np);
+     teardownSession(true, false);
++    syncActiveSignal(wasActive);
+ }
+ 
+ void ContinuityCameraPlugin::switchLens(const QString &lens)
+ {
++    const QString normalized = ContinuityCameraProtocol::normalizeLens(lens);
++    if (m_currentLens != normalized) {
++        m_currentLens = normalized;
++        Q_EMIT lensChanged();
++    }
+     NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST);
+     np.set(QStringLiteral("action"), QStringLiteral("switch_lens"));
+-    np.set(QStringLiteral("lens"), ContinuityCameraProtocol::normalizeLens(lens));
++    np.set(QStringLiteral("lens"), normalized);
+     sendPacket(np);
+ }
+ 
++void ContinuityCameraPlugin::toggleLens()
++{
++    const QString nextLens = (m_currentLens == QLatin1String("front")) ? QStringLiteral("back") : QStringLiteral("front");
++    if (m_currentLens != nextLens) {
++        m_currentLens = nextLens;
++        Q_EMIT lensChanged();
++    }
++    if (active()) {
++        switchLens(nextLens);
++    }
++}
++
+ void ContinuityCameraPlugin::requestPhotoCapture()
+ {
+     NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST, {{QStringLiteral("action"), QStringLiteral("capture_photo")}});
+@@ -162,6 +230,7 @@ void ContinuityCameraPlugin::receivePacket(const NetworkPacket &np)
+             teardownSession(true, true);
+             return;
+         }
++        const bool wasActive = active();
+         const bool includeMic = np.get<bool>(QStringLiteral("audioEnabled"), false);
+         teardownSession(true, false);
+         m_stopping = false;
+@@ -170,7 +239,9 @@ void ContinuityCameraPlugin::receivePacket(const NetworkPacket &np)
+         m_pendingFrames.clear();
+ 
+         if (!ensureLocalServer() || !launchBridge(includeMic)) {
++            setLastError(i18n("Failed to launch continuity camera PipeWire bridge."));
+             teardownSession(true, true);
++            syncActiveSignal(wasActive);
+             return;
+         }
+ 
+@@ -190,6 +261,8 @@ void ContinuityCameraPlugin::receivePacket(const NetworkPacket &np)
+         }
+ 
+         m_session.onStreamOpen();
++        setLastError(QString());
++        Q_EMIT activeChanged();
+         Q_EMIT streamingChanged(true);
+         Q_EMIT stateChanged();
+ 
+@@ -331,6 +404,7 @@ bool ContinuityCameraPlugin::launchBridge(bool includeMic)
+ 
+ void ContinuityCameraPlugin::teardownSession(bool terminateBridge, bool error)
+ {
++    const bool wasActive = active();
+     const bool wasStreaming = isStreaming();
+     if (m_payload) {
+         QSharedPointer<QIODevice> stalePayload = m_payload;
+@@ -378,9 +452,13 @@ void ContinuityCameraPlugin::teardownSession(bool terminateBridge, bool error)
+     m_pendingFrames.clear();
+     m_parser.reset();
+     m_session.onTeardown(error);
++    if (error && m_lastError.isEmpty()) {
++        setLastError(i18n("Continuity camera stream ended with an error."));
++    }
+     if (wasStreaming) {
+         Q_EMIT streamingChanged(false);
+     }
++    syncActiveSignal(wasActive);
+     Q_EMIT stateChanged();
+ }
+ 
+diff --git a/plugins/continuity_camera/continuitycameraplugin.h b/plugins/continuity_camera/continuitycameraplugin.h
+index 8d5258ab527c729729fa176f3f4cc5583eceea04..9298472a8e20aeae69418851297211209f60c524 100644
+--- a/plugins/continuity_camera/continuitycameraplugin.h
++++ b/plugins/continuity_camera/continuitycameraplugin.h
+@@ -28,28 +28,39 @@ class ContinuityCameraPlugin : public KdeConnectPlugin
+ {
+     Q_OBJECT
+     Q_CLASSINFO("D-Bus Interface", "org.kde.kdeconnect.device.continuitycamera")
++    Q_PROPERTY(bool active READ active NOTIFY activeChanged)
+     Q_PROPERTY(bool isStreaming READ isStreaming NOTIFY streamingChanged)
+     Q_PROPERTY(QString state READ state NOTIFY stateChanged)
++    Q_PROPERTY(QString currentLens READ currentLens NOTIFY lensChanged)
++    Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
+ 
+ public:
+     explicit ContinuityCameraPlugin(QObject *parent, const QVariantList &args);
+     ~ContinuityCameraPlugin() override;
+ 
++    bool active() const;
+     bool isStreaming() const;
+     QString state() const;
++    QString currentLens() const;
++    QString lastError() const;
+ 
+     void receivePacket(const NetworkPacket &np) override;
+     QString dbusPath() const override;
+ 
+     Q_SCRIPTABLE bool startCamera(int maxWidth = 1280, int maxHeight = 720, int fps = 30, bool includeMic = true, const QString &lens = QStringLiteral("back"));
++    Q_SCRIPTABLE bool startDefaultCamera();
+     Q_SCRIPTABLE void stopCamera();
+     Q_SCRIPTABLE void switchLens(const QString &lens);
++    Q_SCRIPTABLE void toggleLens();
+     Q_SCRIPTABLE void requestPhotoCapture();
+     Q_SCRIPTABLE void requestDocumentScan();
+ 
+ Q_SIGNALS:
++    Q_SCRIPTABLE void activeChanged();
+     Q_SCRIPTABLE void streamingChanged(bool streaming);
+     Q_SCRIPTABLE void stateChanged();
++    Q_SCRIPTABLE void lensChanged();
++    Q_SCRIPTABLE void lastErrorChanged();
+     Q_SCRIPTABLE void captureImported(const QString &localPath, const QString &mimeType);
+ 
+ private Q_SLOTS:
+@@ -67,6 +78,8 @@ private:
+     void enqueueOrSendFrame(const ContinuityCameraProtocol::StreamFrame &frame);
+     void flushPendingFrames();
+     void handleCaptureResult(const NetworkPacket &np);
++    void setLastError(const QString &error);
++    void syncActiveSignal(bool wasActive);
+ 
+     ContinuityCameraProtocol::CameraSessionMachine m_session;
+     ContinuityCameraProtocol::StreamFrameParser m_parser;
+@@ -76,6 +89,8 @@ private:
+     QProcess *m_bridgeProcess = nullptr;
+     QString m_socketPath;
+     QString m_fallbackSocketDir;
++    QString m_currentLens = QStringLiteral("back");
++    QString m_lastError;
+     QByteArray m_cachedCodecConfig;
+     QList<QByteArray> m_pendingFrames;
+     bool m_stopping = false;

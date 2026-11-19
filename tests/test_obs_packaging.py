@@ -12,6 +12,9 @@ import unittest
 from pathlib import Path
 
 from tools.obs_packaging import (
+    LIBEI_DEBIAN_SHA256,
+    LIBEI_DEBIAN_URL,
+    LIBEI_MUNIT_URL,
     build_android_probe_bundle,
     build_kdeconnect_bundle,
     prepare_libei_debian_tar,
@@ -241,6 +244,12 @@ class ObsPackagingTests(unittest.TestCase):
             self.assertIn("lintian --fail-on error", rules)
             changelog = tf.extractfile("debian/changelog").read().decode("utf-8")
             self.assertTrue(changelog.startswith("libei (1.6.0-1~obs1) resolute; urgency=medium"))
+
+        out_bytes_again, _ = prepare_libei_debian_tar(buf.getvalue(), upstream_version="1.6.0", obs_rev=1)
+        self.assertEqual(out_bytes, out_bytes_again)
+        self.assertTrue(LIBEI_MUNIT_URL.startswith("https://"))
+        self.assertTrue(LIBEI_DEBIAN_URL.startswith("https://"))
+        self.assertRegex(LIBEI_DEBIAN_SHA256, r"^[0-9a-f]{64}$")
 
 
 if __name__ == "__main__":

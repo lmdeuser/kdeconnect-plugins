@@ -7,9 +7,11 @@ compliance rules on external plugin branches.
 """
 
 import argparse
+import fnmatch
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 COPYRIGHT_RE = re.compile(r"SPDX-FileCopyrightText:\s*\S+")
@@ -117,13 +119,69 @@ def _iter_repo_files(root: Path) -> list[Path]:
     return files
 
 
+def _match_reuse_pattern(rel: str, pattern: str) -> bool:
+    if pattern.endswith("/**"):
+        prefix = pattern[:-3].rstrip("/")
+        if not prefix:
+            return True
+        return rel == prefix or rel.startswith(prefix + "/")
+    return fnmatch.fnmatchcase(rel, pattern)
+
+
+def _load_reuse_annotations(root: Path, known: set[str]) -> tuple[list[list[str]], list[str]]:
+    reuse_path = root / "REUSE.toml"
+    if not reuse_path.is_file():
+        return [], []
+    issues: list[str] = []
+    patterns_list: list[list[str]] = []
+    try:
+        data = tomllib.loads(reuse_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return [], [f"REUSE.toml: invalid TOML: {exc}"]
+
+    raw_annotations = data.get("annotations", [])
+    if not isinstance(raw_annotations, list):
+        return [], ["REUSE.toml: 'annotations' must be a list"]
+
+    for idx, entry in enumerate(raw_annotations):
+        if not isinstance(entry, dict):
+            issues.append(f"REUSE.toml: annotations[{idx}] must be a table")
+            continue
+        raw_path = entry.get("path")
+        paths = [raw_path] if isinstance(raw_path, str) else raw_path if isinstance(raw_path, list) else None
+        if not paths or not all(isinstance(p, str) and p and not p.startswith("/") and ".." not in Path(p).parts for p in paths):
+            issues.append(f"REUSE.toml: annotations[{idx}] has invalid 'path'")
+            continue
+        raw_copy = entry.get("SPDX-FileCopyrightText")
+        copy_ok = (isinstance(raw_copy, str) and bool(raw_copy.strip())) or (
+            isinstance(raw_copy, list) and bool(raw_copy) and all(isinstance(c, str) and bool(c.strip()) for c in raw_copy)
+        )
+        if not copy_ok:
+            issues.append(f"REUSE.toml: annotations[{idx}] missing valid SPDX-FileCopyrightText")
+            continue
+        raw_lic = entry.get("SPDX-License-Identifier")
+        if not isinstance(raw_lic, str) or not raw_lic.strip():
+            issues.append(f"REUSE.toml: annotations[{idx}] missing SPDX-License-Identifier")
+            continue
+        tokens = _extract_license_tokens(_clean_spdx_expression(raw_lic))
+        if not tokens:
+            issues.append(f"REUSE.toml: annotations[{idx}] empty SPDX-License-Identifier")
+            continue
+        bad_tokens = [tok for tok in tokens if tok not in known]
+        if bad_tokens:
+            issues.append(f"REUSE.toml: annotations[{idx}] unknown license(s) {bad_tokens} missing from LICENSES/")
+            continue
+        patterns_list.append(paths)
+    return patterns_list, issues
+
+
 def check_repo_reuse(root: Path) -> list[str]:
-    """Check that all repository files carry valid SPDX headers matching LICENSES/."""
+    """Check that all repository files carry valid SPDX headers or valid REUSE.toml annotations."""
     known = _known_licenses(root)
     if not known:
         return ["LICENSES/: directory is missing or contains no *.txt license texts"]
 
-    issues: list[str] = []
+    ann_patterns, issues = _load_reuse_annotations(root, known)
     for path in _iter_repo_files(root):
         rel = path.relative_to(root).as_posix()
         if rel.startswith("LICENSES/"):
@@ -132,6 +190,8 @@ def check_repo_reuse(root: Path) -> list[str]:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             issues.append(f"{rel}: unreadable as UTF-8 text")
+            continue
+        if any(_match_reuse_pattern(rel, pat) for pats in ann_patterns for pat in pats):
             continue
         issues.extend(_check_header_lines(rel, text, known))
     return issues

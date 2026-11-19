@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 18:04:59 +0500
+Subject: [PATCH] sms: push strictly newer inbox messages for OTP redaction
+ fallback
+
+
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sms/SMSPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/sms/SMSPlugin.kt
+index 704edb06bd31abc81569e9b48f11a96e4320a113..60429ca6f1cca2fda1bd81fcd8a77a2b9daf22ef 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/sms/SMSPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/sms/SMSPlugin.kt
+@@ -2,6 +2,7 @@
+  * SPDX-FileCopyrightText: 2014 Albert Vaca Cintora <albertvaka@gmail.com>
+  * SPDX-FileCopyrightText: 2021 Simon Redman <simon@ergotech.com>
+  * SPDX-FileCopyrightText: 2020 Aniket Kumar <anikketkumar786@gmail.com>
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
+  *
+  * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+  */
+@@ -89,7 +90,9 @@ class SMSPlugin : Plugin() {
+             val action: String? = intent.action
+ 
+             if (Transaction.REFRESH == action) {
+-                sendLatestMessage()
++                MessageLooper.handler.post {
++                    sendLatestMessage()
++                }
+             }
+         }
+     }
+@@ -104,32 +107,28 @@ class SMSPlugin : Plugin() {
+      * Should only be called after initializing the mostRecentTimestamp
+      */
+     private fun sendLatestMessage() {
++        val toSend: List<SMSHelper.Message>
+         // Lock so no one uses the mostRecentTimestamp between the moment we read it and the
+         // moment we update it. This is because reading the Messages DB can take long.
+         mostRecentTimestampLock.lock()
+-
+-        if (!haveMessagesBeenRequested) {
+-            // Since the user has not requested a message, there is most likely nobody listening
+-            // for message updates, so just drop them rather than spending battery/time sending
+-            // updates that don't matter.
++        try {
++            val queryFloor = SmsRealtimePushHelper.queryFloorTimestamp(mostRecentTimestamp)
++            val messages: List<SMSHelper.Message> = getMessagesInRange(context, null, queryFloor, null, false)
++            val (newMostRecentTimestamp, selected) = SmsRealtimePushHelper.selectMessagesToPush(
++                candidates = messages,
++                previousTimestamp = mostRecentTimestamp,
++                haveMessagesBeenRequested = haveMessagesBeenRequested,
++            )
++            mostRecentTimestamp = newMostRecentTimestamp
++            toSend = selected
++        } finally {
+             mostRecentTimestampLock.unlock()
+-            return
+         }
+-        val messages: List<SMSHelper.Message> = getMessagesInRange(context, null, mostRecentTimestamp, null, false)
+ 
+-        var newMostRecentTimestamp: Long = mostRecentTimestamp
+-        for (message: SMSHelper.Message in messages) {
+-            if (message.date >= newMostRecentTimestamp) {
+-                newMostRecentTimestamp = message.date
+-            }
++        if (toSend.isNotEmpty()) {
++            // Send the alert about the update
++            device.sendPacket(constructBulkMessagePacket(toSend))
+         }
+-
+-        // Update the most recent counter
+-        mostRecentTimestamp = newMostRecentTimestamp
+-        mostRecentTimestampLock.unlock()
+-
+-        // Send the alert about the update
+-        device.sendPacket(constructBulkMessagePacket(messages))
+     }
+ 
+     override val minSdk: Int = Build.VERSION_CODES.O
+@@ -146,8 +145,14 @@ class SMSPlugin : Plugin() {
+         // To see debug messages for Klinker library, uncomment the below line
+         //Log.setDebug(true)
+         mostRecentTimestampLock.lock()
+-        mostRecentTimestamp = getNewestMessageTimestamp(context)
+-        mostRecentTimestampLock.unlock()
++        try {
++            mostRecentTimestamp = SmsRealtimePushHelper.initialBaselineTimestamp(
++                getNewestMessageTimestamp(context),
++                System.currentTimeMillis(),
++            )
++        } finally {
++            mostRecentTimestampLock.unlock()
++        }
+     }
+ 
+     override fun onDestroy() {
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/sms/SmsRealtimePushHelper.kt b/src/main/java/org/kde/kdeconnect/plugins/sms/SmsRealtimePushHelper.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..83892dd42db6db2b5aa1c58267cc207c7ac3aeeb
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/sms/SmsRealtimePushHelper.kt
+@@ -0,0 +1,49 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.sms
++
++import android.provider.Telephony
++import org.kde.kdeconnect.helpers.SMSHelper
++
++internal object SmsRealtimePushHelper {
++    private const val EMPTY_DB_GRACE_MS = 5_000L
++
++    fun initialBaselineTimestamp(dbNewestTimestamp: Long, nowMs: Long): Long {
++        if (dbNewestTimestamp > 0L) {
++            return dbNewestTimestamp
++        }
++        return maxOf(0L, nowMs - EMPTY_DB_GRACE_MS)
++    }
++
++    fun queryFloorTimestamp(mostRecentTimestamp: Long): Long {
++        return if (mostRecentTimestamp < Long.MAX_VALUE) {
++            mostRecentTimestamp + 1L
++        } else {
++            Long.MAX_VALUE
++        }
++    }
++
++    fun selectMessagesToPush(
++        candidates: List<SMSHelper.Message>,
++        previousTimestamp: Long,
++        haveMessagesBeenRequested: Boolean,
++    ): Pair<Long, List<SMSHelper.Message>> {
++        val strictlyNewer = candidates.filter { it.date > previousTimestamp }
++        if (strictlyNewer.isEmpty()) {
++            return previousTimestamp to emptyList()
++        }
++
++        val updatedTimestamp = strictlyNewer.maxOf { it.date }
++        if (haveMessagesBeenRequested) {
++            return updatedTimestamp to strictlyNewer
++        }
++
++        val inboxOnly = strictlyNewer.filter {
++            it.type == Telephony.TextBasedSmsColumns.MESSAGE_TYPE_INBOX && it.body.isNotEmpty()
++        }
++        return updatedTimestamp to inboxOnly
++    }
++}
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/sms/SmsRealtimePushHelperTest.kt b/src/test/java/org/kde/kdeconnect/plugins/sms/SmsRealtimePushHelperTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..136c4b0011a27069c1b9d466161b7e420d281592
+--- /dev/null
++++ b/src/test/java/org/kde/kdeconnect/plugins/sms/SmsRealtimePushHelperTest.kt
+@@ -0,0 +1,81 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++package org.kde.kdeconnect.plugins.sms
++
++import android.provider.Telephony
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.kde.kdeconnect.helpers.SMSHelper
++
++class SmsRealtimePushHelperTest {
++
++    private fun fakeMessage(
++        body: String,
++        date: Long,
++        type: Int = Telephony.TextBasedSmsColumns.MESSAGE_TYPE_INBOX,
++    ): SMSHelper.Message = SMSHelper.Message(
++        addresses = listOf(SMSHelper.Address("32665")),
++        body = body,
++        date = date,
++        type = type,
++        read = 0,
++        threadID = SMSHelper.ThreadID(1L),
++        uID = date,
++        event = SMSHelper.Message.EVENT_TEXT_MESSAGE,
++        subscriptionID = -1,
++        attachments = null,
++    )
++
++    @Test
++    fun initialBaselineHandlesEmptyAndPopulatedDatabases() {
++        assertEquals(95_000L, SmsRealtimePushHelper.initialBaselineTimestamp(Long.MIN_VALUE, 100_000L))
++        assertEquals(0L, SmsRealtimePushHelper.initialBaselineTimestamp(0L, 1_000L))
++        assertEquals(50_000L, SmsRealtimePushHelper.initialBaselineTimestamp(50_000L, 100_000L))
++        assertEquals(50_001L, SmsRealtimePushHelper.queryFloorTimestamp(50_000L))
++        assertEquals(Long.MAX_VALUE, SmsRealtimePushHelper.queryFloorTimestamp(Long.MAX_VALUE))
++    }
++
++    @Test
++    fun unsolicitedPushSelectsStrictlyNewerInboxMessagesOnly() {
++        val previous = 1_000L
++        val sameTs = fakeMessage("Old code 111111", date = 1_000L)
++        val sentMsg = fakeMessage("Sent verification 222222", date = 1_100L, type = Telephony.TextBasedSmsColumns.MESSAGE_TYPE_SENT)
++        val emptyMsg = fakeMessage("", date = 1_200L)
++        val inboxOtp = fakeMessage("Your verification code is 582941", date = 1_300L)
++
++        val (updatedTs, selected) = SmsRealtimePushHelper.selectMessagesToPush(
++            candidates = listOf(sameTs, sentMsg, emptyMsg, inboxOtp),
++            previousTimestamp = previous,
++            haveMessagesBeenRequested = false,
++        )
++        assertEquals(1_300L, updatedTs)
++        assertEquals(1, selected.size)
++        assertEquals("Your verification code is 582941", selected.first().body)
++
++        val (unchangedTs, duplicateRun) = SmsRealtimePushHelper.selectMessagesToPush(
++            candidates = listOf(inboxOtp),
++            previousTimestamp = updatedTs,
++            haveMessagesBeenRequested = false,
++        )
++        assertEquals(1_300L, unchangedTs)
++        assertTrue(duplicateRun.isEmpty())
++    }
++
++    @Test
++    fun requestedModeForwardsAllStrictlyNewerMessages() {
++        val sentMsg = fakeMessage("Outbound reply", date = 2_000L, type = Telephony.TextBasedSmsColumns.MESSAGE_TYPE_SENT)
++        val inboxMsg = fakeMessage("Inbound reply", date = 2_100L, type = Telephony.TextBasedSmsColumns.MESSAGE_TYPE_INBOX)
++
++        val (updatedTs, selected) = SmsRealtimePushHelper.selectMessagesToPush(
++            candidates = listOf(sentMsg, inboxMsg),
++            previousTimestamp = 1_900L,
++            haveMessagesBeenRequested = true,
++        )
++        assertEquals(2_100L, updatedTs)
++        assertEquals(2, selected.size)
++    }
++}

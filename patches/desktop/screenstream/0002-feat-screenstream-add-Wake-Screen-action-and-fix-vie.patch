@@ -1,0 +1,418 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 04:04:06 +0500
+Subject: [PATCH 2/8] feat(screenstream): add Wake Screen action and fix viewer
+ exit UAF crash
+
+
+diff --git a/app/qml/DevicePage.qml b/app/qml/DevicePage.qml
+index 590bac191d220b8d6ca5f24d56f327878714bebb..160e6ff5c74dbf5a3691ac01bbf185432f321860 100644
+--- a/app/qml/DevicePage.qml
++++ b/app/qml/DevicePage.qml
+@@ -260,6 +260,7 @@ Kirigami.ScrollablePage {
+                 device: root.currentDevice
+             },
+             PluginItem {
++                id: screenStreamPlugin
+                 readonly property QtObject screenStream: ScreenStreamDbusInterfaceFactory.create(root.currentDevice.id())
+                 pluginName: "screenstream"
+                 name: screenStream.active ? i18n("Stop screen stream") : i18n("View device screen")
+@@ -276,6 +277,19 @@ Kirigami.ScrollablePage {
+                 section: "action"
+                 device: root.currentDevice
+             },
++            PluginItem {
++                pluginName: "screenstream"
++                iconNameOverride: "preferences-desktop-display"
++                name: i18n("Wake device screen")
++                onClick: () => {
++                    screenStreamPlugin.screenStream.wakeScreen();
++                    if (screenStreamPlugin.screenStream.lastError.length > 0) {
++                        showPassiveNotification(screenStreamPlugin.screenStream.lastError)
++                    }
++                }
++                section: "action"
++                device: root.currentDevice
++            },
+             PluginItem {
+                 pluginName: "battery"
+                 name: batteryInfo.displayString
+diff --git a/plugins/screenstream/screenstreamplugin.cpp b/plugins/screenstream/screenstreamplugin.cpp
+index b7692150ebf97c7cefc276986e4734dec8ac924e..1436909ae54f96704b942cdceafb307dbf77f061 100644
+--- a/plugins/screenstream/screenstreamplugin.cpp
++++ b/plugins/screenstream/screenstreamplugin.cpp
+@@ -223,6 +223,18 @@ void ScreenStreamPlugin::requestKeyframe()
+     sendPacket(np);
+ }
+ 
++bool ScreenStreamPlugin::wakeScreen()
++{
++    if (!peerSupportsScreenStream()) {
++        setLastError(i18n("Screen streaming is not supported by this device."));
++        return false;
++    }
++    setLastError(QString());
++    NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST, ScreenStreamProtocol::buildWakeRequestBody());
++    sendPacket(np);
++    return true;
++}
++
+ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+ {
+     if (np.type() != PACKET_TYPE_SCREENSTREAM) {
+diff --git a/plugins/screenstream/screenstreamplugin.h b/plugins/screenstream/screenstreamplugin.h
+index 6b59ca543ab58354560b71e77a7698847c2eb994..583e419805d9b53e2d7976ece322266aa49fab8b 100644
+--- a/plugins/screenstream/screenstreamplugin.h
++++ b/plugins/screenstream/screenstreamplugin.h
+@@ -65,6 +65,7 @@ public:
+ 
+     Q_SCRIPTABLE bool startStream();
+     Q_SCRIPTABLE void stopStream();
++    Q_SCRIPTABLE bool wakeScreen();
+     Q_SCRIPTABLE void requestKeyframe();
+ 
+ Q_SIGNALS:
+diff --git a/plugins/screenstream/screenstreamprotocol.cpp b/plugins/screenstream/screenstreamprotocol.cpp
+index 16487305897c59d78db4c94bf07f9bff5607c386..f3e1f4facc23984a0ed619672528da0814933100 100644
+--- a/plugins/screenstream/screenstreamprotocol.cpp
++++ b/plugins/screenstream/screenstreamprotocol.cpp
+@@ -357,6 +357,13 @@ QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int m
+     };
+ }
+ 
++QVariantMap buildWakeRequestBody()
++{
++    return QVariantMap{
++        {QStringLiteral("action"), QStringLiteral("wake")},
++    };
++}
++
+ bool isValidRotation(int rotation)
+ {
+     return rotation == 0 || rotation == 90 || rotation == 180 || rotation == 270;
+diff --git a/plugins/screenstream/screenstreamprotocol.h b/plugins/screenstream/screenstreamprotocol.h
+index 1824acf75f80999695ec08292a33c489574cf90a..0ca3ac2a174a41a51cd28d749fdc2e935b505ae7 100644
+--- a/plugins/screenstream/screenstreamprotocol.h
++++ b/plugins/screenstream/screenstreamprotocol.h
+@@ -150,6 +150,7 @@ private:
+ };
+ 
+ QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int maxBitrateKbps, bool requestAudio);
++QVariantMap buildWakeRequestBody();
+ bool isValidRotation(int rotation);
+ void releaseStreamPayloadSafely(QSharedPointer<QIODevice> &payload, QObject *receiver = nullptr);
+ 
+diff --git a/plugins/screenstream/viewer/viewerwindow.cpp b/plugins/screenstream/viewer/viewerwindow.cpp
+index 2aa001297402a7f051ad97cd4911289909d0ddac..6909a71f92ff184c859d7689f1a1c61a8e4fc3ca 100644
+--- a/plugins/screenstream/viewer/viewerwindow.cpp
++++ b/plugins/screenstream/viewer/viewerwindow.cpp
+@@ -223,7 +223,21 @@ ViewerWindow::ViewerWindow(const ViewerLaunchConfig &config, QWidget *parent)
+     m_socket->connectToServer(m_config.socketPath);
+ }
+ 
+-ViewerWindow::~ViewerWindow() = default;
++ViewerWindow::~ViewerWindow()
++{
++    m_closing = true;
++    if (m_socket) {
++        QObject::disconnect(m_socket, nullptr, this, nullptr);
++        m_socket->abort();
++    }
++    if (m_decoder) {
++        QObject::disconnect(m_decoder, nullptr, this, nullptr);
++        m_decoder->shutdown();
++    }
++    if (m_audioPlayer) {
++        m_audioPlayer->stop();
++    }
++}
+ 
+ void ViewerWindow::setupUi()
+ {
+@@ -243,6 +257,9 @@ void ViewerWindow::setupUi()
+     auto *keyframeAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("view-refresh")), i18n("Refresh Keyframe"));
+     connect(keyframeAct, &QAction::triggered, this, &ViewerWindow::onKeyframeClicked);
+ 
++    auto *wakeAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("preferences-desktop-display")), i18n("Wake Screen"));
++    connect(wakeAct, &QAction::triggered, this, &ViewerWindow::onWakeScreenClicked);
++
+     auto *fitWindowAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("zoom-fit-best")), i18n("Fit Window"));
+     connect(fitWindowAct, &QAction::triggered, this, &ViewerWindow::onFitWindowClicked);
+ 
+@@ -357,7 +374,7 @@ void ViewerWindow::setupDbus()
+ 
+ void ViewerWindow::refreshDbusProperties()
+ {
+-    if (!m_screenstreamIface || !m_screenstreamIface->isValid()) {
++    if (m_closing || !m_screenstreamIface || !m_screenstreamIface->isValid()) {
+         return;
+     }
+     m_accessibilityEnabled = m_screenstreamIface->property("accessibilityEnabled").toBool();
+@@ -368,7 +385,9 @@ void ViewerWindow::refreshDbusProperties()
+     const int dh = m_screenstreamIface->property("displayHeight").toInt();
+     if (dw > 1 && dh > 1) {
+         m_displaySize = QSize(dw, dh);
+-        m_canvas->setRemoteDisplaySize(m_displaySize);
++        if (m_canvas) {
++            m_canvas->setRemoteDisplaySize(m_displaySize);
++        }
+     }
+     const int sw = m_screenstreamIface->property("streamWidth").toInt();
+     const int sh = m_screenstreamIface->property("streamHeight").toInt();
+@@ -380,6 +399,9 @@ void ViewerWindow::refreshDbusProperties()
+ 
+ void ViewerWindow::updateBannerAndInputGate()
+ {
++    if (m_closing || !m_canvas || !m_banner) {
++        return;
++    }
+     const bool remoteCtrlValid = m_remoteControlIface && m_remoteControlIface->isValid();
+     const bool allowInput = m_sessionActive && remoteCtrlValid && m_accessibilityEnabled;
+     m_canvas->setInputEnabled(allowInput);
+@@ -469,11 +491,17 @@ void ViewerWindow::fitWindowToStream(bool force)
+ 
+ void ViewerWindow::onSocketConnected()
+ {
++    if (m_closing) {
++        return;
++    }
+     updateBannerAndInputGate();
+ }
+ 
+ void ViewerWindow::onSocketReadyRead()
+ {
++    if (m_closing || !m_socket) {
++        return;
++    }
+     const QByteArray bytes = m_socket->readAll();
+     if (bytes.isEmpty()) {
+         return;
+@@ -498,13 +526,17 @@ void ViewerWindow::onSocketReadyRead()
+         switch (frame.kind) {
+         case ScreenStreamProtocol::FrameKind::CodecConfig:
+         case ScreenStreamProtocol::FrameKind::VideoAccessUnit: {
+-            const bool isKey = (frame.kind == ScreenStreamProtocol::FrameKind::CodecConfig)
+-                || ((frame.flags & ScreenStreamProtocol::FlagKeyframe) != 0);
+-            m_decoder->pushAccessUnit(frame.payload, frame.ptsUs, isKey);
++            if (m_decoder) {
++                const bool isKey = (frame.kind == ScreenStreamProtocol::FrameKind::CodecConfig)
++                    || ((frame.flags & ScreenStreamProtocol::FlagKeyframe) != 0);
++                m_decoder->pushAccessUnit(frame.payload, frame.ptsUs, isKey);
++            }
+             break;
+         }
+         case ScreenStreamProtocol::FrameKind::AudioPcmChunk:
+-            m_audioPlayer->writePcm(frame.payload);
++            if (m_audioPlayer) {
++                m_audioPlayer->writePcm(frame.payload);
++            }
+             break;
+         case ScreenStreamProtocol::FrameKind::ControlEos:
+             onSocketDisconnected();
+@@ -515,13 +547,21 @@ void ViewerWindow::onSocketReadyRead()
+ 
+ void ViewerWindow::onSocketDisconnected()
+ {
++    if (m_closing) {
++        return;
++    }
+     m_sessionActive = false;
+     updateBannerAndInputGate();
+-    m_audioPlayer->stop();
++    if (m_audioPlayer) {
++        m_audioPlayer->stop();
++    }
+ }
+ 
+ void ViewerWindow::onFrameDecoded(const QImage &frame)
+ {
++    if (m_closing || !m_canvas) {
++        return;
++    }
+     if (!frame.isNull() && frame.size() != m_lastFrameSize) {
+         m_lastFrameSize = frame.size();
+         m_canvas->setFrame(frame);
+@@ -533,14 +573,21 @@ void ViewerWindow::onFrameDecoded(const QImage &frame)
+ 
+ void ViewerWindow::onDecoderError(const QString &message)
+ {
++    if (m_closing) {
++        return;
++    }
+     m_decoderError = message;
+     updateBannerAndInputGate();
+ }
+ 
+ void ViewerWindow::onStopClicked()
+ {
++    m_closing = true;
+     m_sessionActive = false;
+-    updateBannerAndInputGate();
++    if (m_socket) {
++        QObject::disconnect(m_socket, nullptr, this, nullptr);
++        m_socket->close();
++    }
+     if (m_screenstreamIface && m_screenstreamIface->isValid()) {
+         m_screenstreamIface->asyncCall(QStringLiteral("stopStream"));
+     }
+@@ -549,7 +596,9 @@ void ViewerWindow::onStopClicked()
+ 
+ void ViewerWindow::onMuteToggled(bool checked)
+ {
+-    m_audioPlayer->setMuted(checked);
++    if (m_audioPlayer) {
++        m_audioPlayer->setMuted(checked);
++    }
+ }
+ 
+ void ViewerWindow::onKeyframeClicked()
+@@ -559,6 +608,13 @@ void ViewerWindow::onKeyframeClicked()
+     }
+ }
+ 
++void ViewerWindow::onWakeScreenClicked()
++{
++    if (m_screenstreamIface && m_screenstreamIface->isValid()) {
++        m_screenstreamIface->asyncCall(QStringLiteral("wakeScreen"));
++    }
++}
++
+ void ViewerWindow::onFitWindowClicked()
+ {
+     fitWindowToStream(true);
+@@ -594,9 +650,14 @@ void ViewerWindow::onShareFileClicked()
+ void ViewerWindow::onDbusGeometryChanged(int width, int height, int rotation)
+ {
+     Q_UNUSED(rotation)
++    if (m_closing) {
++        return;
++    }
+     if (width > 1 && height > 1) {
+         m_displaySize = QSize(width, height);
+-        m_canvas->setRemoteDisplaySize(m_displaySize);
++        if (m_canvas) {
++            m_canvas->setRemoteDisplaySize(m_displaySize);
++        }
+         if (m_screenstreamIface && m_screenstreamIface->isValid()) {
+             const int sw = m_screenstreamIface->property("streamWidth").toInt();
+             const int sh = m_screenstreamIface->property("streamHeight").toInt();
+@@ -616,6 +677,9 @@ void ViewerWindow::onDbusGeometryChanged(int width, int height, int rotation)
+ 
+ void ViewerWindow::onDbusAudioStatusChanged(bool available, const QString &reason)
+ {
++    if (m_closing) {
++        return;
++    }
+     m_audioAvailable = available;
+     m_audioReason = reason;
+     updateBannerAndInputGate();
+@@ -623,26 +687,42 @@ void ViewerWindow::onDbusAudioStatusChanged(bool available, const QString &reaso
+ 
+ void ViewerWindow::onDbusStateChanged()
+ {
++    if (m_closing) {
++        return;
++    }
+     refreshDbusProperties();
+ }
+ 
+ void ViewerWindow::onDbusStreamingChanged(bool streaming)
+ {
++    if (m_closing) {
++        return;
++    }
+     m_sessionActive = streaming;
+     updateBannerAndInputGate();
+-    if (!streaming) {
++    if (!streaming && m_audioPlayer) {
+         m_audioPlayer->stop();
+     }
+ }
+ 
+ void ViewerWindow::closeEvent(QCloseEvent *event)
+ {
++    m_closing = true;
++    if (m_socket) {
++        QObject::disconnect(m_socket, nullptr, this, nullptr);
++        m_socket->close();
++    }
+     if (m_sessionActive && m_screenstreamIface && m_screenstreamIface->isValid()) {
+         m_sessionActive = false;
+         m_screenstreamIface->call(QDBus::NoBlock, QStringLiteral("stopStream"));
+     }
+-    m_audioPlayer->stop();
+-    m_decoder->shutdown();
++    if (m_audioPlayer) {
++        m_audioPlayer->stop();
++    }
++    if (m_decoder) {
++        QObject::disconnect(m_decoder, nullptr, this, nullptr);
++        m_decoder->shutdown();
++    }
+     QMainWindow::closeEvent(event);
+ }
+ 
+diff --git a/plugins/screenstream/viewer/viewerwindow.h b/plugins/screenstream/viewer/viewerwindow.h
+index 3dc9defedd2c3a5a88be82e42a7cca9f3a729dc1..ae254080a4b5ddc6af8ed980a5581ce6ee696957 100644
+--- a/plugins/screenstream/viewer/viewerwindow.h
++++ b/plugins/screenstream/viewer/viewerwindow.h
+@@ -9,6 +9,7 @@
+ #include <QImage>
+ #include <QMainWindow>
+ #include <QPointF>
++#include <QPointer>
+ #include <QSize>
+ #include <QString>
+ #include <QWidget>
+@@ -100,6 +101,7 @@ private Q_SLOTS:
+     void onStopClicked();
+     void onMuteToggled(bool checked);
+     void onKeyframeClicked();
++    void onWakeScreenClicked();
+     void onFitWindowClicked();
+     void onClipboardClicked();
+     void onShareFileClicked();
+@@ -121,12 +123,12 @@ private:
+     ViewerLaunchConfig m_config;
+     ScreenStreamProtocol::ScreenStreamFrameParser m_parser;
+ 
+-    ScreenStreamVideoDecoder *m_decoder = nullptr;
+-    PcmPlayer *m_audioPlayer = nullptr;
+-    QLocalSocket *m_socket = nullptr;
+-    ScreenCanvasWidget *m_canvas = nullptr;
++    QPointer<ScreenStreamVideoDecoder> m_decoder;
++    QPointer<PcmPlayer> m_audioPlayer;
++    QPointer<QLocalSocket> m_socket;
++    QPointer<ScreenCanvasWidget> m_canvas;
+     QToolBar *m_toolbar = nullptr;
+-    QLabel *m_banner = nullptr;
++    QPointer<QLabel> m_banner;
+     QAction *m_muteAction = nullptr;
+     QAction *m_backAction = nullptr;
+     QAction *m_homeAction = nullptr;
+@@ -138,6 +140,7 @@ private:
+     QDBusInterface *m_clipboardIface = nullptr;
+     QDBusInterface *m_shareIface = nullptr;
+ 
++    bool m_closing = false;
+     bool m_sessionActive = true;
+     bool m_accessibilityEnabled = false;
+     bool m_audioAvailable = false;
+diff --git a/tests/screenstreamtest.cpp b/tests/screenstreamtest.cpp
+index 735537bc647a04171f212daf4aaf5a4e4898cabd..0b9cd1fdb31188a8b3d3593af25d1bc16b3b7c0b 100644
+--- a/tests/screenstreamtest.cpp
++++ b/tests/screenstreamtest.cpp
+@@ -262,6 +262,13 @@ private Q_SLOTS:
+         QTRY_VERIFY(guard.isNull());
+     }
+ 
++    void testWakeRequestBody()
++    {
++        const QVariantMap body = buildWakeRequestBody();
++        QCOMPARE(body.size(), 1);
++        QCOMPARE(body.value(QStringLiteral("action")).toString(), QStringLiteral("wake"));
++    }
++
+     void testPluginMetadataDiscovery()
+     {
+         const QList<KPluginMetaData> plugins = KPluginMetaData::findPlugins(QStringLiteral("kdeconnect"));

@@ -25,9 +25,10 @@ MAINTAINER = "Dmitriy Volkov <dennshield@duck.com>"
 LIBEI_VERSION = "1.6.0"
 LIBEI_URL = "https://gitlab.freedesktop.org/libinput/libei/-/archive/1.6.0/libei-1.6.0.tar.bz2"
 LIBEI_SHA256 = "5ed6078fa63afd554cc04b1001675615da0ed8fe23b80492ab63403140b5a830"
-LIBEI_MUNIT_URL = "http://archive.ubuntu.com/ubuntu/pool/main/libe/libei/libei_1.5.0.orig-munit.tar.bz2"
+LIBEI_MUNIT_URL = "https://archive.ubuntu.com/ubuntu/pool/main/libe/libei/libei_1.5.0.orig-munit.tar.bz2"
 LIBEI_MUNIT_SHA256 = "2407d9d6b6bb99c4c5c7dc0ba25b760faff952c3374b68c78802e8de91b610e9"
-LIBEI_DEBIAN_URL = "http://archive.ubuntu.com/ubuntu/pool/main/libe/libei/libei_1.5.0-3.debian.tar.xz"
+LIBEI_DEBIAN_URL = "https://archive.ubuntu.com/ubuntu/pool/main/libe/libei/libei_1.5.0-3.debian.tar.xz"
+LIBEI_DEBIAN_SHA256 = "be230ad4c73e43ef033e785580ed8d4fe8088cc4c61f72688febedee27b3aa4d"
 
 SPDX_STRIP_FILES = {"kdeconnect.qmlfiles", "qmldeps.overrides", "kdeconnect.maintscript"}
 SPDX_COMMENT_LINE_RE = re.compile(r"^\s*#\s*SPDX-(?:FileCopyrightText|License-Identifier):.*$")
@@ -361,16 +362,19 @@ def prepare_libei_debian_tar(
     timestamp: int | None = None,
 ) -> tuple[bytes, dict]:
     """Update Ubuntu libei debian.tar.xz for an offline 1.6.0 OBS staging backport."""
-    mtime = timestamp if timestamp is not None else int(datetime.now(timezone.utc).timestamp())
     pkg_version = f"{upstream_version}-1~obs{obs_rev}"
     entries: dict[str, tuple[bytes, int]] = {}
+    max_member_mtime = 0
 
     with tarfile.open(fileobj=io.BytesIO(raw_deb_xz), mode="r:xz") as tf:
         for member in tf.getmembers():
             if not member.isfile():
                 continue
+            max_member_mtime = max(max_member_mtime, int(member.mtime))
             data = tf.extractfile(member).read()
             entries[member.name] = (data, member.mode & 0o777)
+
+    mtime = timestamp if timestamp is not None else max_member_mtime
 
     if "debian/control" not in entries or "debian/rules" not in entries or "debian/changelog" not in entries:
         raise ValueError("libei debian tarball is missing control, rules, or changelog")
@@ -417,7 +421,7 @@ def build_libei_bundle(output_dir: Path, obs_rev: int = 1) -> dict:
     output_dir.mkdir(parents=True, exist_ok=True)
     orig_data = _download_verified(LIBEI_URL, LIBEI_SHA256)
     munit_data = _download_verified(LIBEI_MUNIT_URL, LIBEI_MUNIT_SHA256)
-    deb_raw = _download_verified(LIBEI_DEBIAN_URL)
+    deb_raw = _download_verified(LIBEI_DEBIAN_URL, LIBEI_DEBIAN_SHA256)
 
     orig_path = output_dir / f"libei_{LIBEI_VERSION}.orig.tar.bz2"
     munit_path = output_dir / f"libei_{LIBEI_VERSION}.orig-munit.tar.bz2"
@@ -522,12 +526,39 @@ def build_kdeconnect_bundle(
     }
 
 
+def _resolve_dir_git_timestamp(src_dir: Path) -> int:
+    proc = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(src_dir),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "log",
+            "-1",
+            "--format=%ct",
+            "--",
+            ".",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    raw = proc.stdout.strip()
+    if proc.returncode == 0 and raw.isdigit():
+        return int(raw)
+    return 0
+
+
 def build_android_probe_bundle(
     probe_src: Path,
     sdk_root: Path,
     overlay_debian_dir: Path,
     output_dir: Path,
     obs_rev: int = 1,
+    timestamp: int | None = None,
 ) -> dict:
     """Create the OBS 3.0 (quilt) source bundle for prototype/android-probe with offline SDK slice."""
     required_relpaths = [
@@ -547,7 +578,7 @@ def build_android_probe_bundle(
             raise FileNotFoundError(f"Required Android SDK tool/jar missing: {candidate}")
         sdk_files.append(candidate)
 
-    mtime = int(datetime.now(timezone.utc).timestamp())
+    mtime = timestamp if timestamp is not None else _resolve_dir_git_timestamp(probe_src)
     upstream_version = "0.1.0"
     pkg_version = f"{upstream_version}-0ubuntu1~obs{obs_rev}"
     output_dir.mkdir(parents=True, exist_ok=True)

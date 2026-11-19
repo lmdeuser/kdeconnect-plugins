@@ -1,0 +1,441 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 18:03:35 +0500
+Subject: [PATCH 7/8] screenstream: clamp viewer window within monitor bounds
+ on rotation
+
+
+diff --git a/plugins/screenstream/screenstreamprotocol.cpp b/plugins/screenstream/screenstreamprotocol.cpp
+index 834ed04deda6538830d55ab774c7946b76ae371b..0a2f4684217687e5ad8fc17de06bc445554433b9 100644
+--- a/plugins/screenstream/screenstreamprotocol.cpp
++++ b/plugins/screenstream/screenstreamprotocol.cpp
+@@ -197,6 +197,46 @@ QSize ScreenStreamCoordinateMapper::computeTargetCanvasSize(const QSize &sourceS
+                  std::max(1, static_cast<int>(std::lround(static_cast<qreal>(sourceSize.height()) * scale))));
+ }
+ 
++QRect ScreenStreamCoordinateMapper::computeClampedWindowFrame(
++    const QRect &currentFrameRect,
++    const QSize &targetClientSize,
++    const QMargins &frameMargins,
++    const QRect &availableScreenRect,
++    bool anchorCenter)
++{
++    if (targetClientSize.width() <= 0 || targetClientSize.height() <= 0 || availableScreenRect.width() <= 0
++        || availableScreenRect.height() <= 0) {
++        return {};
++    }
++
++    const int extraW = std::max(0, frameMargins.left()) + std::max(0, frameMargins.right());
++    const int extraH = std::max(0, frameMargins.top()) + std::max(0, frameMargins.bottom());
++    const int outerW = std::min(availableScreenRect.width(), targetClientSize.width() + extraW);
++    const int outerH = std::min(availableScreenRect.height(), targetClientSize.height() + extraH);
++
++    int outerX = availableScreenRect.left() + (availableScreenRect.width() - outerW) / 2;
++    int outerY = availableScreenRect.top() + (availableScreenRect.height() - outerH) / 2;
++    if (currentFrameRect.isValid() && !currentFrameRect.isEmpty()) {
++        if (anchorCenter) {
++            const QPoint center = currentFrameRect.center();
++            outerX = center.x() - (outerW / 2);
++            outerY = center.y() - (outerH / 2);
++        } else {
++            outerX = currentFrameRect.left();
++            outerY = currentFrameRect.top();
++        }
++    }
++
++    const int minX = availableScreenRect.left();
++    const int minY = availableScreenRect.top();
++    const int maxX = minX + std::max(0, availableScreenRect.width() - outerW);
++    const int maxY = minY + std::max(0, availableScreenRect.height() - outerH);
++
++    outerX = std::clamp(outerX, minX, maxX);
++    outerY = std::clamp(outerY, minY, maxY);
++    return QRect(outerX, outerY, outerW, outerH);
++}
++
+ std::optional<QPoint> ScreenStreamCoordinateMapper::mapViewportToRemote(
+     const QPointF &pos,
+     const QSizeF &viewportSize,
+diff --git a/plugins/screenstream/screenstreamprotocol.h b/plugins/screenstream/screenstreamprotocol.h
+index 9fa4c78eefda6dd43aab9b1110cafd4c60c20913..7508982e43a1c721d4a7ab5c3d075201b7121178 100644
+--- a/plugins/screenstream/screenstreamprotocol.h
++++ b/plugins/screenstream/screenstreamprotocol.h
+@@ -9,9 +9,11 @@
+ #include <QByteArray>
+ #include <QIODevice>
+ #include <QList>
++#include <QMargins>
+ #include <QObject>
+ #include <QPoint>
+ #include <QPointF>
++#include <QRect>
+ #include <QRectF>
+ #include <QSharedPointer>
+ #include <QSize>
+@@ -87,6 +89,12 @@ class ScreenStreamCoordinateMapper
+ public:
+     static QRectF computeRenderedRect(const QSizeF &viewportSize, const QSize &streamSize);
+     static QSize computeTargetCanvasSize(const QSize &sourceSize, const QSize &maxCanvasSize, const QSize &minCanvasSize = QSize(240, 240));
++    static QRect computeClampedWindowFrame(
++        const QRect &currentFrameRect,
++        const QSize &targetClientSize,
++        const QMargins &frameMargins,
++        const QRect &availableScreenRect,
++        bool anchorCenter = true);
+     static std::optional<QPoint> mapViewportToRemote(
+         const QPointF &pos,
+         const QSizeF &viewportSize,
+diff --git a/plugins/screenstream/viewer/viewerwindow.cpp b/plugins/screenstream/viewer/viewerwindow.cpp
+index d5553c39af462a7931ea52cd6ea7b0442ad3b149..c9b2b7fea361e6d3ba293e18519ce9bcc7b3cd3d 100644
+--- a/plugins/screenstream/viewer/viewerwindow.cpp
++++ b/plugins/screenstream/viewer/viewerwindow.cpp
+@@ -13,10 +13,15 @@
+ 
+ #include <QAction>
+ #include <QCloseEvent>
++#include <QCoreApplication>
+ #include <QDBusConnection>
++#include <QDBusConnectionInterface>
+ #include <QDBusInterface>
++#include <QDBusReply>
++#include <QDir>
+ #include <QDragEnterEvent>
+ #include <QDropEvent>
++#include <QFileDevice>
+ #include <QFileDialog>
+ #include <QFileInfo>
+ #include <QFocusEvent>
+@@ -25,17 +30,20 @@
+ #include <QKeyEvent>
+ #include <QLabel>
+ #include <QLocalSocket>
++#include <QMargins>
+ #include <QMimeData>
+ #include <QMouseEvent>
+ #include <QPainter>
+ #include <QPalette>
+ #include <QScreen>
+ #include <QStandardPaths>
++#include <QTemporaryFile>
+ #include <QTimer>
+ #include <QToolBar>
+ #include <QUrl>
+ #include <QVBoxLayout>
+ #include <QWheelEvent>
++#include <QWindow>
+ 
+ #include <algorithm>
+ 
+@@ -313,6 +321,21 @@ void ViewerWindow::setupUi()
+ 
+     m_toolbar = addToolBar(i18n("Screen Stream Controls"));
+     m_toolbar->setMovable(false);
++    m_toolbar->setToolButtonStyle(Qt::ToolButtonIconOnly);
++
++    m_waylandClampTimer = new QTimer(this);
++    m_waylandClampTimer->setSingleShot(true);
++    connect(m_waylandClampTimer, &QTimer::timeout, this, [this]() {
++        const bool anchor = m_pendingClampAnchorCenter;
++        const QSize targetSize = m_pendingClampClientSize;
++        const QSize prevSize = m_preResizeClientSize;
++        m_pendingClampAnchorCenter = false;
++        m_pendingClampClientSize = QSize();
++        m_preResizeClientSize = QSize();
++        if (targetSize.isValid()) {
++            clampWindowViaKWin(targetSize, prevSize, anchor);
++        }
++    });
+ 
+     auto *stopAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("media-playback-stop")), i18n("Stop"));
+     connect(stopAct, &QAction::triggered, this, &ViewerWindow::onStopClicked);
+@@ -545,21 +568,186 @@ void ViewerWindow::fitWindowToStream(bool force)
+         showNormal();
+     }
+ 
++    const QSize srcSize = effectiveStreamSize();
++    const bool isLandscape = srcSize.width() > srcSize.height();
++    const bool orientationChanged = m_lastFittedLandscape.has_value() && (*m_lastFittedLandscape != isLandscape);
++    m_lastFittedLandscape = isLandscape;
++    const bool anchorCenter = force || orientationChanged;
++
+     QScreen *scr = screen() ? screen() : QGuiApplication::primaryScreen();
+-    const QSize avail = scr ? scr->availableGeometry().size() : QSize(1920, 1080);
++    const QRect availRect = scr ? scr->availableGeometry() : QRect(0, 0, 1920, 1080);
++    const QMargins margins = windowHandle() ? windowHandle()->frameMargins() : QMargins();
++    const bool isWayland = QGuiApplication::platformName().startsWith(QLatin1String("wayland"));
++    // Wayland SSD frames typically report 0 client frameMargins until compositor decorates them.
++    const int ssdReserveH = (isWayland && margins.top() == 0 && margins.bottom() == 0)
++        ? 36
++        : (margins.top() + margins.bottom());
++    const int ssdReserveW = margins.left() + margins.right();
++
+     const int chromeHeight = (isVisible() && m_canvas && m_canvas->height() > 0 && height() >= m_canvas->height())
+         ? (height() - m_canvas->height())
+         : ((m_toolbar ? m_toolbar->sizeHint().height() : 40) + ((m_banner && !m_banner->isHidden()) ? m_banner->sizeHint().height() : 0));
++    const int chromeWidth = (isVisible() && m_canvas && m_canvas->width() > 0 && width() >= m_canvas->width())
++        ? (width() - m_canvas->width())
++        : 0;
+ 
+-    const int maxCanvasW = std::max(240, static_cast<int>(avail.width() * 0.85));
+-    const int maxCanvasH = std::max(240, static_cast<int>(avail.height() * 0.85) - chromeHeight);
++    const int maxCanvasW = std::max(240, static_cast<int>(availRect.width() * 0.85) - chromeWidth - ssdReserveW);
++    const int maxCanvasH = std::max(240, static_cast<int>(availRect.height() * 0.85) - chromeHeight - ssdReserveH);
+     const QSize targetCanvas = ScreenStreamProtocol::ScreenStreamCoordinateMapper::computeTargetCanvasSize(
+-        effectiveStreamSize(),
++        srcSize,
+         QSize(maxCanvasW, maxCanvasH),
+         QSize(240, 240));
+-    if (targetCanvas.isValid()) {
+-        resize(targetCanvas.width(), targetCanvas.height() + chromeHeight);
++    if (!targetCanvas.isValid()) {
++        return;
++    }
++
++    const QSize rawClientSize(targetCanvas.width() + chromeWidth, targetCanvas.height() + chromeHeight);
++    if (!isWayland) {
++        const QRect clampedFrame = ScreenStreamProtocol::ScreenStreamCoordinateMapper::computeClampedWindowFrame(
++            isVisible() ? frameGeometry() : QRect(),
++            rawClientSize,
++            margins,
++            availRect,
++            anchorCenter);
++        if (!clampedFrame.isValid()) {
++            return;
++        }
++        const QSize clientSz(std::max(240, clampedFrame.width() - margins.left() - margins.right()),
++                               std::max(240, clampedFrame.height() - margins.top() - margins.bottom()));
++        resize(clientSz);
++        if (isVisible()) {
++            move(clampedFrame.topLeft());
++        }
++        return;
++    }
++
++    const QSize clientSz(std::min(rawClientSize.width(), std::max(240, availRect.width() - ssdReserveW)),
++                           std::min(rawClientSize.height(), std::max(240, availRect.height() - ssdReserveH)));
++    if (!isVisible()) {
++        resize(clientSz);
++        return;
++    }
++
++    auto *busIface = QDBusConnection::sessionBus().interface();
++    if (busIface && busIface->isServiceRegistered(QStringLiteral("org.kde.KWin"))) {
++        if (!m_preResizeClientSize.isValid()) {
++            m_preResizeClientSize = size();
++        }
++        resize(clientSz);
++        m_pendingClampClientSize = clientSz;
++        m_pendingClampAnchorCenter = m_pendingClampAnchorCenter || anchorCenter;
++        if (m_waylandClampTimer) {
++            m_waylandClampTimer->start(30);
++        }
++        return;
++    }
++
++    // Non-KWin Wayland compositors ignore client move(); re-mapping on orientation flips lets them place within output bounds.
++    if (anchorCenter) {
++        hide();
++        resize(clientSz);
++        show();
++    } else {
++        resize(clientSz);
++    }
++}
++
++bool ViewerWindow::clampWindowViaKWin(const QSize &targetClientSize, const QSize &previousClientSize, bool anchorCenter)
++{
++    if (m_closing || !isVisible() || isMaximized() || isFullScreen() || !targetClientSize.isValid()) {
++        return false;
++    }
++
++    const QMargins margins = windowHandle() ? windowHandle()->frameMargins() : QMargins();
++    const int fallbackExtraW = std::max(0, margins.left()) + std::max(0, margins.right());
++    const int fallbackExtraH = std::max(0, margins.top()) + std::max(0, margins.bottom());
++    const int prevClientW = previousClientSize.isValid() ? previousClientSize.width() : targetClientSize.width();
++    const int prevClientH = previousClientSize.isValid() ? previousClientSize.height() : targetClientSize.height();
++
++    QString tempBase = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
++    if (tempBase.isEmpty()) {
++        tempBase = QDir::tempPath();
++    }
++    QTemporaryFile scriptFile(tempBase + QStringLiteral("/kdeconnect-ss-clamp-XXXXXX.js"));
++    if (!scriptFile.open()) {
++        return false;
++    }
++    scriptFile.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
++
++    const qint64 pid = QCoreApplication::applicationPid();
++    const QString script = QStringLiteral(
++        "(function(){\n"
++        "  const targetPid = %1;\n"
++        "  const targetClientW = %2;\n"
++        "  const targetClientH = %3;\n"
++        "  const prevClientW = %4;\n"
++        "  const prevClientH = %5;\n"
++        "  const fallbackExtraW = %6;\n"
++        "  const fallbackExtraH = %7;\n"
++        "  const anchorCenter = %8;\n"
++        "  for (const w of workspace.windowList()) {\n"
++        "    if (w.pid !== targetPid || !w.normalWindow || w.minimized || w.fullScreen) continue;\n"
++        "    const area = workspace.clientArea(2, w);\n"
++        "    if (!area || area.width <= 0 || area.height <= 0) continue;\n"
++        "    const fg = w.frameGeometry;\n"
++        "    const cg = w.clientGeometry;\n"
++        "    const extraW = (cg && cg.width > 0) ? Math.max(0, Math.round(fg.width - cg.width)) : fallbackExtraW;\n"
++        "    const extraH = (cg && cg.height > 0) ? Math.max(0, Math.round(fg.height - cg.height)) : fallbackExtraH;\n"
++        "    const areaLeft = Math.round(area.left);\n"
++        "    const areaTop = Math.round(area.top);\n"
++        "    const areaW = Math.round(area.width);\n"
++        "    const areaH = Math.round(area.height);\n"
++        "    const wantW = Math.min(areaW, targetClientW + extraW);\n"
++        "    const wantH = Math.min(areaH, targetClientH + extraH);\n"
++        "    let nx = Math.round(fg.x);\n"
++        "    let ny = Math.round(fg.y);\n"
++        "    if (anchorCenter) {\n"
++        "      const prevOuterW = Math.min(areaW, prevClientW + extraW);\n"
++        "      const prevOuterH = Math.min(areaH, prevClientH + extraH);\n"
++        "      nx = Math.round(fg.x + (prevOuterW - wantW) * 0.5);\n"
++        "      ny = Math.round(fg.y + (prevOuterH - wantH) * 0.5);\n"
++        "    }\n"
++        "    const maxX = areaLeft + Math.max(0, areaW - wantW);\n"
++        "    const maxY = areaTop + Math.max(0, areaH - wantH);\n"
++        "    nx = Math.max(areaLeft, Math.min(maxX, nx));\n"
++        "    ny = Math.max(areaTop, Math.min(maxY, ny));\n"
++        "    if (Math.round(fg.x) !== nx || Math.round(fg.y) !== ny || Math.round(fg.width) !== wantW || Math.round(fg.height) !== wantH) {\n"
++        "      w.frameGeometry = {x: nx, y: ny, width: wantW, height: wantH};\n"
++        "    }\n"
++        "  }\n"
++        "})();\n")
++                                 .arg(pid)
++                                 .arg(targetClientSize.width())
++                                 .arg(targetClientSize.height())
++                                 .arg(prevClientW)
++                                 .arg(prevClientH)
++                                 .arg(fallbackExtraW)
++                                 .arg(fallbackExtraH)
++                                 .arg(anchorCenter ? QStringLiteral("true") : QStringLiteral("false"));
++
++    if (scriptFile.write(script.toUtf8()) < 0 || !scriptFile.flush()) {
++        return false;
++    }
++
++    QDBusConnection bus = QDBusConnection::sessionBus();
++    QDBusInterface scripting(QStringLiteral("org.kde.KWin"), QStringLiteral("/Scripting"), QStringLiteral("org.kde.kwin.Scripting"), bus);
++    if (!scripting.isValid()) {
++        return false;
++    }
++
++    const QString pluginName = QStringLiteral("kdeconnect_screenstream_fit_%1_%2").arg(pid).arg(++m_kwinClampSeq);
++    QDBusReply<int> loadReply = scripting.call(QStringLiteral("loadScript"), scriptFile.fileName(), pluginName);
++    if (!loadReply.isValid() || loadReply.value() < 0) {
++        return false;
++    }
++
++    const QString scriptPath = QStringLiteral("/Scripting/Script%1").arg(loadReply.value());
++    QDBusInterface scriptObj(QStringLiteral("org.kde.KWin"), scriptPath, QStringLiteral("org.kde.kwin.Script"), bus);
++    if (scriptObj.isValid()) {
++        scriptObj.call(QStringLiteral("run"));
+     }
++    scripting.call(QStringLiteral("unloadScript"), pluginName);
++    return true;
+ }
+ 
+ void ViewerWindow::onSocketConnected()
+diff --git a/plugins/screenstream/viewer/viewerwindow.h b/plugins/screenstream/viewer/viewerwindow.h
+index af907a23a87964eb90d317c604cdf5e0ebc31283..55b654a3d3dce50953ed721cfc1cf9711e34c8d0 100644
+--- a/plugins/screenstream/viewer/viewerwindow.h
++++ b/plugins/screenstream/viewer/viewerwindow.h
+@@ -14,6 +14,8 @@
+ #include <QString>
+ #include <QWidget>
+ 
++#include <optional>
++
+ #include "screenstreamprotocol.h"
+ 
+ class ScreenStreamVideoDecoder;
+@@ -129,6 +131,7 @@ private:
+     void updateBannerAndInputGate();
+     QSize effectiveStreamSize() const;
+     void fitWindowToStream(bool force = false);
++    bool clampWindowViaKWin(const QSize &targetClientSize, const QSize &previousClientSize, bool anchorCenter);
+     void sendRemoteControlCommand(const QVariantMap &body);
+ 
+     ViewerLaunchConfig m_config;
+@@ -144,6 +147,7 @@ private:
+     QAction *m_backAction = nullptr;
+     QAction *m_homeAction = nullptr;
+     QAction *m_recentsAction = nullptr;
++    QTimer *m_waylandClampTimer = nullptr;
+ 
+     QDBusInterface *m_screenstreamIface = nullptr;
+     QDBusInterface *m_remoteControlIface = nullptr;
+@@ -156,9 +160,14 @@ private:
+     bool m_accessibilityEnabled = false;
+     bool m_audioAvailable = false;
+     bool m_protectedContentActive = false;
++    bool m_pendingClampAnchorCenter = false;
++    std::optional<bool> m_lastFittedLandscape;
++    int m_kwinClampSeq = 0;
+     QString m_audioReason;
+     QString m_decoderError;
+     QSize m_displaySize;
+     QSize m_streamSize;
+     QSize m_lastFrameSize;
++    QSize m_pendingClampClientSize;
++    QSize m_preResizeClientSize;
+ };
+diff --git a/tests/screenstreamtest.cpp b/tests/screenstreamtest.cpp
+index b467675e3272ca2219251d53e064bd725ed74563..a48c82ecde81d34a234aeaf97e519dc1efbbcc5b 100644
+--- a/tests/screenstreamtest.cpp
++++ b/tests/screenstreamtest.cpp
+@@ -221,6 +221,49 @@ private Q_SLOTS:
+         QVERIFY(!ScreenStreamCoordinateMapper::computeTargetCanvasSize(QSize(0, 100), QSize(1000, 1000)).isValid());
+     }
+ 
++    void testWindowFrameRotationClamping()
++    {
++        const QRect avail(0, 0, 1280, 722);
++        const QMargins margins(0, 28, 0, 0);
++
++        // Portrait near right edge rotating to landscape must clamp cleanly inside work area.
++        const QRect portraitRight(920, 100, 320, 608);
++        const QRect clampedLand = ScreenStreamCoordinateMapper::computeClampedWindowFrame(portraitRight, QSize(960, 480), margins, avail, true);
++        QCOMPARE(clampedLand.size(), QSize(960, 508));
++        QVERIFY(avail.contains(clampedLand));
++        QCOMPARE(clampedLand.left() + clampedLand.width(), 1280);
++
++        // Landscape near bottom edge rotating to portrait must pull top up to fit within 722 px height.
++        const QRect landscapeBottom(200, 214, 960, 508);
++        const QRect clampedPort = ScreenStreamCoordinateMapper::computeClampedWindowFrame(landscapeBottom, QSize(320, 580), margins, avail, true);
++        QCOMPARE(clampedPort.size(), QSize(320, 608));
++        QVERIFY(avail.contains(clampedPort));
++        QCOMPARE(clampedPort.top(), 114);
++        QCOMPARE(clampedPort.top() + clampedPort.height(), 722);
++
++        // Multi-monitor negative and positive offsets remain inside the active screen bounds.
++        const QRect leftMonitor(-1920, 40, 1920, 1040);
++        const QRect clampedLeft = ScreenStreamCoordinateMapper::computeClampedWindowFrame(
++            QRect(-350, 200, 320, 608), QSize(960, 480), margins, leftMonitor, false);
++        QVERIFY(leftMonitor.contains(clampedLeft));
++        QCOMPARE(clampedLeft.left() + clampedLeft.width(), 0);
++
++        const QRect rightMonitor(1920, 0, 2560, 1400);
++        const QRect clampedRight = ScreenStreamCoordinateMapper::computeClampedWindowFrame(
++            QRect(4200, 950, 320, 608), QSize(1200, 700), margins, rightMonitor, true);
++        QVERIFY(rightMonitor.contains(clampedRight));
++
++        // Oversized target window clamps outer dimensions down to available work area.
++        const QRect oversized = ScreenStreamCoordinateMapper::computeClampedWindowFrame(
++            QRect(100, 100, 500, 500), QSize(2400, 1400), margins, avail, true);
++        QCOMPARE(oversized, avail);
++
++        // Empty initial frame rect centers inside the work area.
++        const QRect initialCentered = ScreenStreamCoordinateMapper::computeClampedWindowFrame(
++            QRect(), QSize(320, 580), margins, avail, true);
++        QCOMPARE(initialCentered, QRect(480, 57, 320, 608));
++    }
++
+     void testSessionStateMachineAndReconnectSuppression()
+     {
+         ScreenStreamSessionMachine sm;

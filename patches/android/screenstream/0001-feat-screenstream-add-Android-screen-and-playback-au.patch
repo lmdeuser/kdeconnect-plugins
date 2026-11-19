@@ -1,0 +1,2827 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Wed, 18 Nov 2026 23:56:24 +0500
+Subject: [PATCH 1/6] feat(screenstream): add Android screen and playback audio
+ stream plugin
+
+
+diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
+index 8bf7ff8c5a43384bd29a33261942d580d5b4e0ce..71c06fdb416ed7f5636614872213b046a245fcba 100644
+--- a/src/main/AndroidManifest.xml
++++ b/src/main/AndroidManifest.xml
+@@ -68,6 +68,7 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <uses-permission android:name="android.permission.READ_LOGS" tools:ignore="ProtectedPermissions" />
+     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+     <uses-permission android:name="android.permission.CAMERA" />
+@@ -207,6 +208,20 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+             android:theme="@style/Theme.Transparent"
+             android:excludeFromRecents="true"/>
+ 
++        <activity
++            android:name="org.kde.kdeconnect.plugins.screenstream.ScreenStreamPermissionActivity"
++            android:exported="false"
++            android:excludeFromRecents="true"
++            android:noHistory="true"
++            android:theme="@style/Theme.Transparent"
++            tools:targetApi="r" />
++
++        <service
++            android:name="org.kde.kdeconnect.plugins.screenstream.ScreenStreamService"
++            android:exported="false"
++            android:foregroundServiceType="mediaProjection"
++            tools:targetApi="r" />
++
+         <activity
+             android:name="org.kde.kdeconnect.plugins.mpris.MprisActivity"
+             android:label="@string/open_mpris_controls"
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..00f31bcbdafb9533ec4004041afc512128cce6cc
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/AudioPlaybackCapturer.kt
+@@ -0,0 +1,173 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.screenstream
++
++import android.Manifest
++import android.annotation.SuppressLint
++import android.content.Context
++import android.content.pm.PackageManager
++import android.media.AudioAttributes
++import android.media.AudioFormat
++import android.media.AudioPlaybackCaptureConfiguration
++import android.media.AudioRecord
++import android.media.projection.MediaProjection
++import android.os.Build
++import android.os.SystemClock
++import android.util.Log
++import androidx.annotation.RequiresApi
++import androidx.core.content.ContextCompat
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicLong
++import kotlin.math.max
++
++@RequiresApi(Build.VERSION_CODES.R)
++class AudioPlaybackCapturer(
++    private val context: Context,
++    private val mediaProjection: MediaProjection,
++    private val muxerQueue: StreamMuxerQueue,
++    private val lastPtsUs: AtomicLong,
++    private val onAudioStatusChanged: (available: Boolean, reason: String) -> Unit,
++) {
++    data class StartResult(
++        val available: Boolean,
++        val reason: String,
++    )
++
++    private var audioRecord: AudioRecord? = null
++    private var workerThread: Thread? = null
++    private val running = AtomicBoolean(false)
++
++    @SuppressLint("MissingPermission")
++    fun start(): StartResult {
++        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
++            return StartResult(available = false, reason = "RECORD_AUDIO permission not granted")
++        }
++
++        return try {
++            val minBytes = AudioRecord.getMinBufferSize(
++                SAMPLE_RATE_HZ,
++                AudioFormat.CHANNEL_IN_MONO,
++                AudioFormat.ENCODING_PCM_16BIT,
++            )
++            if (minBytes <= 0) {
++                return StartResult(available = false, reason = "Incompatible audio capture buffer on device")
++            }
++
++            val captureConfig = AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
++                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
++                .addMatchingUsage(AudioAttributes.USAGE_GAME)
++                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
++                .build()
++
++            val format = AudioFormat.Builder()
++                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
++                .setSampleRate(SAMPLE_RATE_HZ)
++                .setChannelMask(AudioFormat.CHANNEL_IN_MONO)
++                .build()
++
++            val recorder = AudioRecord.Builder()
++                .setAudioFormat(format)
++                .setBufferSizeInBytes(max(minBytes, CHUNK_BYTES * 4))
++                .setAudioPlaybackCaptureConfig(captureConfig)
++                .build()
++
++            if (recorder.state != AudioRecord.STATE_INITIALIZED) {
++                recorder.release()
++                return StartResult(available = false, reason = "AudioRecord failed to initialize")
++            }
++
++            audioRecord = recorder
++            running.set(true)
++            recorder.startRecording()
++
++            val thread = Thread({ readLoop(recorder) }, "ScreenStreamAudio")
++            workerThread = thread
++            thread.start()
++
++            StartResult(available = true, reason = "")
++        } catch (e: SecurityException) {
++            Log.w(TAG, "Audio capture permission error", e)
++            stop()
++            StartResult(available = false, reason = "RECORD_AUDIO permission denied")
++        } catch (e: RuntimeException) {
++            Log.w(TAG, "Playback audio capture unavailable", e)
++            stop()
++            StartResult(available = false, reason = "Playback audio unavailable: ${e.javaClass.simpleName}")
++        }
++    }
++
++    fun stop() {
++        running.set(false)
++        val recorder = audioRecord
++        audioRecord = null
++        if (recorder != null) {
++            try {
++                recorder.stop()
++            } catch (_: IllegalStateException) {
++            }
++        }
++        val thread = workerThread
++        workerThread = null
++        if (thread != null && thread !== Thread.currentThread()) {
++            try {
++                thread.join(1000)
++            } catch (_: InterruptedException) {
++                Thread.currentThread().interrupt()
++            }
++        }
++        recorder?.release()
++    }
++
++    private fun readLoop(recorder: AudioRecord) {
++        val samples = ShortArray(CHUNK_SAMPLES)
++        val pcmBytes = ByteArray(CHUNK_BYTES)
++        try {
++            while (running.get() && !muxerQueue.isClosed) {
++                val readCount = recorder.read(samples, 0, samples.size)
++                if (readCount < 0) {
++                    if (running.get()) {
++                        onAudioStatusChanged(false, "Audio playback read stopped (code $readCount)")
++                    }
++                    break
++                }
++                if (readCount == 0) {
++                    continue
++                }
++                for (i in 0 until readCount) {
++                    val sample = samples[i].toInt()
++                    pcmBytes[i * 2] = (sample and 0xFF).toByte()
++                    pcmBytes[i * 2 + 1] = ((sample ushr 8) and 0xFF).toByte()
++                }
++                val ptsUs = nextMonotonicPts()
++                muxerQueue.offerAudioChunk(ptsUs, pcmBytes, readCount * 2)
++            }
++        } catch (e: RuntimeException) {
++            if (running.get()) {
++                Log.w(TAG, "Audio read loop aborted", e)
++                onAudioStatusChanged(false, "Playback audio interrupted")
++            }
++        }
++    }
++
++    private fun nextMonotonicPts(): Long {
++        val clockNowUs = SystemClock.elapsedRealtimeNanos() / 1000L
++        while (true) {
++            val prev = lastPtsUs.get()
++            val next = if (clockNowUs > prev) clockNowUs else prev + 1L
++            if (lastPtsUs.compareAndSet(prev, next)) {
++                return next
++            }
++        }
++    }
++
++    companion object {
++        private const val TAG = "AudioPlaybackCapturer"
++        const val SAMPLE_RATE_HZ = 48000
++        private const val CHUNK_SAMPLES = 960
++        private const val CHUNK_BYTES = CHUNK_SAMPLES * 2
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..7fd6d403db7fa275f99b4ff56f31d87187572a5d
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenEncoder.kt
+@@ -0,0 +1,264 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.screenstream
++
++import android.media.MediaCodec
++import android.media.MediaCodecInfo
++import android.media.MediaFormat
++import android.os.Build
++import android.os.Bundle
++import android.os.SystemClock
++import android.util.Log
++import android.view.Surface
++import androidx.annotation.RequiresApi
++import java.io.ByteArrayOutputStream
++import java.nio.ByteBuffer
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicLong
++
++@RequiresApi(Build.VERSION_CODES.R)
++class ScreenEncoder(
++    val width: Int,
++    val height: Int,
++    private val fps: Int,
++    private val bitrateKbps: Int,
++    private val muxerQueue: StreamMuxerQueue,
++    private val protectedContentActive: AtomicBoolean,
++    private val lastPtsUs: AtomicLong,
++    private val onFatalError: (String) -> Unit,
++) {
++    private var codec: MediaCodec? = null
++    private var workerThread: Thread? = null
++    private val stopRequested = AtomicBoolean(false)
++    private val syncRequestPending = AtomicBoolean(false)
++    private val emitConfigBeforeNextKeyframe = AtomicBoolean(false)
++
++    @Volatile
++    private var cachedCodecConfig: ByteArray? = null
++
++    var inputSurface: Surface? = null
++        private set
++
++    fun start() {
++        val created = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
++        val surface = configureAndCreateSurface(created)
++        created.start()
++        codec = created
++        inputSurface = surface
++        stopRequested.set(false)
++
++        val thread = Thread(::drainLoop, "ScreenStreamEncoder")
++        workerThread = thread
++        thread.start()
++    }
++
++    fun requestSyncFrame(forceCodecConfig: Boolean = false) {
++        if (forceCodecConfig) {
++            emitConfigBeforeNextKeyframe.set(true)
++        }
++        syncRequestPending.set(true)
++    }
++
++    fun stop() {
++        stopRequested.set(true)
++        val thread = workerThread
++        workerThread = null
++        if (thread != null && thread !== Thread.currentThread()) {
++            try {
++                thread.join(1500)
++            } catch (_: InterruptedException) {
++                Thread.currentThread().interrupt()
++            }
++        }
++        releaseCodecResources()
++    }
++
++    private fun configureAndCreateSurface(encoder: MediaCodec): Surface {
++        val baseFormat = buildVideoFormat(includeLowLatency = true)
++        try {
++            encoder.configure(baseFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
++            return encoder.createInputSurface()
++        } catch (first: Exception) {
++            Log.w(TAG, "Low-latency AVC format rejected, retrying core format: ${first.message}")
++            encoder.reset()
++            val fallbackFormat = buildVideoFormat(includeLowLatency = false)
++            encoder.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
++            return encoder.createInputSurface()
++        }
++    }
++
++    private fun buildVideoFormat(includeLowLatency: Boolean): MediaFormat {
++        return MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
++            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
++            setInteger(MediaFormat.KEY_BIT_RATE, bitrateKbps * 1000)
++            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
++            setInteger(MediaFormat.KEY_FRAME_RATE, fps)
++            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
++            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
++            if (includeLowLatency) {
++                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
++            }
++        }
++    }
++
++    private fun drainLoop() {
++        val bufferInfo = MediaCodec.BufferInfo()
++        val encoder = codec ?: return
++        try {
++            while (!stopRequested.get() && !muxerQueue.isClosed) {
++                if (syncRequestPending.getAndSet(false)) {
++                    applySyncFrameRequest(encoder)
++                }
++
++                val index = encoder.dequeueOutputBuffer(bufferInfo, 25_000L)
++                if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
++                    val csd = extractCodecConfigFromFormat(encoder.outputFormat)
++                    if (csd != null && csd.isNotEmpty()) {
++                        cachedCodecConfig = csd
++                        emitConfigBeforeNextKeyframe.set(false)
++                        muxerQueue.offerCodecConfig(nextMonotonicPts(0L), csd)
++                    }
++                    continue
++                }
++                if (index < 0) {
++                    continue
++                }
++
++                try {
++                    val outBuffer = encoder.getOutputBuffer(index) ?: continue
++                    if (bufferInfo.size <= 0) {
++                        continue
++                    }
++                    outBuffer.position(bufferInfo.offset)
++                    outBuffer.limit(bufferInfo.offset + bufferInfo.size)
++                    val bytes = ByteArray(bufferInfo.size)
++                    outBuffer.get(bytes)
++
++                    val ptsUs = nextMonotonicPts(bufferInfo.presentationTimeUs)
++                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
++                        val normalized = normalizeCodecConfigToAnnexB(bytes)
++                        if (normalized.isNotEmpty()) {
++                            cachedCodecConfig = normalized
++                            emitConfigBeforeNextKeyframe.set(false)
++                            muxerQueue.offerCodecConfig(ptsUs, normalized)
++                        }
++                        continue
++                    }
++
++                    val isKeyframe = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
++                    if (isKeyframe && emitConfigBeforeNextKeyframe.getAndSet(false)) {
++                        cachedCodecConfig?.let { cfg ->
++                            muxerQueue.offerCodecConfig(ptsUs, cfg)
++                        }
++                    }
++
++                    var frameFlags = if (isKeyframe) {
++                        ScreenStreamProtocol.FLAG_KEYFRAME
++                    } else {
++                        ScreenStreamProtocol.FLAG_NONE
++                    }
++                    if (protectedContentActive.get()) {
++                        frameFlags = frameFlags or ScreenStreamProtocol.FLAG_PROTECTED_CONTENT
++                    }
++
++                    val offer = muxerQueue.offerVideoFrame(frameFlags, ptsUs, bytes)
++                    if (offer.requestSyncFrame) {
++                        syncRequestPending.set(true)
++                    }
++                } finally {
++                    encoder.releaseOutputBuffer(index, false)
++                }
++            }
++        } catch (e: Exception) {
++            if (!stopRequested.get()) {
++                Log.e(TAG, "Hardware screen encoder failed", e)
++                onFatalError("Screen encoder error: ${e.message ?: e.javaClass.simpleName}")
++            }
++        }
++    }
++
++    private fun applySyncFrameRequest(encoder: MediaCodec) {
++        try {
++            val params = Bundle().apply {
++                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
++            }
++            encoder.setParameters(params)
++        } catch (e: IllegalStateException) {
++            Log.w(TAG, "Unable to request sync frame during state transition", e)
++        }
++    }
++
++    private fun nextMonotonicPts(encoderPtsUs: Long): Long {
++        val clockNowUs = SystemClock.elapsedRealtimeNanos() / 1000L
++        val candidate = if (encoderPtsUs > 0L) encoderPtsUs else clockNowUs
++        while (true) {
++            val prev = lastPtsUs.get()
++            val next = if (candidate > prev) candidate else prev + 1L
++            if (lastPtsUs.compareAndSet(prev, next)) {
++                return next
++            }
++        }
++    }
++
++    private fun releaseCodecResources() {
++        val encoder = codec
++        codec = null
++        val surface = inputSurface
++        inputSurface = null
++        if (encoder != null) {
++            try {
++                encoder.stop()
++            } catch (_: IllegalStateException) {
++            }
++            try {
++                encoder.release()
++            } catch (_: RuntimeException) {
++            }
++        }
++        surface?.release()
++    }
++
++    companion object {
++        private const val TAG = "ScreenEncoder"
++
++        internal fun extractCodecConfigFromFormat(format: MediaFormat): ByteArray? {
++            val out = ByteArrayOutputStream()
++            listOf("csd-0", "csd-1", "csd-2").forEach { key ->
++                if (format.containsKey(key)) {
++                    val buf: ByteBuffer? = format.getByteBuffer(key)
++                    if (buf != null && buf.remaining() > 0) {
++                        val copy = buf.duplicate()
++                        val data = ByteArray(copy.remaining())
++                        copy.get(data)
++                        out.writeBytesCompat(normalizeCodecConfigToAnnexB(data))
++                    }
++                }
++            }
++            val result = out.toByteArray()
++            return if (result.isEmpty()) null else result
++        }
++
++        internal fun normalizeCodecConfigToAnnexB(raw: ByteArray): ByteArray {
++            if (raw.size >= 4 && raw[0].toInt() == 0 && raw[1].toInt() == 0 &&
++                (raw[2].toInt() == 1 || (raw[2].toInt() == 0 && raw[3].toInt() == 1))
++            ) {
++                return raw
++            }
++            val prefixed = ByteArray(4 + raw.size)
++            prefixed[0] = 0
++            prefixed[1] = 0
++            prefixed[2] = 0
++            prefixed[3] = 1
++            System.arraycopy(raw, 0, prefixed, 4, raw.size)
++            return prefixed
++        }
++
++        private fun ByteArrayOutputStream.writeBytesCompat(data: ByteArray) {
++            write(data, 0, data.size)
++        }
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..5d854676a01be0913ad71591b070a0a3ca5b11d9
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPermissionActivity.kt
+@@ -0,0 +1,123 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.screenstream
++
++import android.content.Context
++import android.content.Intent
++import android.media.projection.MediaProjectionManager
++import android.os.Build
++import android.os.Bundle
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.annotation.RequiresApi
++import androidx.appcompat.app.AppCompatActivity
++import androidx.core.content.ContextCompat
++import org.kde.kdeconnect.KdeConnect
++
++@RequiresApi(Build.VERSION_CODES.R)
++class ScreenStreamPermissionActivity : AppCompatActivity() {
++
++    private var deviceId: String? = null
++    private var maxWidth: Int = ScreenStreamProtocol.DEFAULT_MAX_WIDTH
++    private var maxHeight: Int = ScreenStreamProtocol.DEFAULT_MAX_HEIGHT
++    private var maxFps: Int = ScreenStreamProtocol.DEFAULT_MAX_FPS
++    private var maxBitrateKbps: Int = ScreenStreamProtocol.DEFAULT_BITRATE_KBPS
++    private var requestAudio: Boolean = true
++    private var handledResult = false
++
++    private val projectionLauncher = registerForActivityResult(
++        ActivityResultContracts.StartActivityForResult()
++    ) { result ->
++        handledResult = true
++        val data = result.data
++        val targetDeviceId = deviceId
++        if (result.resultCode == RESULT_OK && data != null && !targetDeviceId.isNullOrEmpty()) {
++            val serviceIntent = ScreenStreamService.createStartIntent(
++                context = this,
++                deviceId = targetDeviceId,
++                resultCode = result.resultCode,
++                consentData = data,
++                params = ScreenStreamProtocol.StartParams(
++                    maxWidth = maxWidth,
++                    maxHeight = maxHeight,
++                    maxFps = maxFps,
++                    maxBitrateKbps = maxBitrateKbps,
++                    requestAudio = requestAudio,
++                ),
++            )
++            ContextCompat.startForegroundService(this, serviceIntent)
++        } else if (!targetDeviceId.isNullOrEmpty()) {
++            KdeConnect.getInstance()
++                .getDevicePlugin(targetDeviceId, ScreenStreamPlugin::class.java)
++                ?.onConsentDenied()
++        }
++        finish()
++    }
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++
++        deviceId = intent.getStringExtra(EXTRA_DEVICE_ID)
++        maxWidth = intent.getIntExtra(EXTRA_MAX_WIDTH, ScreenStreamProtocol.DEFAULT_MAX_WIDTH)
++        maxHeight = intent.getIntExtra(EXTRA_MAX_HEIGHT, ScreenStreamProtocol.DEFAULT_MAX_HEIGHT)
++        maxFps = intent.getIntExtra(EXTRA_MAX_FPS, ScreenStreamProtocol.DEFAULT_MAX_FPS)
++        maxBitrateKbps = intent.getIntExtra(EXTRA_MAX_BITRATE_KBPS, ScreenStreamProtocol.DEFAULT_BITRATE_KBPS)
++        requestAudio = intent.getBooleanExtra(EXTRA_REQUEST_AUDIO, true)
++
++        if (deviceId.isNullOrEmpty()) {
++            finish()
++            return
++        }
++
++        if (savedInstanceState == null) {
++            val mgr = getSystemService(MediaProjectionManager::class.java)
++            if (mgr == null) {
++                KdeConnect.getInstance()
++                    .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                    ?.onConsentDenied()
++                finish()
++                return
++            }
++            projectionLauncher.launch(mgr.createScreenCaptureIntent())
++        }
++    }
++
++    override fun onDestroy() {
++        if (isFinishing && !handledResult) {
++            val targetDeviceId = deviceId
++            if (!targetDeviceId.isNullOrEmpty()) {
++                KdeConnect.getInstance()
++                    .getDevicePlugin(targetDeviceId, ScreenStreamPlugin::class.java)
++                    ?.onConsentDenied()
++            }
++        }
++        super.onDestroy()
++    }
++
++    companion object {
++        const val EXTRA_DEVICE_ID = "screenstream_device_id"
++        const val EXTRA_MAX_WIDTH = "screenstream_max_width"
++        const val EXTRA_MAX_HEIGHT = "screenstream_max_height"
++        const val EXTRA_MAX_FPS = "screenstream_max_fps"
++        const val EXTRA_MAX_BITRATE_KBPS = "screenstream_max_bitrate_kbps"
++        const val EXTRA_REQUEST_AUDIO = "screenstream_request_audio"
++
++        fun createIntent(
++            context: Context,
++            deviceId: String,
++            params: ScreenStreamProtocol.StartParams,
++        ): Intent {
++            return Intent(context, ScreenStreamPermissionActivity::class.java).apply {
++                putExtra(EXTRA_DEVICE_ID, deviceId)
++                putExtra(EXTRA_MAX_WIDTH, params.maxWidth)
++                putExtra(EXTRA_MAX_HEIGHT, params.maxHeight)
++                putExtra(EXTRA_MAX_FPS, params.maxFps)
++                putExtra(EXTRA_MAX_BITRATE_KBPS, params.maxBitrateKbps)
++                putExtra(EXTRA_REQUEST_AUDIO, params.requestAudio)
++            }
++        }
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..b163bfd7854a29c5e58162ef1b4a02d5e358b864
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamPlugin.kt
+@@ -0,0 +1,650 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.screenstream
++
++import android.Manifest
++import android.app.Activity
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.Intent
++import android.hardware.display.DisplayManager
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import android.view.Display
++import android.view.WindowManager
++import android.view.accessibility.AccessibilityManager
++import androidx.annotation.RequiresApi
++import androidx.core.app.NotificationCompat
++import androidx.core.content.edit
++import androidx.core.content.getSystemService
++import org.kde.kdeconnect.Device
++import org.kde.kdeconnect.KdeConnectAccessibilityService
++import org.kde.kdeconnect.NetworkPacket
++import org.kde.kdeconnect.helpers.LifecycleHelper
++import org.kde.kdeconnect.helpers.NotificationHelper
++import org.kde.kdeconnect.plugins.Plugin
++import org.kde.kdeconnect.plugins.PluginFactory
++import org.kde.kdeconnect.plugins.mousereceiver.MouseReceiverPlugin
++import org.kde.kdeconnect.plugins.remotekeyboard.RemoteKeyboardPlugin
++import org.kde.kdeconnect.ui.PluginSettingsFragment
++import org.kde.kdeconnect_tp.R
++
++@PluginFactory.LoadablePlugin
++@RequiresApi(Build.VERSION_CODES.R)
++class ScreenStreamPlugin : Plugin() {
++
++    private val mainHandler = Handler(Looper.getMainLooper())
++    private val sessionTracker = ScreenStreamSessionTracker()
++    private val reconnectRunnable = Runnable { attemptScheduledReconnect() }
++
++    @Volatile
++    private var activeMuxerQueue: StreamMuxerQueue? = null
++
++    @Volatile
++    private var activeStreamPacket: NetworkPacket? = null
++
++    @Volatile
++    private var pendingAccessibilityReload: Boolean = false
++
++    private var a11yStateListener: AccessibilityManager.AccessibilityStateChangeListener? = null
++    private var a11yServicesListener: Any? = null
++
++    private var audioAvailable: Boolean = false
++    private var audioReason: String = ""
++    private var lastDisplayWidth: Int = 0
++    private var lastDisplayHeight: Int = 0
++    private var lastRotationDegrees: Int = 0
++
++    override val minSdk: Int = Build.VERSION_CODES.R
++
++    override val keepAliveWhenUnreachable: Boolean = true
++
++    override val hasSettings: Boolean = true
++
++    override val settingsScope: SettingsScope = SettingsScope.PER_DEVICE
++
++    override val displayName: String
++        get() = context.getString(R.string.pref_plugin_screenstream)
++
++    override val description: String
++        get() = context.getString(R.string.pref_plugin_screenstream_desc)
++
++    override val supportedPacketTypes: Array<String>
++        get() = arrayOf(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM_REQUEST)
++
++    override val outgoingPacketTypes: Array<String>
++        get() = arrayOf(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM)
++
++    override val optionalPermissions: Array<String>
++        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
++        } else {
++            arrayOf(Manifest.permission.RECORD_AUDIO)
++        }
++
++    override val optionalPermissionExplanation: Int
++        get() = R.string.screenstream_optional_permission_explanation
++
++    override fun getSettingsFragment(activity: Activity): PluginSettingsFragment {
++        return PluginSettingsFragment.newInstance(pluginKey, device.deviceId, R.xml.screenstreamplugin_preferences)
++    }
++
++    override fun getUiButtons(): List<PluginUiButton> {
++        val isActive = sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING ||
++            sessionTracker.state == ScreenStreamProtocol.SessionState.AWAITING_CONSENT
++        return listOf(
++            if (isActive) {
++                PluginUiButton(
++                    context.getString(R.string.screenstream_action_stop),
++                    R.drawable.ic_stop,
++                ) {
++                    stopStreamingByUser()
++                }
++            } else {
++                PluginUiButton(
++                    context.getString(R.string.screenstream_action_start),
++                    R.drawable.ic_phonelink_36dp,
++                ) { parentActivity ->
++                    startConsentFlowFromUi(parentActivity)
++                }
++            }
++        )
++    }
++
++    override fun onCreate() {
++        syncPreferencesIntoTracker()
++        refreshDefaultDisplayInfo()
++        registerAccessibilityListener()
++        sendStatePacket()
++
++        if (sessionTracker.hasPendingReconnect) {
++            scheduleReconnectIfEligible()
++        } else if (sessionTracker.shouldAutoStartOnConnect()) {
++            val audioWanted = isAudioEnabledInSettings()
++            initiateCapture(
++                params = ScreenStreamProtocol.StartParams(requestAudio = audioWanted),
++                uiActivity = null,
++                isReconnectAttempt = false,
++            )
++        }
++    }
++
++    override fun onDestroy() {
++        unregisterAccessibilityListener()
++        pendingAccessibilityReload = false
++        mainHandler.removeCallbacksAndMessages(null)
++        cancelPendingConsentNotification()
++        teardownActiveStream()
++        sessionTracker.onLinkLost()
++        device.onPluginsChanged()
++    }
++
++    override fun onPacketReceived(np: NetworkPacket): Boolean {
++        if (np.type != ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM_REQUEST) {
++            return false
++        }
++
++        val serializedSize = np.serialize().toByteArray(Charsets.UTF_8).size
++        val request = ScreenStreamProtocol.parseControlRequest(
++            action = np.getStringOrNull("action"),
++            rawJsonBytes = serializedSize,
++            maxWidth = np.getIntOrNull("maxWidth"),
++            maxHeight = np.getIntOrNull("maxHeight"),
++            maxFps = np.getIntOrNull("maxFps"),
++            maxBitrateKbps = np.getIntOrNull("maxBitrateKbps"),
++            requestAudio = if (np.has("requestAudio")) np.getBoolean("requestAudio", true) else null,
++            explicitStop = if (np.has("explicitStop")) np.getBoolean("explicitStop", true) else null,
++        ) ?: return false
++
++        when (request) {
++            is ScreenStreamProtocol.ControlRequest.QueryState -> {
++                refreshDefaultDisplayInfo()
++                sendStatePacket()
++            }
++            is ScreenStreamProtocol.ControlRequest.RequestKeyframe -> {
++                if (sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING) {
++                    ScreenStreamService.requestKeyframeIfRunning(device.deviceId)
++                }
++            }
++            is ScreenStreamProtocol.ControlRequest.Start -> {
++                val effectiveAudio = request.params.requestAudio && isAudioEnabledInSettings()
++                val effectiveParams = request.params.copy(requestAudio = effectiveAudio)
++                initiateCapture(params = effectiveParams, uiActivity = null)
++            }
++            is ScreenStreamProtocol.ControlRequest.Stop -> {
++                stopFromRemote(explicitStop = request.explicitStop)
++            }
++        }
++        return true
++    }
++
++    private fun startConsentFlowFromUi(parentActivity: Activity) {
++        syncPreferencesIntoTracker()
++        val params = ScreenStreamProtocol.StartParams(requestAudio = isAudioEnabledInSettings())
++        initiateCapture(params = params, uiActivity = parentActivity)
++    }
++
++    private fun stopStreamingByUser() {
++        cancelScheduledReconnect()
++        sessionTracker.onExplicitStop("user_stopped")
++        persistExplicitStop(true)
++        cancelPendingConsentNotification()
++        val packet = activeStreamPacket
++        val queue = activeMuxerQueue
++        activeStreamPacket = null
++        activeMuxerQueue = null
++        audioAvailable = false
++        ScreenStreamService.stopCaptureForDevice(context, device.deviceId, closeQueueImmediately = false)
++        sendStoppedPacketAndClose(explicitStop = true, reason = "user_stopped", packet = packet, queue = queue)
++        device.onPluginsChanged()
++    }
++
++    private fun stopFromRemote(explicitStop: Boolean) {
++        cancelScheduledReconnect()
++        cancelPendingConsentNotification()
++        val packet = activeStreamPacket
++        val queue = activeMuxerQueue
++        activeStreamPacket = null
++        activeMuxerQueue = null
++        audioAvailable = false
++        ScreenStreamService.stopCaptureForDevice(context, device.deviceId, closeQueueImmediately = false)
++
++        if (explicitStop) {
++            sessionTracker.onExplicitStop("remote_stopped")
++            persistExplicitStop(true)
++            sendStoppedPacketAndClose(explicitStop = true, reason = "remote_stopped", packet = packet, queue = queue)
++        } else {
++            handleTransportDropped(packet, queue)
++        }
++        device.onPluginsChanged()
++    }
++
++    private fun initiateCapture(
++        params: ScreenStreamProtocol.StartParams,
++        uiActivity: Activity?,
++        isReconnectAttempt: Boolean = false,
++    ) {
++        if (sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING) {
++            sendStatePacket()
++            return
++        }
++
++        cancelScheduledReconnect()
++        persistExplicitStop(false)
++        sessionTracker.onStartRequested(isReconnectAttempt = isReconnectAttempt)
++        audioReason = ""
++        refreshDefaultDisplayInfo()
++        sendStatePacket()
++        device.onPluginsChanged()
++
++        val consentIntent = ScreenStreamPermissionActivity.createIntent(
++            context = uiActivity ?: context,
++            deviceId = device.deviceId,
++            params = params,
++        )
++
++        if (uiActivity != null) {
++            uiActivity.startActivity(consentIntent)
++            return
++        }
++
++        if (LifecycleHelper.isInForeground) {
++            consentIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++            context.startActivity(consentIntent)
++        } else {
++            showConsentNotification(consentIntent)
++        }
++    }
++
++    private fun showConsentNotification(consentIntent: Intent) {
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
++            !isPermissionGranted(Manifest.permission.POST_NOTIFICATIONS)
++        ) {
++            return
++        }
++        val pending = PendingIntent.getActivity(
++            context,
++            CONSENT_NOTIFICATION_ID,
++            consentIntent,
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
++        )
++        val notification = NotificationCompat.Builder(context, NotificationHelper.Channels.HIGHPRIORITY)
++            .setSmallIcon(R.drawable.ic_notification)
++            .setContentTitle(context.getString(R.string.screenstream_consent_notif_title, device.name))
++            .setContentText(context.getString(R.string.screenstream_consent_notif_body))
++            .setPriority(NotificationCompat.PRIORITY_HIGH)
++            .setAutoCancel(true)
++            .setContentIntent(pending)
++            .build()
++
++        context.getSystemService<NotificationManager>()?.notify(CONSENT_NOTIFICATION_ID, notification)
++    }
++
++    private fun cancelPendingConsentNotification() {
++        context.getSystemService<NotificationManager>()?.cancel(CONSENT_NOTIFICATION_ID)
++    }
++
++    internal fun onConsentDenied() {
++        if (!isDeviceInitialized) return
++        cancelPendingConsentNotification()
++        sessionTracker.onExplicitStop("consent_denied")
++        audioReason = ""
++        sendStoppedPacketAndClose(explicitStop = false, reason = "consent_denied", packet = null, queue = null)
++        device.onPluginsChanged()
++    }
++
++    internal fun onServiceStreamingStarted(
++        muxerQueue: StreamMuxerQueue,
++        displayWidth: Int,
++        displayHeight: Int,
++        streamWidth: Int,
++        streamHeight: Int,
++        rotationDegrees: Int,
++        fps: Int,
++        audioAvailable: Boolean,
++        audioReason: String,
++    ) {
++        if (!isDeviceInitialized) {
++            muxerQueue.close()
++            return
++        }
++        cancelScheduledReconnect()
++        cancelPendingConsentNotification()
++        closeActiveStreamObjects()
++        val validRotation = if (ScreenStreamProtocol.isValidRotation(rotationDegrees)) rotationDegrees else 0
++        this.activeMuxerQueue = muxerQueue
++        this.lastDisplayWidth = displayWidth
++        this.lastDisplayHeight = displayHeight
++        this.lastRotationDegrees = validRotation
++        this.audioAvailable = audioAvailable
++        this.audioReason = audioReason
++
++        sessionTracker.onStreamingStarted()
++        persistExplicitStop(false)
++        sendStatePacket()
++
++        val streamNp = NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
++            this["event"] = "stream_open"
++            this["videoCodec"] = ScreenStreamProtocol.VIDEO_CODEC_H264_ANNEXB
++            this["audioCodec"] = if (audioAvailable) {
++                ScreenStreamProtocol.AUDIO_CODEC_PCM_S16LE
++            } else {
++                ScreenStreamProtocol.AUDIO_CODEC_NONE
++            }
++            this["width"] = streamWidth
++            this["height"] = streamHeight
++            this["rotation"] = validRotation
++            this["fps"] = fps
++            payload = NetworkPacket.Payload(muxerQueue, -1L)
++        }
++        activeStreamPacket = streamNp
++        device.sendPacket(streamNp)
++        device.onPluginsChanged()
++    }
++
++    internal fun onServiceGeometryChanged(
++        displayWidth: Int,
++        displayHeight: Int,
++        streamWidth: Int,
++        streamHeight: Int,
++        rotationDegrees: Int,
++    ) {
++        if (!isDeviceInitialized) return
++        val validRotation = if (ScreenStreamProtocol.isValidRotation(rotationDegrees)) rotationDegrees else 0
++        lastDisplayWidth = displayWidth
++        lastDisplayHeight = displayHeight
++        lastRotationDegrees = validRotation
++
++        val geomNp = NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
++            this["event"] = "geometry_changed"
++            this["width"] = streamWidth
++            this["height"] = streamHeight
++            this["rotation"] = validRotation
++        }
++        device.sendPacket(geomNp)
++        sendStatePacket()
++    }
++
++    internal fun onServiceAudioStatusChanged(available: Boolean, reason: String) {
++        if (!isDeviceInitialized) return
++        audioAvailable = available
++        audioReason = reason
++        sendStatePacket()
++    }
++
++    internal fun onServiceStopped(reason: String, explicitStop: Boolean, queue: StreamMuxerQueue? = null) {
++        if (!isDeviceInitialized) {
++            queue?.close()
++            return
++        }
++        cancelScheduledReconnect()
++        val packet = activeStreamPacket
++        val targetQueue = queue ?: activeMuxerQueue
++        activeMuxerQueue = null
++        activeStreamPacket = null
++        audioAvailable = false
++
++        if (explicitStop) {
++            sessionTracker.onExplicitStop(reason)
++            persistExplicitStop(true)
++            sendStoppedPacketAndClose(explicitStop = true, reason = reason, packet = packet, queue = targetQueue)
++        } else if (reason == "stream_closed") {
++            handleTransportDropped(packet, targetQueue)
++        } else {
++            sessionTracker.onExplicitStop(reason)
++            sendStoppedPacketAndClose(explicitStop = false, reason = reason, packet = packet, queue = targetQueue)
++        }
++        device.onPluginsChanged()
++    }
++
++    internal fun onServiceError(reason: String) {
++        if (!isDeviceInitialized) return
++        cancelScheduledReconnect()
++        activeMuxerQueue = null
++        activeStreamPacket?.cancel()
++        activeStreamPacket = null
++        audioAvailable = false
++        sessionTracker.onError()
++
++        val np = NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
++            this["event"] = "state"
++            this["state"] = ScreenStreamProtocol.SessionState.ERROR.wireName
++            this["explicitStop"] = sessionTracker.explicitStop
++            this["reason"] = reason
++            this["audioAvailable"] = false
++            this["audioReason"] = audioReason
++            this["accessibilityEnabled"] = (KdeConnectAccessibilityService.instance != null)
++            this["displayWidth"] = lastDisplayWidth
++            this["displayHeight"] = lastDisplayHeight
++            this["rotation"] = lastRotationDegrees
++        }
++        device.sendPacket(np)
++        device.onPluginsChanged()
++    }
++
++    private fun closeActiveStreamObjects() {
++        val packet = activeStreamPacket
++        activeStreamPacket = null
++        packet?.cancel()
++        val queue = activeMuxerQueue
++        activeMuxerQueue = null
++        queue?.close()
++    }
++
++    private fun teardownActiveStream() {
++        if (isDeviceInitialized) {
++            ScreenStreamService.stopCaptureForDevice(context, device.deviceId)
++        }
++        closeActiveStreamObjects()
++        audioAvailable = false
++    }
++
++    private fun handleTransportDropped(packet: NetworkPacket?, queue: StreamMuxerQueue?) {
++        packet?.cancel()
++        queue?.close()
++        syncPreferencesIntoTracker()
++        sessionTracker.onLinkLost()
++        sendStatePacket()
++        if (device.isReachable) {
++            scheduleReconnectIfEligible()
++        }
++    }
++
++    private fun cancelScheduledReconnect() {
++        mainHandler.removeCallbacks(reconnectRunnable)
++    }
++
++    private fun scheduleReconnectIfEligible() {
++        if (!isDeviceInitialized) return
++        val delayMs = sessionTracker.consumeReconnectDelayMs() ?: return
++        mainHandler.removeCallbacks(reconnectRunnable)
++        mainHandler.postDelayed(reconnectRunnable, delayMs.toLong())
++    }
++
++    private fun attemptScheduledReconnect() {
++        if (!isDeviceInitialized || !device.isReachable) {
++            return
++        }
++        syncPreferencesIntoTracker()
++        if (sessionTracker.explicitStop || !sessionTracker.autoStartEnabled) {
++            return
++        }
++        if (sessionTracker.state == ScreenStreamProtocol.SessionState.STREAMING ||
++            sessionTracker.state == ScreenStreamProtocol.SessionState.AWAITING_CONSENT
++        ) {
++            return
++        }
++        initiateCapture(
++            params = ScreenStreamProtocol.StartParams(requestAudio = isAudioEnabledInSettings()),
++            uiActivity = null,
++            isReconnectAttempt = true,
++        )
++    }
++
++    private fun registerAccessibilityListener() {
++        val am = context.getSystemService(AccessibilityManager::class.java) ?: return
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            if (a11yServicesListener != null) return
++            val listener = AccessibilityManager.AccessibilityServicesStateChangeListener {
++                scheduleAccessibilitySync()
++            }
++            a11yServicesListener = listener
++            am.addAccessibilityServicesStateChangeListener(listener)
++        } else {
++            if (a11yStateListener != null) return
++            @Suppress("DEPRECATION")
++            val listener = AccessibilityManager.AccessibilityStateChangeListener {
++                scheduleAccessibilitySync()
++            }
++            a11yStateListener = listener
++            @Suppress("DEPRECATION")
++            am.addAccessibilityStateChangeListener(listener)
++        }
++    }
++
++    private fun unregisterAccessibilityListener() {
++        val am = context.getSystemService(AccessibilityManager::class.java) ?: return
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            val listener = a11yServicesListener as? AccessibilityManager.AccessibilityServicesStateChangeListener
++            if (listener != null) {
++                am.removeAccessibilityServicesStateChangeListener(listener)
++            }
++            a11yServicesListener = null
++        } else {
++            val listener = a11yStateListener
++            if (listener != null) {
++                @Suppress("DEPRECATION")
++                am.removeAccessibilityStateChangeListener(listener)
++            }
++            a11yStateListener = null
++        }
++    }
++
++    private fun scheduleAccessibilitySync() {
++        mainHandler.postDelayed({
++            if (isDeviceInitialized && device.isReachable) {
++                sendStatePacket()
++            }
++        }, 250L)
++    }
++
++    private fun isRemoteInputReady(): Boolean {
++        if (KdeConnectAccessibilityService.instance == null) {
++            pendingAccessibilityReload = false
++            return false
++        }
++        val mouseLoaded = device.getPlugin(MouseReceiverPlugin::class.java) != null
++        val kbdLoaded = device.getPlugin(RemoteKeyboardPlugin::class.java) != null
++        val mouseEnabled = device.isPluginEnabled(getPluginKey(MouseReceiverPlugin::class.java))
++        val kbdEnabled = device.isPluginEnabled(getPluginKey(RemoteKeyboardPlugin::class.java))
++        if (((!mouseLoaded && mouseEnabled) || (!kbdLoaded && kbdEnabled)) && !pendingAccessibilityReload) {
++            pendingAccessibilityReload = true
++            device.launchBackgroundReloadPluginsFromSettings()
++            mainHandler.postDelayed({
++                pendingAccessibilityReload = false
++                if (isDeviceInitialized && device.isReachable) {
++                    sendStatePacket()
++                }
++            }, 350L)
++        }
++        return device.getPlugin(MouseReceiverPlugin::class.java) != null
++    }
++
++    private fun sendStatePacket() {
++        val np = NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
++            this["event"] = "state"
++            this["state"] = sessionTracker.state.wireName
++            this["explicitStop"] = sessionTracker.explicitStop
++            this["audioAvailable"] = audioAvailable
++            this["audioReason"] = audioReason
++            this["accessibilityEnabled"] = isRemoteInputReady()
++            this["displayWidth"] = lastDisplayWidth
++            this["displayHeight"] = lastDisplayHeight
++            this["rotation"] = lastRotationDegrees
++        }
++        device.sendPacket(np)
++    }
++
++    private fun sendStoppedPacketAndClose(
++        explicitStop: Boolean,
++        reason: String,
++        packet: NetworkPacket?,
++        queue: StreamMuxerQueue?,
++    ) {
++        val closeAction = {
++            packet?.cancel()
++            queue?.close()
++        }
++        val np = NetworkPacket(ScreenStreamProtocol.PACKET_TYPE_SCREENSTREAM).apply {
++            this["event"] = "stopped"
++            this["explicitStop"] = explicitStop
++            this["reason"] = reason
++        }
++        mainHandler.postDelayed({ closeAction() }, 400L)
++        device.sendPacket(np, object : Device.SendPacketStatusCallback() {
++            override fun onSuccess() {
++                mainHandler.post { closeAction() }
++            }
++
++            override fun onFailure(e: Throwable) {
++                mainHandler.post { closeAction() }
++            }
++        })
++    }
++
++    private fun syncPreferencesIntoTracker() {
++        val explicit = preferences.getBoolean(PREF_EXPLICIT_STOP, false)
++        val autoStart = preferences.getBoolean(
++            context.getString(R.string.screenstream_pref_auto_start_key),
++            false,
++        )
++        sessionTracker.configure(autoStart = autoStart, explicitStop = explicit)
++    }
++
++    private fun persistExplicitStop(explicitStop: Boolean) {
++        preferences.edit {
++            putBoolean(PREF_EXPLICIT_STOP, explicitStop)
++        }
++    }
++
++    private fun isAudioEnabledInSettings(): Boolean {
++        return preferences.getBoolean(
++            context.getString(R.string.screenstream_pref_send_audio_key),
++            true,
++        )
++    }
++
++    private fun refreshDefaultDisplayInfo() {
++        val displayManager = context.getSystemService(DisplayManager::class.java) ?: return
++        val display = displayManager.getDisplay(Display.DEFAULT_DISPLAY) ?: return
++        lastRotationDegrees = ScreenStreamProtocol.surfaceRotationToDegrees(display.rotation)
++        try {
++            val windowCtx = context.createDisplayContext(display).createWindowContext(
++                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
++                null,
++            )
++            val bounds = windowCtx.getSystemService(WindowManager::class.java)?.maximumWindowMetrics?.bounds
++            if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
++                lastDisplayWidth = bounds.width()
++                lastDisplayHeight = bounds.height()
++                return
++            }
++        } catch (_: RuntimeException) {
++        }
++
++        val mode = display.mode
++        val swap = lastRotationDegrees == 90 || lastRotationDegrees == 270
++        lastDisplayWidth = if (swap) mode.physicalHeight else mode.physicalWidth
++        lastDisplayHeight = if (swap) mode.physicalWidth else mode.physicalHeight
++    }
++
++    companion object {
++        private const val PREF_EXPLICIT_STOP = "screenstream_explicit_stop"
++        private const val CONSENT_NOTIFICATION_ID = 47292
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d34d35ea216ab1bcfa1cc9cf41ce166f8ac366a
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocol.kt
+@@ -0,0 +1,681 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.screenstream
++
++import java.io.ByteArrayOutputStream
++import java.io.InputStream
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import java.util.ArrayDeque
++import java.util.concurrent.locks.ReentrantLock
++import kotlin.concurrent.withLock
++import kotlin.math.max
++import kotlin.math.min
++import kotlin.math.roundToInt
++
++object ScreenStreamProtocol {
++    const val PACKET_TYPE_SCREENSTREAM_REQUEST = "kdeconnect.screenstream.request"
++    const val PACKET_TYPE_SCREENSTREAM = "kdeconnect.screenstream"
++
++    const val STREAM_MAGIC = 0x4B53
++    const val HEADER_BYTES = 16
++    const val MAX_VIDEO_FRAME_BYTES = 4 * 1024 * 1024
++    const val MAX_AUDIO_CHUNK_BYTES = 65536
++    const val MAX_CONTROL_JSON_BYTES = 8192
++
++    const val MAX_VIDEO_QUEUE_FRAMES = 8
++    const val MAX_AUDIO_QUEUE_CHUNKS = 16
++
++    const val FLAG_NONE = 0x00
++    const val FLAG_KEYFRAME = 0x01
++    const val FLAG_PROTECTED_CONTENT = 0x02
++    const val FLAG_VALID_MASK = 0x03
++
++    const val VIDEO_CODEC_H264_ANNEXB = "h264-annexb"
++    const val AUDIO_CODEC_PCM_S16LE = "pcm_s16le_48000_mono"
++    const val AUDIO_CODEC_NONE = "none"
++
++    const val DEFAULT_MAX_WIDTH = 1920
++    const val DEFAULT_MAX_HEIGHT = 1920
++    const val DEFAULT_MAX_FPS = 60
++    const val DEFAULT_BITRATE_KBPS = 8000
++
++    val RECONNECT_DELAYS_MS = intArrayOf(2000, 4000, 8000)
++
++    enum class FrameKind(val id: Int) {
++        CODEC_CONFIG(0x01),
++        VIDEO_ACCESS_UNIT(0x02),
++        AUDIO_PCM_CHUNK(0x03),
++        CONTROL_EOS(0x04);
++
++        companion object {
++            fun fromId(raw: Int): FrameKind? = entries.firstOrNull { it.id == raw }
++        }
++    }
++
++    data class Frame(
++        val kind: FrameKind,
++        val flags: Int,
++        val ptsUs: Long,
++        val payload: ByteArray,
++    ) {
++        override fun equals(other: Any?): Boolean {
++            if (this === other) return true
++            if (other !is Frame) return false
++            return kind == other.kind &&
++                flags == other.flags &&
++                ptsUs == other.ptsUs &&
++                payload.contentEquals(other.payload)
++        }
++
++        override fun hashCode(): Int {
++            var result = kind.hashCode()
++            result = 31 * result + flags
++            result = 31 * result + ptsUs.hashCode()
++            result = 31 * result + payload.contentHashCode()
++            return result
++        }
++    }
++
++    data class StartParams(
++        val maxWidth: Int = DEFAULT_MAX_WIDTH,
++        val maxHeight: Int = DEFAULT_MAX_HEIGHT,
++        val maxFps: Int = DEFAULT_MAX_FPS,
++        val maxBitrateKbps: Int = DEFAULT_BITRATE_KBPS,
++        val requestAudio: Boolean = true,
++    )
++
++    sealed class ControlRequest {
++        data object QueryState : ControlRequest()
++        data class Start(val params: StartParams) : ControlRequest()
++        data object RequestKeyframe : ControlRequest()
++        data class Stop(val explicitStop: Boolean) : ControlRequest()
++    }
++
++    enum class SessionState(val wireName: String) {
++        IDLE("idle"),
++        AWAITING_CONSENT("awaiting_consent"),
++        STREAMING("streaming"),
++        STOPPED("stopped"),
++        ERROR("error");
++
++        companion object {
++            fun fromWireName(value: String?): SessionState? =
++                entries.firstOrNull { it.wireName == value }
++        }
++    }
++
++    fun isValidPayloadLength(kind: FrameKind, length: Int): Boolean {
++        if (length < 0) return false
++        return when (kind) {
++            FrameKind.CODEC_CONFIG, FrameKind.VIDEO_ACCESS_UNIT -> length <= MAX_VIDEO_FRAME_BYTES
++            FrameKind.AUDIO_PCM_CHUNK -> length <= MAX_AUDIO_CHUNK_BYTES
++            FrameKind.CONTROL_EOS -> length == 0
++        }
++    }
++
++    fun encodeFrame(
++        kind: FrameKind,
++        flags: Int,
++        ptsUs: Long,
++        payload: ByteArray,
++        offset: Int = 0,
++        length: Int = payload.size,
++    ): ByteArray {
++        require(offset >= 0 && length >= 0 && offset + length <= payload.size) {
++            "Invalid payload slice: offset=$offset length=$length size=${payload.size}"
++        }
++        require((flags and FLAG_VALID_MASK.inv()) == 0) {
++            "Reserved frame flags set: 0x${flags.toString(16)}"
++        }
++        require(isValidPayloadLength(kind, length)) {
++            "Payload length $length out of bounds for frame kind $kind"
++        }
++
++        val buf = ByteBuffer.allocate(HEADER_BYTES + length).order(ByteOrder.BIG_ENDIAN)
++        buf.putShort(STREAM_MAGIC.toShort())
++        buf.put(kind.id.toByte())
++        buf.put(flags.toByte())
++        buf.putInt(length)
++        buf.putLong(ptsUs)
++        if (length > 0) {
++            buf.put(payload, offset, length)
++        }
++        return buf.array()
++    }
++
++    fun parseControlRequest(
++        action: String?,
++        rawJsonBytes: Int,
++        maxWidth: Int? = null,
++        maxHeight: Int? = null,
++        maxFps: Int? = null,
++        maxBitrateKbps: Int? = null,
++        requestAudio: Boolean? = null,
++        explicitStop: Boolean? = null,
++    ): ControlRequest? {
++        if (rawJsonBytes <= 0 || rawJsonBytes > MAX_CONTROL_JSON_BYTES || action == null) {
++            return null
++        }
++        return when (action) {
++            "query_state" -> ControlRequest.QueryState
++            "request_keyframe" -> ControlRequest.RequestKeyframe
++            "stop" -> ControlRequest.Stop(explicitStop ?: true)
++            "start" -> {
++                val clampedW = (maxWidth ?: DEFAULT_MAX_WIDTH).coerceIn(320, 3840)
++                val clampedH = (maxHeight ?: DEFAULT_MAX_HEIGHT).coerceIn(320, 3840)
++                val clampedFps = (maxFps ?: DEFAULT_MAX_FPS).coerceIn(5, 60)
++                val clampedBitrate = (maxBitrateKbps ?: DEFAULT_BITRATE_KBPS).coerceIn(500, 20000)
++                val audio = requestAudio ?: true
++                ControlRequest.Start(
++                    StartParams(
++                        maxWidth = clampedW,
++                        maxHeight = clampedH,
++                        maxFps = clampedFps,
++                        maxBitrateKbps = clampedBitrate,
++                        requestAudio = audio,
++                    )
++                )
++            }
++            else -> null
++        }
++    }
++
++    fun isValidRotation(degrees: Int): Boolean {
++        return degrees == 0 || degrees == 90 || degrees == 180 || degrees == 270
++    }
++
++    fun surfaceRotationToDegrees(surfaceRotation: Int): Int {
++        return when (surfaceRotation) {
++            1 -> 90
++            2 -> 180
++            3 -> 270
++            else -> 0
++        }
++    }
++
++    fun computeStreamGeometry(
++        displayWidth: Int,
++        displayHeight: Int,
++        maxWidth: Int,
++        maxHeight: Int,
++    ): Pair<Int, Int> {
++        val safeW = max(16, displayWidth)
++        val safeH = max(16, displayHeight)
++        val boundW = maxWidth.coerceIn(320, 3840)
++        val boundH = maxHeight.coerceIn(320, 3840)
++
++        val scale = min(1.0, min(boundW.toDouble() / safeW, boundH.toDouble() / safeH))
++        val rawW = (safeW * scale).roundToInt().coerceAtLeast(160)
++        val rawH = (safeH * scale).roundToInt().coerceAtLeast(160)
++
++        fun align16(value: Int, maxBound: Int): Int {
++            val aligned = ((value + 8) / 16) * 16
++            return aligned.coerceIn(160, (maxBound / 16) * 16).let { if (it % 2 != 0) it - 1 else it }
++        }
++
++        return Pair(align16(rawW, boundW), align16(rawH, boundH))
++    }
++
++    fun parseFrames(data: ByteArray): List<Frame> {
++        val reader = FrameReader()
++        val out = mutableListOf<Frame>()
++        require(reader.feed(data, out)) { reader.error ?: "Invalid stream bytes" }
++        require(reader.bufferedBytes == 0) { "Trailing incomplete frame bytes: ${reader.bufferedBytes}" }
++        return out
++    }
++
++    class FrameReader {
++        private val buffer = ByteArrayOutputStream()
++        private var consumedOffset = 0
++        var error: String? = null
++            private set
++
++        val bufferedBytes: Int
++            get() = buffer.size() - consumedOffset
++
++        fun reset() {
++            buffer.reset()
++            consumedOffset = 0
++            error = null
++        }
++
++        fun feed(chunk: ByteArray, outFrames: MutableList<Frame>): Boolean {
++            if (error != null) return false
++            if (chunk.isNotEmpty()) {
++                buffer.write(chunk)
++            }
++
++            val bytes = buffer.toByteArray()
++            var pos = consumedOffset
++
++            while (bytes.size - pos >= HEADER_BYTES) {
++                val bb = ByteBuffer.wrap(bytes, pos, HEADER_BYTES).order(ByteOrder.BIG_ENDIAN)
++                val magic = bb.short.toInt() and 0xFFFF
++                if (magic != STREAM_MAGIC) {
++                    error = "Invalid stream magic: 0x${magic.toString(16)}"
++                    return false
++                }
++                val rawKind = bb.get().toInt() and 0xFF
++                val kind = FrameKind.fromId(rawKind)
++                if (kind == null) {
++                    error = "Unknown frame kind: 0x${rawKind.toString(16)}"
++                    return false
++                }
++                val flags = bb.get().toInt() and 0xFF
++                if ((flags and FLAG_VALID_MASK.inv()) != 0) {
++                    error = "Invalid reserved flags: 0x${flags.toString(16)}"
++                    return false
++                }
++                val lengthLong = bb.int.toLong() and 0xFFFFFFFFL
++                if (lengthLong > MAX_VIDEO_FRAME_BYTES.toLong()) {
++                    error = "Oversized frame length: $lengthLong"
++                    return false
++                }
++                val length = lengthLong.toInt()
++                if (!isValidPayloadLength(kind, length)) {
++                    error = "Invalid payload length $length for kind $kind"
++                    return false
++                }
++                val ptsUs = bb.long
++
++                if (bytes.size - pos < HEADER_BYTES + length) {
++                    break
++                }
++
++                val payload = if (length == 0) {
++                    ByteArray(0)
++                } else {
++                    bytes.copyOfRange(pos + HEADER_BYTES, pos + HEADER_BYTES + length)
++                }
++                outFrames.add(Frame(kind = kind, flags = flags, ptsUs = ptsUs, payload = payload))
++                pos += HEADER_BYTES + length
++            }
++
++            if (pos > 0) {
++                val remaining = if (pos < bytes.size) bytes.copyOfRange(pos, bytes.size) else ByteArray(0)
++                buffer.reset()
++                if (remaining.isNotEmpty()) {
++                    buffer.write(remaining)
++                }
++                consumedOffset = 0
++            } else {
++                consumedOffset = pos
++            }
++            return true
++        }
++    }
++}
++
++class StreamMuxerQueue(
++    private val maxVideoFrames: Int = ScreenStreamProtocol.MAX_VIDEO_QUEUE_FRAMES,
++    private val maxAudioChunks: Int = ScreenStreamProtocol.MAX_AUDIO_QUEUE_CHUNKS,
++    private val onClosedCallback: (() -> Unit)? = null,
++) : InputStream() {
++
++    data class OfferResult(
++        val accepted: Boolean,
++        val requestSyncFrame: Boolean,
++    )
++
++    private class QueuedPacket(
++        val kind: ScreenStreamProtocol.FrameKind,
++        val isKeyframe: Boolean,
++        val encoded: ByteArray,
++    )
++
++    private val lock = ReentrantLock()
++    private val notEmpty = lock.newCondition()
++    private val queue = ArrayDeque<QueuedPacket>()
++    private var currentChunk: ByteArray? = null
++    private var currentOffset = 0
++    private var queuedVideoFrames = 0
++    private var queuedAudioChunks = 0
++    private var droppingUntilKeyframe = false
++    private var closed = false
++    private var eosQueued = false
++    private var closedNotified = false
++
++    val isClosed: Boolean
++        get() = lock.withLock { closed }
++
++    fun queuedCounts(): Pair<Int, Int> = lock.withLock {
++        Pair(queuedVideoFrames, queuedAudioChunks)
++    }
++
++    fun offerCodecConfig(ptsUs: Long, annexBConfig: ByteArray): Boolean {
++        if (annexBConfig.isEmpty() || annexBConfig.size > ScreenStreamProtocol.MAX_VIDEO_FRAME_BYTES) {
++            return false
++        }
++        val encoded = ScreenStreamProtocol.encodeFrame(
++            kind = ScreenStreamProtocol.FrameKind.CODEC_CONFIG,
++            flags = ScreenStreamProtocol.FLAG_NONE,
++            ptsUs = ptsUs,
++            payload = annexBConfig,
++        )
++        lock.withLock {
++            if (closed || eosQueued) return false
++            queue.addLast(
++                QueuedPacket(
++                    kind = ScreenStreamProtocol.FrameKind.CODEC_CONFIG,
++                    isKeyframe = true,
++                    encoded = encoded,
++                )
++            )
++            notEmpty.signalAll()
++            return true
++        }
++    }
++
++    fun offerVideoFrame(flags: Int, ptsUs: Long, payload: ByteArray): OfferResult {
++        if (payload.size > ScreenStreamProtocol.MAX_VIDEO_FRAME_BYTES) {
++            return OfferResult(accepted = false, requestSyncFrame = false)
++        }
++        val isKeyframe = (flags and ScreenStreamProtocol.FLAG_KEYFRAME) != 0
++        val encoded = ScreenStreamProtocol.encodeFrame(
++            kind = ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT,
++            flags = flags and ScreenStreamProtocol.FLAG_VALID_MASK,
++            ptsUs = ptsUs,
++            payload = payload,
++        )
++
++        lock.withLock {
++            if (closed || eosQueued) {
++                return OfferResult(accepted = false, requestSyncFrame = false)
++            }
++
++            if (droppingUntilKeyframe && !isKeyframe) {
++                return OfferResult(accepted = false, requestSyncFrame = true)
++            }
++
++            var triggerSync = false
++            if (queuedVideoFrames >= maxVideoFrames) {
++                purgeQueuedNonKeyframesLocked()
++                triggerSync = true
++
++                if (!isKeyframe) {
++                    droppingUntilKeyframe = true
++                    return OfferResult(accepted = false, requestSyncFrame = true)
++                }
++
++                while (queuedVideoFrames >= maxVideoFrames) {
++                    if (!dropOldestPacketOfKindLocked(ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT)) {
++                        break
++                    }
++                }
++            }
++
++            if (isKeyframe) {
++                droppingUntilKeyframe = false
++            }
++
++            queue.addLast(
++                QueuedPacket(
++                    kind = ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT,
++                    isKeyframe = isKeyframe,
++                    encoded = encoded,
++                )
++            )
++            queuedVideoFrames += 1
++            notEmpty.signalAll()
++            return OfferResult(accepted = true, requestSyncFrame = triggerSync)
++        }
++    }
++
++    fun offerAudioChunk(ptsUs: Long, pcmBytes: ByteArray, length: Int = pcmBytes.size): Boolean {
++        if (length <= 0 || length > ScreenStreamProtocol.MAX_AUDIO_CHUNK_BYTES || length > pcmBytes.size) {
++            return false
++        }
++        val encoded = ScreenStreamProtocol.encodeFrame(
++            kind = ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK,
++            flags = ScreenStreamProtocol.FLAG_NONE,
++            ptsUs = ptsUs,
++            payload = pcmBytes,
++            offset = 0,
++            length = length,
++        )
++
++        lock.withLock {
++            if (closed || eosQueued) return false
++            while (queuedAudioChunks >= maxAudioChunks) {
++                if (!dropOldestPacketOfKindLocked(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK)) {
++                    break
++                }
++            }
++            queue.addLast(
++                QueuedPacket(
++                    kind = ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK,
++                    isKeyframe = false,
++                    encoded = encoded,
++                )
++            )
++            queuedAudioChunks += 1
++            notEmpty.signalAll()
++            return true
++        }
++    }
++
++    fun offerEosAndFinish(ptsUs: Long) {
++        val encoded = ScreenStreamProtocol.encodeFrame(
++            kind = ScreenStreamProtocol.FrameKind.CONTROL_EOS,
++            flags = ScreenStreamProtocol.FLAG_NONE,
++            ptsUs = ptsUs,
++            payload = ByteArray(0),
++        )
++        lock.withLock {
++            if (!closed && !eosQueued) {
++                eosQueued = true
++                queue.addLast(
++                    QueuedPacket(
++                        kind = ScreenStreamProtocol.FrameKind.CONTROL_EOS,
++                        isKeyframe = true,
++                        encoded = encoded,
++                    )
++                )
++                closed = true
++                notEmpty.signalAll()
++            }
++        }
++    }
++
++    override fun read(): Int {
++        val single = ByteArray(1)
++        val n = read(single, 0, 1)
++        return if (n == -1) -1 else (single[0].toInt() and 0xFF)
++    }
++
++    override fun read(b: ByteArray, off: Int, len: Int): Int {
++        if (off < 0 || len < 0 || off + len > b.size) {
++            throw IndexOutOfBoundsException("Invalid read bounds")
++        }
++        if (len == 0) return 0
++
++        lock.withLock {
++            while (currentChunk == null && queue.isEmpty()) {
++                if (closed) return -1
++                try {
++                    notEmpty.await()
++                } catch (_: InterruptedException) {
++                    Thread.currentThread().interrupt()
++                    return -1
++                }
++            }
++
++            var copied = 0
++            while (copied < len) {
++                if (currentChunk == null) {
++                    val next = queue.pollFirst() ?: break
++                    decrementCountsLocked(next)
++                    currentChunk = next.encoded
++                    currentOffset = 0
++                }
++
++                val active = currentChunk!!
++                val avail = active.size - currentOffset
++                val toCopy = min(len - copied, avail)
++                System.arraycopy(active, currentOffset, b, off + copied, toCopy)
++                currentOffset += toCopy
++                copied += toCopy
++
++                if (currentOffset >= active.size) {
++                    currentChunk = null
++                    currentOffset = 0
++                }
++            }
++
++            return if (copied > 0) copied else if (closed) -1 else 0
++        }
++    }
++
++    override fun available(): Int = lock.withLock {
++        val headAvail = currentChunk?.let { it.size - currentOffset } ?: 0
++        val queuedBytes = queue.sumOf { it.encoded.size }
++        headAvail + queuedBytes
++    }
++
++    override fun close() {
++        var callbackToRun: (() -> Unit)? = null
++        lock.withLock {
++            closed = true
++            eosQueued = true
++            queue.clear()
++            currentChunk = null
++            currentOffset = 0
++            queuedVideoFrames = 0
++            queuedAudioChunks = 0
++            if (!closedNotified) {
++                closedNotified = true
++                callbackToRun = onClosedCallback
++            }
++            notEmpty.signalAll()
++        }
++        callbackToRun?.invoke()
++    }
++
++    private fun purgeQueuedNonKeyframesLocked() {
++        val retained = ArrayDeque<QueuedPacket>(queue.size)
++        for (pkt in queue) {
++            if (pkt.kind == ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT && !pkt.isKeyframe) {
++                queuedVideoFrames -= 1
++            } else {
++                retained.addLast(pkt)
++            }
++        }
++        queue.clear()
++        queue.addAll(retained)
++    }
++
++    private fun dropOldestPacketOfKindLocked(kind: ScreenStreamProtocol.FrameKind): Boolean {
++        val it = queue.iterator()
++        while (it.hasNext()) {
++            val pkt = it.next()
++            if (pkt.kind == kind) {
++                it.remove()
++                decrementCountsLocked(pkt)
++                return true
++            }
++        }
++        return false
++    }
++
++    private fun decrementCountsLocked(pkt: QueuedPacket) {
++        when (pkt.kind) {
++            ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT -> {
++                if (queuedVideoFrames > 0) queuedVideoFrames -= 1
++            }
++            ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK -> {
++                if (queuedAudioChunks > 0) queuedAudioChunks -= 1
++            }
++            ScreenStreamProtocol.FrameKind.CODEC_CONFIG,
++            ScreenStreamProtocol.FrameKind.CONTROL_EOS -> Unit
++        }
++    }
++}
++
++class ScreenStreamSessionTracker(
++    initialExplicitStop: Boolean = false,
++    initialAutoStart: Boolean = false,
++) {
++    var state: ScreenStreamProtocol.SessionState = ScreenStreamProtocol.SessionState.IDLE
++        private set
++
++    var explicitStop: Boolean = initialExplicitStop
++        private set
++
++    var autoStartEnabled: Boolean = initialAutoStart
++        private set
++
++    val hasPendingReconnect: Boolean
++        get() = shouldReconnect && !explicitStop && autoStartEnabled
++
++    private var shouldReconnect = false
++    private var reconnectAttempt = 0
++
++    fun configure(autoStart: Boolean, explicitStop: Boolean) {
++        this.autoStartEnabled = autoStart
++        this.explicitStop = explicitStop
++        if (explicitStop || !autoStart) {
++            shouldReconnect = false
++            reconnectAttempt = 0
++        }
++    }
++
++    fun shouldAutoStartOnConnect(): Boolean {
++        return autoStartEnabled && !explicitStop
++    }
++
++    fun onStartRequested(isReconnectAttempt: Boolean = false) {
++        explicitStop = false
++        shouldReconnect = autoStartEnabled
++        if (!isReconnectAttempt) {
++            reconnectAttempt = 0
++        }
++        state = ScreenStreamProtocol.SessionState.AWAITING_CONSENT
++    }
++
++    fun onStreamingStarted() {
++        explicitStop = false
++        shouldReconnect = autoStartEnabled
++        reconnectAttempt = 0
++        state = ScreenStreamProtocol.SessionState.STREAMING
++    }
++
++    fun onExplicitStop(reason: String = "user_stopped") {
++        val cleanReason = reason.ifEmpty { "user_stopped" }
++        explicitStop = (cleanReason == "user_stopped" || cleanReason == "remote_stopped")
++        shouldReconnect = false
++        reconnectAttempt = 0
++        state = ScreenStreamProtocol.SessionState.STOPPED
++    }
++
++    fun onError() {
++        state = ScreenStreamProtocol.SessionState.ERROR
++    }
++
++    fun onLinkLost() {
++        if (state == ScreenStreamProtocol.SessionState.STREAMING || state == ScreenStreamProtocol.SessionState.AWAITING_CONSENT) {
++            state = ScreenStreamProtocol.SessionState.IDLE
++            if (!explicitStop && autoStartEnabled) {
++                shouldReconnect = true
++            }
++        }
++    }
++
++    fun consumeReconnectDelayMs(): Int? {
++        if (explicitStop || !autoStartEnabled || !shouldReconnect) {
++            return null
++        }
++        val delays = ScreenStreamProtocol.RECONNECT_DELAYS_MS
++        if (reconnectAttempt >= delays.size) {
++            shouldReconnect = false
++            return null
++        }
++        val delay = delays[reconnectAttempt]
++        reconnectAttempt += 1
++        return delay
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..db4b2e9fb028a2f247703d0c98c7d8e2a6c709c6
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamService.kt
+@@ -0,0 +1,550 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.screenstream
++
++import android.app.Activity
++import android.app.Notification
++import android.app.PendingIntent
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.content.pm.ServiceInfo
++import android.graphics.Rect
++import android.hardware.display.DisplayManager
++import android.hardware.display.VirtualDisplay
++import android.media.projection.MediaProjection
++import android.media.projection.MediaProjectionManager
++import android.os.Build
++import android.os.Handler
++import android.os.IBinder
++import android.os.Looper
++import android.os.SystemClock
++import android.util.Log
++import android.view.Display
++import android.view.WindowManager
++import androidx.annotation.RequiresApi
++import androidx.core.app.NotificationCompat
++import androidx.core.content.IntentCompat
++import org.kde.kdeconnect.KdeConnect
++import org.kde.kdeconnect.helpers.NotificationHelper
++import org.kde.kdeconnect_tp.R
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicLong
++
++@RequiresApi(Build.VERSION_CODES.R)
++class ScreenStreamService : Service() {
++
++    private data class DisplayGeometry(
++        val width: Int,
++        val height: Int,
++        val densityDpi: Int,
++        val rotationDegrees: Int,
++    )
++
++    private val mainHandler = Handler(Looper.getMainLooper())
++    private val protectedContentActive = AtomicBoolean(false)
++    private val lastPtsUs = AtomicLong(0L)
++    private val stopping = AtomicBoolean(false)
++
++    private var activeDeviceId: String? = null
++    private var startParams = ScreenStreamProtocol.StartParams()
++    private var currentDisplayGeometry: DisplayGeometry? = null
++
++    private var displayManager: DisplayManager? = null
++    private var mediaProjection: MediaProjection? = null
++    private var virtualDisplay: VirtualDisplay? = null
++    private var screenEncoder: ScreenEncoder? = null
++    private var audioCapturer: AudioPlaybackCapturer? = null
++    private var muxerQueue: StreamMuxerQueue? = null
++
++    private val projectionCallback = object : MediaProjection.Callback() {
++        override fun onStop() {
++            mainHandler.post {
++                stopCaptureAndNotify(reason = "projection_revoked", explicitStop = false)
++            }
++        }
++
++        override fun onCapturedContentVisibilityChanged(isVisible: Boolean) {
++            protectedContentActive.set(!isVisible)
++        }
++    }
++
++    private val displayListener = object : DisplayManager.DisplayListener {
++        override fun onDisplayAdded(displayId: Int) = Unit
++        override fun onDisplayRemoved(displayId: Int) = Unit
++
++        override fun onDisplayChanged(displayId: Int) {
++            if (displayId != Display.DEFAULT_DISPLAY || stopping.get()) {
++                return
++            }
++            handleDisplayChanged()
++        }
++    }
++
++    override fun onCreate() {
++        super.onCreate()
++        displayManager = getSystemService(DisplayManager::class.java)
++    }
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        if (intent == null) {
++            stopSelf()
++            return START_NOT_STICKY
++        }
++
++        when (intent.action) {
++            ACTION_USER_STOP -> {
++                stopCaptureAndNotify(reason = "user_stopped", explicitStop = true)
++                return START_NOT_STICKY
++            }
++            ACTION_REQUEST_KEYFRAME -> {
++                screenEncoder?.requestSyncFrame(forceCodecConfig = true)
++                return START_NOT_STICKY
++            }
++            ACTION_START_CAPTURE -> {
++                val deviceId = intent.getStringExtra(EXTRA_DEVICE_ID)
++                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
++                val consentData = IntentCompat.getParcelableExtra(intent, EXTRA_CONSENT_DATA, Intent::class.java)
++                if (deviceId.isNullOrEmpty() || resultCode != Activity.RESULT_OK || consentData == null) {
++                    Log.w(TAG, "Missing MediaProjection consent intent before foreground start")
++                    stopSelf()
++                    return START_NOT_STICKY
++                }
++
++                val params = ScreenStreamProtocol.StartParams(
++                    maxWidth = intent.getIntExtra(EXTRA_MAX_WIDTH, ScreenStreamProtocol.DEFAULT_MAX_WIDTH).coerceIn(320, 3840),
++                    maxHeight = intent.getIntExtra(EXTRA_MAX_HEIGHT, ScreenStreamProtocol.DEFAULT_MAX_HEIGHT).coerceIn(320, 3840),
++                    maxFps = intent.getIntExtra(EXTRA_MAX_FPS, ScreenStreamProtocol.DEFAULT_MAX_FPS).coerceIn(5, 60),
++                    maxBitrateKbps = intent.getIntExtra(EXTRA_MAX_BITRATE_KBPS, ScreenStreamProtocol.DEFAULT_BITRATE_KBPS).coerceIn(500, 20000),
++                    requestAudio = intent.getBooleanExtra(EXTRA_REQUEST_AUDIO, true),
++                )
++
++                val plugin = KdeConnect.getInstance().getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                val deviceName = plugin?.device?.name ?: deviceId
++
++                startForeground(
++                    NOTIFICATION_ID,
++                    buildOngoingNotification(deviceName),
++                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION,
++                )
++
++                teardownResources()
++                stopping.set(false)
++                protectedContentActive.set(false)
++                lastPtsUs.set(SystemClock.elapsedRealtimeNanos() / 1000L)
++                activeDeviceId = deviceId
++                startParams = params
++
++                beginCaptureSession(deviceId, resultCode, consentData, params)
++                return START_NOT_STICKY
++            }
++            else -> {
++                stopSelf()
++                return START_NOT_STICKY
++            }
++        }
++    }
++
++    private fun beginCaptureSession(
++        deviceId: String,
++        resultCode: Int,
++        consentData: Intent,
++        params: ScreenStreamProtocol.StartParams,
++    ) {
++        val mgr = getSystemService(MediaProjectionManager::class.java)
++        val projection = mgr?.getMediaProjection(resultCode, consentData)
++        if (projection == null) {
++            failStart(deviceId, "Unable to obtain MediaProjection from consent token")
++            return
++        }
++
++        val plugin = KdeConnect.getInstance().getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++        if (plugin == null) {
++            projection.stop()
++            stopSelf()
++            return
++        }
++
++        try {
++            mediaProjection = projection
++            projection.registerCallback(projectionCallback, mainHandler)
++
++            val geom = queryDefaultDisplayGeometry()
++            currentDisplayGeometry = geom
++
++            val (streamW, streamH) = ScreenStreamProtocol.computeStreamGeometry(
++                geom.width,
++                geom.height,
++                params.maxWidth,
++                params.maxHeight,
++            )
++
++            val queue = StreamMuxerQueue(onClosedCallback = {
++                mainHandler.post {
++                    if (!stopping.get()) {
++                        stopCaptureAndNotify(reason = "stream_closed", explicitStop = false)
++                    }
++                }
++            })
++            muxerQueue = queue
++
++            val encoder = ScreenEncoder(
++                width = streamW,
++                height = streamH,
++                fps = params.maxFps,
++                bitrateKbps = params.maxBitrateKbps,
++                muxerQueue = queue,
++                protectedContentActive = protectedContentActive,
++                lastPtsUs = lastPtsUs,
++                onFatalError = { errorMsg ->
++                    mainHandler.post {
++                        failStart(deviceId, errorMsg)
++                    }
++                },
++            )
++            encoder.start()
++            screenEncoder = encoder
++
++            val surface = encoder.inputSurface
++                ?: throw IllegalStateException("MediaCodec encoder created no input surface")
++
++            virtualDisplay = projection.createVirtualDisplay(
++                VIRTUAL_DISPLAY_NAME,
++                streamW,
++                streamH,
++                geom.densityDpi,
++                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
++                surface,
++                null,
++                mainHandler,
++            )
++
++            displayManager?.registerDisplayListener(displayListener, mainHandler)
++
++            var audioAvailable = false
++            var audioReason = if (params.requestAudio) "" else "Audio disabled by viewer request"
++            if (params.requestAudio) {
++                val capturer = AudioPlaybackCapturer(
++                    context = this,
++                    mediaProjection = projection,
++                    muxerQueue = queue,
++                    lastPtsUs = lastPtsUs,
++                    onAudioStatusChanged = { avail, reason ->
++                        mainHandler.post {
++                            KdeConnect.getInstance()
++                                .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                                ?.onServiceAudioStatusChanged(avail, reason)
++                        }
++                    },
++                )
++                val audioRes = capturer.start()
++                audioAvailable = audioRes.available
++                audioReason = audioRes.reason
++                if (audioAvailable) {
++                    audioCapturer = capturer
++                }
++            }
++
++            currentInstance = this
++            plugin.onServiceStreamingStarted(
++                muxerQueue = queue,
++                displayWidth = geom.width,
++                displayHeight = geom.height,
++                streamWidth = streamW,
++                streamHeight = streamH,
++                rotationDegrees = geom.rotationDegrees,
++                fps = params.maxFps,
++                audioAvailable = audioAvailable,
++                audioReason = audioReason,
++            )
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to start MediaProjection capture", e)
++            failStart(deviceId, e.message ?: e.javaClass.simpleName)
++        }
++    }
++
++    private fun handleDisplayChanged() {
++        val vd = virtualDisplay ?: return
++        val deviceId = activeDeviceId ?: return
++        val queue = muxerQueue ?: return
++        if (queue.isClosed) return
++
++        val prev = currentDisplayGeometry
++        val next = queryDefaultDisplayGeometry()
++        if (prev != null &&
++            prev.width == next.width &&
++            prev.height == next.height &&
++            prev.rotationDegrees == next.rotationDegrees
++        ) {
++            return
++        }
++        currentDisplayGeometry = next
++
++        val (newStreamW, newStreamH) = ScreenStreamProtocol.computeStreamGeometry(
++            next.width,
++            next.height,
++            startParams.maxWidth,
++            startParams.maxHeight,
++        )
++
++        val oldEncoder = screenEncoder
++        if (oldEncoder != null && oldEncoder.width == newStreamW && oldEncoder.height == newStreamH) {
++            KdeConnect.getInstance()
++                .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                ?.onServiceGeometryChanged(next.width, next.height, newStreamW, newStreamH, next.rotationDegrees)
++            return
++        }
++
++        try {
++            val replacement = ScreenEncoder(
++                width = newStreamW,
++                height = newStreamH,
++                fps = startParams.maxFps,
++                bitrateKbps = startParams.maxBitrateKbps,
++                muxerQueue = queue,
++                protectedContentActive = protectedContentActive,
++                lastPtsUs = lastPtsUs,
++                onFatalError = { errorMsg ->
++                    mainHandler.post {
++                        failStart(deviceId, errorMsg)
++                    }
++                },
++            )
++            replacement.start()
++            val newSurface = replacement.inputSurface
++                ?: throw IllegalStateException("Replacement encoder produced no input surface")
++
++            vd.resize(newStreamW, newStreamH, next.densityDpi)
++            vd.setSurface(newSurface)
++            screenEncoder = replacement
++            oldEncoder?.stop()
++
++            KdeConnect.getInstance()
++                .getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++                ?.onServiceGeometryChanged(next.width, next.height, newStreamW, newStreamH, next.rotationDegrees)
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to reconfigure virtual display on rotation", e)
++            failStart(deviceId, "Rotation resize failed: ${e.message ?: e.javaClass.simpleName}")
++        }
++    }
++
++    private fun queryDefaultDisplayGeometry(): DisplayGeometry {
++        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
++        if (display != null) {
++            val rotDegrees = ScreenStreamProtocol.surfaceRotationToDegrees(display.rotation)
++            val fallbackDensity = resources.configuration.densityDpi.coerceAtLeast(160)
++            try {
++                val windowCtx = createDisplayContext(display).createWindowContext(
++                    WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
++                    null,
++                )
++                val wm = windowCtx.getSystemService(WindowManager::class.java)
++                val bounds: Rect? = wm?.maximumWindowMetrics?.bounds
++                val density = windowCtx.resources.configuration.densityDpi.coerceAtLeast(160)
++                if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
++                    return DisplayGeometry(
++                        width = bounds.width(),
++                        height = bounds.height(),
++                        densityDpi = density,
++                        rotationDegrees = rotDegrees,
++                    )
++                }
++            } catch (e: RuntimeException) {
++                Log.w(TAG, "WindowContext bounds unavailable, falling back to Display.Mode: ${e.message}")
++            }
++
++            val mode = display.mode
++            val swap = rotDegrees == 90 || rotDegrees == 270
++            val w = if (swap) mode.physicalHeight else mode.physicalWidth
++            val h = if (swap) mode.physicalWidth else mode.physicalHeight
++            return DisplayGeometry(
++                width = w.coerceAtLeast(320),
++                height = h.coerceAtLeast(320),
++                densityDpi = fallbackDensity,
++                rotationDegrees = rotDegrees,
++            )
++        }
++        return DisplayGeometry(width = 1080, height = 1920, densityDpi = 420, rotationDegrees = 0)
++    }
++
++    private fun failStart(deviceId: String, reason: String) {
++        if (!stopping.compareAndSet(false, true)) {
++            return
++        }
++        val plugin = KdeConnect.getInstance().getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++        teardownResources()
++        plugin?.onServiceError(reason)
++        stopForeground(STOP_FOREGROUND_REMOVE)
++        stopSelf()
++    }
++
++    private fun stopCaptureAndNotify(reason: String, explicitStop: Boolean) {
++        if (!stopping.compareAndSet(false, true)) {
++            return
++        }
++        val deviceId = activeDeviceId
++        val plugin = if (!deviceId.isNullOrEmpty()) {
++            KdeConnect.getInstance().getDevicePlugin(deviceId, ScreenStreamPlugin::class.java)
++        } else {
++            null
++        }
++        val queue = muxerQueue
++        if (plugin != null) {
++            teardownCaptureHardwareOnly()
++            plugin.onServiceStopped(reason = reason, explicitStop = explicitStop, queue = queue)
++            if (muxerQueue === queue) {
++                muxerQueue = null
++            }
++        } else {
++            teardownResources()
++        }
++        stopForeground(STOP_FOREGROUND_REMOVE)
++        stopSelf()
++    }
++
++    private fun teardownCaptureHardwareOnly() {
++        if (currentInstance === this) {
++            currentInstance = null
++        }
++        displayManager?.unregisterDisplayListener(displayListener)
++
++        audioCapturer?.stop()
++        audioCapturer = null
++
++        val encoder = screenEncoder
++        screenEncoder = null
++
++        virtualDisplay?.release()
++        virtualDisplay = null
++
++        encoder?.stop()
++
++        val projection = mediaProjection
++        mediaProjection = null
++        if (projection != null) {
++            try {
++                projection.unregisterCallback(projectionCallback)
++            } catch (_: RuntimeException) {
++            }
++            try {
++                projection.stop()
++            } catch (_: RuntimeException) {
++            }
++        }
++    }
++
++    private fun teardownResources() {
++        teardownCaptureHardwareOnly()
++        val queue = muxerQueue
++        muxerQueue = null
++        queue?.offerEosAndFinish(SystemClock.elapsedRealtimeNanos() / 1000L)
++        queue?.close()
++    }
++
++    private fun buildOngoingNotification(deviceName: String): Notification {
++        val stopIntent = Intent(this, ScreenStreamService::class.java).apply {
++            action = ACTION_USER_STOP
++        }
++        val stopPending = PendingIntent.getService(
++            this,
++            0,
++            stopIntent,
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
++        )
++
++        return NotificationCompat.Builder(this, NotificationHelper.Channels.DEFAULT)
++            .setSmallIcon(R.drawable.ic_notification)
++            .setContentTitle(getString(R.string.screenstream_notification_title))
++            .setContentText(getString(R.string.screenstream_notification_body, deviceName))
++            .setOngoing(true)
++            .setOnlyAlertOnce(true)
++            .setCategory(NotificationCompat.CATEGORY_SERVICE)
++            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
++            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
++            .setGroup(NOTIFICATION_GROUP)
++            .addAction(R.drawable.ic_stop, getString(R.string.screenstream_action_stop), stopPending)
++            .build()
++    }
++
++    override fun onDestroy() {
++        stopping.set(true)
++        teardownResources()
++        super.onDestroy()
++    }
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    companion object {
++        private const val TAG = "ScreenStreamService"
++        private const val NOTIFICATION_ID = 47291
++        private const val NOTIFICATION_GROUP = "ScreenStream"
++        private const val VIRTUAL_DISPLAY_NAME = "KDEConnectScreenStream"
++
++        private const val ACTION_START_CAPTURE = "org.kde.kdeconnect.plugins.screenstream.START"
++        private const val ACTION_USER_STOP = "org.kde.kdeconnect.plugins.screenstream.STOP"
++        private const val ACTION_REQUEST_KEYFRAME = "org.kde.kdeconnect.plugins.screenstream.KEYFRAME"
++
++        private const val EXTRA_DEVICE_ID = "device_id"
++        private const val EXTRA_RESULT_CODE = "result_code"
++        private const val EXTRA_CONSENT_DATA = "consent_data"
++        private const val EXTRA_MAX_WIDTH = "max_width"
++        private const val EXTRA_MAX_HEIGHT = "max_height"
++        private const val EXTRA_MAX_FPS = "max_fps"
++        private const val EXTRA_MAX_BITRATE_KBPS = "max_bitrate_kbps"
++        private const val EXTRA_REQUEST_AUDIO = "request_audio"
++
++        @Volatile
++        private var currentInstance: ScreenStreamService? = null
++
++        fun createStartIntent(
++            context: Context,
++            deviceId: String,
++            resultCode: Int,
++            consentData: Intent,
++            params: ScreenStreamProtocol.StartParams,
++        ): Intent {
++            return Intent(context, ScreenStreamService::class.java).apply {
++                action = ACTION_START_CAPTURE
++                putExtra(EXTRA_DEVICE_ID, deviceId)
++                putExtra(EXTRA_RESULT_CODE, resultCode)
++                putExtra(EXTRA_CONSENT_DATA, consentData)
++                putExtra(EXTRA_MAX_WIDTH, params.maxWidth)
++                putExtra(EXTRA_MAX_HEIGHT, params.maxHeight)
++                putExtra(EXTRA_MAX_FPS, params.maxFps)
++                putExtra(EXTRA_MAX_BITRATE_KBPS, params.maxBitrateKbps)
++                putExtra(EXTRA_REQUEST_AUDIO, params.requestAudio)
++            }
++        }
++
++        fun requestKeyframeIfRunning(deviceId: String) {
++            val active = currentInstance ?: return
++            if (active.activeDeviceId == deviceId) {
++                active.screenEncoder?.requestSyncFrame(forceCodecConfig = true)
++            }
++        }
++
++        fun stopCaptureForDevice(context: Context, deviceId: String, closeQueueImmediately: Boolean = true) {
++            val active = currentInstance
++            if (active != null && active.activeDeviceId == deviceId) {
++                active.mainHandler.post {
++                    if (currentInstance === active) {
++                        active.stopping.set(true)
++                        if (closeQueueImmediately) {
++                            active.teardownResources()
++                        } else {
++                            active.teardownCaptureHardwareOnly()
++                        }
++                        active.stopForeground(STOP_FOREGROUND_REMOVE)
++                        active.stopSelf()
++                    }
++                }
++            } else {
++                context.stopService(Intent(context, ScreenStreamService::class.java))
++            }
++        }
++    }
++}
+diff --git a/src/main/res/values/strings.xml b/src/main/res/values/strings.xml
+index 165e045d3cad09d407539d8b7623424ef177b7bb..fbcfe35e5710e4dd36de4d1f1a577aea0b4a39b5 100644
+--- a/src/main/res/values/strings.xml
++++ b/src/main/res/values/strings.xml
+@@ -676,4 +676,20 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <string name="pref_mpris_volume_control_summary">Control the connected device\'s media volume using this phone\'s hardware buttons</string>
+ 
+     <string name="pref_notification_screen_off_key" translatable="false">pref_notification_screen_off</string>
++
++    <string name="pref_plugin_screenstream">Screen stream</string>
++    <string name="pref_plugin_screenstream_desc">Stream this device screen and eligible playback audio to the connected desktop</string>
++    <string name="screenstream_action_start">Start screen stream</string>
++    <string name="screenstream_action_stop">Stop screen stream</string>
++    <string name="screenstream_optional_permission_explanation">Microphone/audio permission lets KDE Connect capture eligible app playback audio during screen streaming, and notification permission keeps capture controls visible</string>
++    <string name="screenstream_notification_title">Screen streaming active</string>
++    <string name="screenstream_notification_body">Sharing screen with %s</string>
++    <string name="screenstream_consent_notif_title">Screen stream requested by %s</string>
++    <string name="screenstream_consent_notif_body">Tap to allow screen capture</string>
++    <string name="screenstream_pref_auto_start_key" translatable="false">screenstream_auto_start</string>
++    <string name="screenstream_pref_auto_start_title">Auto-start when connected</string>
++    <string name="screenstream_pref_auto_start_summary">Request screen capture automatically on reconnect unless explicitly stopped</string>
++    <string name="screenstream_pref_send_audio_key" translatable="false">screenstream_send_audio</string>
++    <string name="screenstream_pref_send_audio_title">Include playback audio</string>
++    <string name="screenstream_pref_send_audio_summary">Stream eligible app playback audio alongside screen video</string>
+ </resources>
+diff --git a/src/main/res/xml/screenstreamplugin_preferences.xml b/src/main/res/xml/screenstreamplugin_preferences.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c91895cdecc9bdcb0dfbd8c40002cadcac068d7
+--- /dev/null
++++ b/src/main/res/xml/screenstreamplugin_preferences.xml
+@@ -0,0 +1,27 @@
++<?xml version="1.0" encoding="utf-8"?>
++
++<!--
++SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++
++SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++-->
++
++<androidx.preference.PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
++    xmlns:tools="http://schemas.android.com/tools"
++    android:layout_width="match_parent"
++    android:layout_height="match_parent"
++    tools:keep="@xml/screenstreamplugin_preferences">
++
++    <SwitchPreference
++        android:defaultValue="false"
++        android:key="@string/screenstream_pref_auto_start_key"
++        android:summary="@string/screenstream_pref_auto_start_summary"
++        android:title="@string/screenstream_pref_auto_start_title" />
++
++    <SwitchPreference
++        android:defaultValue="true"
++        android:key="@string/screenstream_pref_send_audio_key"
++        android:summary="@string/screenstream_pref_send_audio_summary"
++        android:title="@string/screenstream_pref_send_audio_title" />
++
++</androidx.preference.PreferenceScreen>
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt b/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..48ffdf19b978095216ebe4a64365c16a0c34cd56
+--- /dev/null
++++ b/src/test/java/org/kde/kdeconnect/plugins/screenstream/ScreenStreamProtocolTest.kt
+@@ -0,0 +1,246 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.screenstream
++
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import java.io.ByteArrayOutputStream
++
++class ScreenStreamProtocolTest {
++
++    @Test
++    fun testEncodeAndDecodeRoundTripAllFrameKinds() {
++        val sps = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E)
++        val idr = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65, 0x11, 0x22, 0x33)
++        val pcm = byteArrayOf(0x01, 0x02, 0x03, 0x04)
++
++        val packet = ByteArrayOutputStream().apply {
++            write(ScreenStreamProtocol.encodeFrame(ScreenStreamProtocol.FrameKind.CODEC_CONFIG, ScreenStreamProtocol.FLAG_NONE, 100L, sps))
++            write(
++                ScreenStreamProtocol.encodeFrame(
++                    ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT,
++                    ScreenStreamProtocol.FLAG_KEYFRAME or ScreenStreamProtocol.FLAG_PROTECTED_CONTENT,
++                    200L,
++                    idr,
++                )
++            )
++            write(ScreenStreamProtocol.encodeFrame(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK, ScreenStreamProtocol.FLAG_NONE, 300L, pcm))
++            write(ScreenStreamProtocol.encodeFrame(ScreenStreamProtocol.FrameKind.CONTROL_EOS, ScreenStreamProtocol.FLAG_NONE, 400L, ByteArray(0)))
++        }.toByteArray()
++
++        val frames = ScreenStreamProtocol.parseFrames(packet)
++        assertEquals(4, frames.size)
++        assertEquals(ScreenStreamProtocol.FrameKind.CODEC_CONFIG, frames[0].kind)
++        assertArrayEquals(sps, frames[0].payload)
++        assertEquals(ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT, frames[1].kind)
++        assertEquals(ScreenStreamProtocol.FLAG_KEYFRAME or ScreenStreamProtocol.FLAG_PROTECTED_CONTENT, frames[1].flags)
++        assertEquals(200L, frames[1].ptsUs)
++        assertArrayEquals(idr, frames[1].payload)
++        assertEquals(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK, frames[2].kind)
++        assertArrayEquals(pcm, frames[2].payload)
++        assertEquals(ScreenStreamProtocol.FrameKind.CONTROL_EOS, frames[3].kind)
++        assertEquals(0, frames[3].payload.size)
++    }
++
++    @Test
++    fun testFrameReaderRejectsInvalidMagicAndOversizedAudio() {
++        val badMagic = ByteArray(16)
++        val reader = ScreenStreamProtocol.FrameReader()
++        val out = mutableListOf<ScreenStreamProtocol.Frame>()
++        assertFalse(reader.feed(badMagic, out))
++        assertNotNull(reader.error)
++
++        val oversizedAudioHeader = ScreenStreamProtocol.encodeFrame(
++            ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT,
++            ScreenStreamProtocol.FLAG_NONE,
++            10L,
++            ByteArray(4),
++        )
++        // Corrupt kind byte (index 2) to AUDIO_PCM_CHUNK (0x03) and length (index 4..7) to 70000
++        oversizedAudioHeader[2] = 0x03
++        oversizedAudioHeader[4] = 0x00
++        oversizedAudioHeader[5] = 0x01
++        oversizedAudioHeader[6] = 0x11
++        oversizedAudioHeader[7] = 0x70
++
++        val audioReader = ScreenStreamProtocol.FrameReader()
++        assertFalse(audioReader.feed(oversizedAudioHeader, out))
++        assertNotNull(audioReader.error)
++    }
++
++    @Test
++    fun testControlRequestValidationAndClamping() {
++        assertNull(ScreenStreamProtocol.parseControlRequest("start", ScreenStreamProtocol.MAX_CONTROL_JSON_BYTES + 1))
++        assertNull(ScreenStreamProtocol.parseControlRequest("unknown", 32))
++        assertNull(ScreenStreamProtocol.parseControlRequest(null, 32))
++
++        val req = ScreenStreamProtocol.parseControlRequest(
++            action = "start",
++            rawJsonBytes = 128,
++            maxWidth = 99999,
++            maxHeight = 100,
++            maxFps = 240,
++            maxBitrateKbps = 500000,
++            requestAudio = false,
++        ) as ScreenStreamProtocol.ControlRequest.Start
++
++        assertEquals(3840, req.params.maxWidth)
++        assertEquals(320, req.params.maxHeight)
++        assertEquals(60, req.params.maxFps)
++        assertEquals(20000, req.params.maxBitrateKbps)
++        assertFalse(req.params.requestAudio)
++    }
++
++    @Test
++    fun testComputeStreamGeometryPreservesAspectAndAligns16() {
++        val portrait = ScreenStreamProtocol.computeStreamGeometry(1080, 2460, 1920, 1920)
++        assertEquals(0, portrait.first % 16)
++        assertEquals(0, portrait.second % 16)
++        assertTrue(portrait.first <= 1920 && portrait.second <= 1920)
++        assertEquals(Pair(848, 1920), portrait)
++
++        val landscape = ScreenStreamProtocol.computeStreamGeometry(2460, 1080, 1920, 1920)
++        assertEquals(Pair(1920, 848), landscape)
++    }
++
++    @Test
++    fun testMuxerQueueDropsNonIdrOnPressureAndResumesOnKeyframe() {
++        val queue = StreamMuxerQueue(maxVideoFrames = 4, maxAudioChunks = 2)
++        val deltaPayload = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x41)
++        val idrPayload = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65)
++
++        for (i in 0 until 4) {
++            val res = queue.offerVideoFrame(ScreenStreamProtocol.FLAG_NONE, i.toLong(), deltaPayload)
++            assertTrue(res.accepted)
++            assertFalse(res.requestSyncFrame)
++        }
++
++        // 5th non-IDR triggers backpressure purge and demands a sync frame
++        val overflowDelta = queue.offerVideoFrame(ScreenStreamProtocol.FLAG_NONE, 4L, deltaPayload)
++        assertFalse(overflowDelta.accepted)
++        assertTrue(overflowDelta.requestSyncFrame)
++
++        // Subsequent delta continues dropping while awaiting keyframe
++        val skippedDelta = queue.offerVideoFrame(ScreenStreamProtocol.FLAG_NONE, 5L, deltaPayload)
++        assertFalse(skippedDelta.accepted)
++        assertTrue(skippedDelta.requestSyncFrame)
++
++        // Fresh IDR recovers stream
++        val recovered = queue.offerVideoFrame(ScreenStreamProtocol.FLAG_KEYFRAME, 6L, idrPayload)
++        assertTrue(recovered.accepted)
++
++        // Bounded audio drops oldest when over maxAudioChunks=2
++        assertTrue(queue.offerAudioChunk(10L, byteArrayOf(1, 2)))
++        assertTrue(queue.offerAudioChunk(11L, byteArrayOf(3, 4)))
++        assertTrue(queue.offerAudioChunk(12L, byteArrayOf(5, 6)))
++        assertEquals(Pair(1, 2), queue.queuedCounts())
++
++        queue.offerEosAndFinish(20L)
++        val streamed = queue.readBytes()
++        val decoded = ScreenStreamProtocol.parseFrames(streamed)
++        assertEquals(ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT, decoded[0].kind)
++        assertEquals(6L, decoded[0].ptsUs)
++        assertEquals(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK, decoded[1].kind)
++        assertEquals(11L, decoded[1].ptsUs)
++        assertEquals(ScreenStreamProtocol.FrameKind.AUDIO_PCM_CHUNK, decoded[2].kind)
++        assertEquals(12L, decoded[2].ptsUs)
++        assertEquals(ScreenStreamProtocol.FrameKind.CONTROL_EOS, decoded[3].kind)
++    }
++
++    @Test
++    fun testSessionTrackerExplicitStopPersistenceAndReconnectBackoff() {
++        val tracker = ScreenStreamSessionTracker(initialExplicitStop = false, initialAutoStart = true)
++        assertTrue(tracker.shouldAutoStartOnConnect())
++        tracker.onStreamingStarted()
++        tracker.onLinkLost()
++        assertEquals(2000, tracker.consumeReconnectDelayMs())
++        assertEquals(4000, tracker.consumeReconnectDelayMs())
++        assertEquals(8000, tracker.consumeReconnectDelayMs())
++        assertNull(tracker.consumeReconnectDelayMs())
++
++        tracker.onExplicitStop("user_stopped")
++        assertTrue(tracker.explicitStop)
++        assertFalse(tracker.shouldAutoStartOnConnect())
++        assertNull(tracker.consumeReconnectDelayMs())
++    }
++
++    @Test
++    fun testReconnectAttemptsStayBoundedAcrossFailedReconnectStarts() {
++        val tracker = ScreenStreamSessionTracker(initialExplicitStop = false, initialAutoStart = true)
++        tracker.onStreamingStarted()
++        tracker.onLinkLost()
++        assertTrue(tracker.hasPendingReconnect)
++
++        // Simulating reconnect attempts that fail to reach STREAMING must keep backoff bounded.
++        assertEquals(2000, tracker.consumeReconnectDelayMs())
++        tracker.onStartRequested(isReconnectAttempt = true)
++        tracker.onLinkLost()
++        tracker.configure(autoStart = true, explicitStop = false)
++        assertTrue(tracker.hasPendingReconnect)
++
++        assertEquals(4000, tracker.consumeReconnectDelayMs())
++        tracker.onStartRequested(isReconnectAttempt = true)
++        tracker.onLinkLost()
++
++        assertEquals(8000, tracker.consumeReconnectDelayMs())
++        tracker.onStartRequested(isReconnectAttempt = true)
++        tracker.onLinkLost()
++
++        assertNull(tracker.consumeReconnectDelayMs())
++        assertFalse(tracker.hasPendingReconnect)
++
++        // Successful stream resets reconnect attempt budget for future drops.
++        tracker.onStreamingStarted()
++        tracker.onLinkLost()
++        assertEquals(2000, tracker.consumeReconnectDelayMs())
++    }
++
++    @Test
++    fun testIncrementalFrameReaderResetAndWireHelpers() {
++        for (state in ScreenStreamProtocol.SessionState.entries) {
++            assertEquals(state, ScreenStreamProtocol.SessionState.fromWireName(state.wireName))
++        }
++        assertNull(ScreenStreamProtocol.SessionState.fromWireName("unknown_state"))
++
++        assertTrue(ScreenStreamProtocol.isValidRotation(0))
++        assertTrue(ScreenStreamProtocol.isValidRotation(90))
++        assertTrue(ScreenStreamProtocol.isValidRotation(180))
++        assertTrue(ScreenStreamProtocol.isValidRotation(270))
++        assertFalse(ScreenStreamProtocol.isValidRotation(-90))
++        assertFalse(ScreenStreamProtocol.isValidRotation(45))
++        assertFalse(ScreenStreamProtocol.isValidRotation(360))
++
++        val validFrame = ScreenStreamProtocol.encodeFrame(
++            ScreenStreamProtocol.FrameKind.VIDEO_ACCESS_UNIT,
++            ScreenStreamProtocol.FLAG_KEYFRAME,
++            500L,
++            byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65),
++        )
++        val reader = ScreenStreamProtocol.FrameReader()
++        val parsed = mutableListOf<ScreenStreamProtocol.Frame>()
++
++        // Corrupt stream first, verify reset() restores clean parsing.
++        assertFalse(reader.feed(ByteArray(16), parsed))
++        assertNotNull(reader.error)
++        reader.reset()
++        assertNull(reader.error)
++        assertEquals(0, reader.bufferedBytes)
++
++        assertTrue(reader.feed(validFrame.copyOfRange(0, 7), parsed))
++        assertEquals(0, parsed.size)
++        assertEquals(7, reader.bufferedBytes)
++        assertTrue(reader.feed(validFrame.copyOfRange(7, validFrame.size), parsed))
++        assertEquals(1, parsed.size)
++        assertEquals(0, reader.bufferedBytes)
++        assertEquals(500L, parsed[0].ptsUs)
++    }
++}

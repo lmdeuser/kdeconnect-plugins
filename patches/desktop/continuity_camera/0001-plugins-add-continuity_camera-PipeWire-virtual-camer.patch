@@ -1,0 +1,1599 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:56:43 +0500
+Subject: [PATCH 1/4] plugins: add continuity_camera PipeWire virtual camera
+ and mic plugin
+
+
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 0afd522eaf6dfa35ffceff69e9b34070a09218bc..5c7b8995d3ff0c266ffb6b46c49e2261069834a9 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -14,6 +14,9 @@ add_subdirectory(mpriscontrol)
+ add_subdirectory(mprisremote)
+ add_subdirectory(contacts)
+ add_subdirectory(share)
++if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
++    add_subdirectory(continuity_camera)
++endif()
+ add_subdirectory(remotekeyboard)
+ add_subdirectory(notifications)
+ add_subdirectory(findmyphone)
+diff --git a/plugins/continuity_camera/CMakeLists.txt b/plugins/continuity_camera/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..0cd43aa080f5639b0f9db04588f1a7efa79d08f3
+--- /dev/null
++++ b/plugins/continuity_camera/CMakeLists.txt
+@@ -0,0 +1,48 @@
++# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Core Network)
++find_package(PkgConfig QUIET REQUIRED)
++pkg_check_modules(GStreamer REQUIRED IMPORTED_TARGET gstreamer-1.0 gstreamer-app-1.0)
++
++add_library(kdeconnectcontinuitycameracommon STATIC
++    continuitycameraprotocol.cpp
++)
++set_property(TARGET kdeconnectcontinuitycameracommon PROPERTY POSITION_INDEPENDENT_CODE ON)
++target_include_directories(kdeconnectcontinuitycameracommon PUBLIC
++    ${PROJECT_SOURCE_DIR}
++    ${CMAKE_CURRENT_SOURCE_DIR}
++)
++target_link_libraries(kdeconnectcontinuitycameracommon PUBLIC
++    Qt::Core
++)
++
++kdeconnect_add_plugin(kdeconnect_continuitycamera SOURCES
++    continuitycameraplugin.cpp
++)
++target_link_libraries(kdeconnect_continuitycamera
++    kdeconnectcore
++    kdeconnectcontinuitycameracommon
++    Qt::Core
++    Qt::Network
++    KF6::I18n
++)
++
++add_executable(kdeconnect-continuitycamera-bridge
++    bridge/main.cpp
++    bridge/pipewirebridge.cpp
++)
++target_link_libraries(kdeconnect-continuitycamera-bridge PRIVATE
++    kdeconnectcontinuitycameracommon
++    Qt::Core
++    Qt::Network
++    PkgConfig::GStreamer
++)
++install(TARGETS kdeconnect-continuitycamera-bridge ${KDECONNECT_INSTALL_TARGETS_DEFAULT_ARGS})
++
++if(BUILD_TESTING)
++    find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Test)
++    ecm_add_test(continuitycameratest.cpp
++        LINK_LIBRARIES kdeconnectcore kdeconnectcontinuitycameracommon Qt::Core Qt::Test)
++    set_tests_properties(continuitycameratest PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
++endif()
+diff --git a/plugins/continuity_camera/bridge/main.cpp b/plugins/continuity_camera/bridge/main.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ad6660c6861169b1ad7762e2f16fb81da4a8b595
+--- /dev/null
++++ b/plugins/continuity_camera/bridge/main.cpp
+@@ -0,0 +1,82 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "pipewirebridge.h"
++
++#include <QCommandLineOption>
++#include <QCommandLineParser>
++#include <QCoreApplication>
++#include <QSocketNotifier>
++#include <QTextStream>
++
++#include <csignal>
++#include <sys/socket.h>
++#include <unistd.h>
++
++namespace
++{
++int g_sigFd[2] = {-1, -1};
++
++void unixSignalHandler(int /*sig*/)
++{
++    const char byte = 1;
++    if (g_sigFd[0] >= 0) {
++        const ssize_t ignored = ::write(g_sigFd[0], &byte, sizeof(byte));
++        (void)ignored;
++    }
++}
++}
++
++int main(int argc, char *argv[])
++{
++    QCoreApplication app(argc, argv);
++    app.setApplicationName(QStringLiteral("kdeconnect-continuitycamera-bridge"));
++
++    QCommandLineParser parser;
++    parser.addHelpOption();
++    QCommandLineOption deviceOpt(QStringLiteral("device"), QStringLiteral("Device ID"), QStringLiteral("id"));
++    QCommandLineOption nameOpt(QStringLiteral("device-name"), QStringLiteral("Device Name"), QStringLiteral("name"));
++    QCommandLineOption socketOpt(QStringLiteral("socket"), QStringLiteral("Local IPC Socket"), QStringLiteral("path"));
++    QCommandLineOption audioOpt(QStringLiteral("audio"), QStringLiteral("Enable mic audio stream"), QStringLiteral("0|1"), QStringLiteral("0"));
++    parser.addOption(deviceOpt);
++    parser.addOption(nameOpt);
++    parser.addOption(socketOpt);
++    parser.addOption(audioOpt);
++    parser.process(app);
++
++    const QString socketPath = parser.value(socketOpt);
++    if (socketPath.isEmpty()) {
++        QTextStream(stderr) << QStringLiteral("Missing --socket argument\n");
++        return 2;
++    }
++
++    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, g_sigFd) == 0) {
++        auto *notifier = new QSocketNotifier(g_sigFd[1], QSocketNotifier::Read, &app);
++        QObject::connect(notifier, &QSocketNotifier::activated, &app, [&app](int fd) {
++            char tmp = 0;
++            const ssize_t ignored = ::read(fd, &tmp, sizeof(tmp));
++            (void)ignored;
++            app.quit();
++        });
++        struct sigaction sa{};
++        sa.sa_handler = unixSignalHandler;
++        sigemptyset(&sa.sa_mask);
++        sa.sa_flags = SA_RESTART;
++        ::sigaction(SIGINT, &sa, nullptr);
++        ::sigaction(SIGTERM, &sa, nullptr);
++    }
++
++    PipeWireBridge bridge(socketPath, parser.value(nameOpt), parser.value(audioOpt) == QLatin1String("1"));
++    QObject::connect(&app, &QCoreApplication::aboutToQuit, &bridge, &PipeWireBridge::shutdown);
++
++    QString err;
++    if (!bridge.start(&err)) {
++        QTextStream(stderr) << err << QStringLiteral("\n");
++        return 1;
++    }
++
++    return app.exec();
++}
+diff --git a/plugins/continuity_camera/bridge/pipewirebridge.cpp b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..f90dffbdcfe42ea953b966ef11043e68a63a3012
+--- /dev/null
++++ b/plugins/continuity_camera/bridge/pipewirebridge.cpp
+@@ -0,0 +1,314 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "pipewirebridge.h"
++
++#include <QCoreApplication>
++#include <QLocalSocket>
++
++#include <cstring>
++
++#include <gst/app/gstappsrc.h>
++#include <gst/gst.h>
++
++namespace
++{
++void configureLiveAppSrc(GstElement *appsrc, const char *capsString, guint64 maxBytes)
++{
++    GstCaps *caps = gst_caps_from_string(capsString);
++    g_object_set(appsrc,
++                 "is-live",
++                 TRUE,
++                 "format",
++                 GST_FORMAT_TIME,
++                 "stream-type",
++                 GST_APP_STREAM_TYPE_STREAM,
++                 "max-bytes",
++                 maxBytes,
++                 "caps",
++                 caps,
++                 nullptr);
++    gst_caps_unref(caps);
++}
++
++void configurePipeWireProvideSink(
++    GstElement *sink,
++    const QByteArray &clientName,
++    const char *mediaType,
++    const char *mediaRole,
++    const char *mediaClass,
++    const QByteArray &nodeDesc)
++{
++    GstStructure *props = gst_structure_new("props",
++                                            "media.type",
++                                            G_TYPE_STRING,
++                                            mediaType,
++                                            "media.category",
++                                            G_TYPE_STRING,
++                                            "Source",
++                                            "media.role",
++                                            G_TYPE_STRING,
++                                            mediaRole,
++                                            "media.class",
++                                            G_TYPE_STRING,
++                                            mediaClass,
++                                            "node.description",
++                                            G_TYPE_STRING,
++                                            nodeDesc.constData(),
++                                            nullptr);
++    g_object_set(sink,
++                 "mode",
++                 2,
++                 "client-name",
++                 clientName.constData(),
++                 "stream-properties",
++                 props,
++                 nullptr);
++    gst_structure_free(props);
++}
++
++bool pushBufferToAppSrc(GstElement *appsrc, const QByteArray &data, quint64 ptsUs, bool setKeyframeFlag, bool isKeyframe)
++{
++    if (!appsrc || data.isEmpty()) {
++        return false;
++    }
++    GstBuffer *buf = gst_buffer_new_allocate(nullptr, static_cast<gsize>(data.size()), nullptr);
++    if (!buf) {
++        return false;
++    }
++    GstMapInfo map;
++    if (!gst_buffer_map(buf, &map, GST_MAP_WRITE)) {
++        gst_buffer_unref(buf);
++        return false;
++    }
++    std::memcpy(map.data, data.constData(), static_cast<size_t>(data.size()));
++    gst_buffer_unmap(buf, &map);
++
++    GST_BUFFER_PTS(buf) = static_cast<GstClockTime>(ptsUs) * 1000ULL;
++    GST_BUFFER_DTS(buf) = GST_CLOCK_TIME_NONE;
++    if (setKeyframeFlag) {
++        if (isKeyframe) {
++            GST_BUFFER_FLAG_UNSET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
++        } else {
++            GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
++        }
++    }
++    return gst_app_src_push_buffer(GST_APP_SRC(appsrc), buf) == GST_FLOW_OK;
++}
++
++void teardownGstPipeline(GstElement *&pipeline, GstElement *&appsrc)
++{
++    if (pipeline) {
++        gst_element_set_state(pipeline, GST_STATE_NULL);
++        gst_object_unref(pipeline);
++        pipeline = nullptr;
++    }
++    appsrc = nullptr;
++}
++}
++
++struct PipeWireBridge::Private {
++    GstElement *videoPipeline = nullptr;
++    GstElement *videoAppSrc = nullptr;
++    GstElement *audioPipeline = nullptr;
++    GstElement *audioAppSrc = nullptr;
++};
++
++PipeWireBridge::PipeWireBridge(const QString &socketPath, const QString &deviceName, bool enableAudio, QObject *parent)
++    : QObject(parent)
++    , m_socketPath(socketPath)
++    , m_deviceName(deviceName.isEmpty() ? QStringLiteral("Android Phone") : deviceName)
++    , m_enableAudio(enableAudio)
++    , d(new Private)
++{
++}
++
++PipeWireBridge::~PipeWireBridge()
++{
++    shutdown();
++    delete d;
++    d = nullptr;
++}
++
++bool PipeWireBridge::start(QString *errorOut)
++{
++    if (!initPipelines(errorOut)) {
++        return false;
++    }
++
++    m_socket = new QLocalSocket(this);
++    connect(m_socket, &QLocalSocket::readyRead, this, &PipeWireBridge::onSocketReadyRead);
++    connect(m_socket, &QLocalSocket::disconnected, this, &PipeWireBridge::onSocketDisconnected);
++    m_socket->connectToServer(m_socketPath);
++    if (!m_socket->waitForConnected(3000)) {
++        if (errorOut) {
++            *errorOut = QStringLiteral("Failed to connect to continuity camera socket: %1").arg(m_socket->errorString());
++        }
++        shutdown();
++        return false;
++    }
++    return true;
++}
++
++bool PipeWireBridge::initPipelines(QString *errorOut)
++{
++    GError *gerr = nullptr;
++    if (!gst_init_check(nullptr, nullptr, &gerr)) {
++        if (errorOut) {
++            *errorOut = gerr ? QString::fromUtf8(gerr->message) : QStringLiteral("Failed to initialize GStreamer");
++        }
++        if (gerr) {
++            g_error_free(gerr);
++        }
++        return false;
++    }
++
++    d->videoPipeline = gst_pipeline_new("continuity-camera-video");
++    d->videoAppSrc = gst_element_factory_make("appsrc", "vsrc");
++    GstElement *parser = gst_element_factory_make("h264parse", "vparse");
++    GstElement *decoder = gst_element_factory_make("avdec_h264", "vdec");
++    GstElement *convert = gst_element_factory_make("videoconvert", "vconv");
++    GstElement *pwSink = gst_element_factory_make("pipewiresink", "vsink");
++
++    if (!d->videoPipeline || !d->videoAppSrc || !parser || !decoder || !convert || !pwSink) {
++        if (errorOut) {
++            *errorOut = QStringLiteral("Missing GStreamer video elements (appsrc, h264parse, avdec_h264, videoconvert, pipewiresink)");
++        }
++        if (d->videoAppSrc && !GST_OBJECT_PARENT(d->videoAppSrc)) gst_object_unref(d->videoAppSrc);
++        if (parser && !GST_OBJECT_PARENT(parser)) gst_object_unref(parser);
++        if (decoder && !GST_OBJECT_PARENT(decoder)) gst_object_unref(decoder);
++        if (convert && !GST_OBJECT_PARENT(convert)) gst_object_unref(convert);
++        if (pwSink && !GST_OBJECT_PARENT(pwSink)) gst_object_unref(pwSink);
++        teardownGstPipeline(d->videoPipeline, d->videoAppSrc);
++        return false;
++    }
++
++    configureLiveAppSrc(d->videoAppSrc, "video/x-h264,stream-format=(string)byte-stream,alignment=(string)au", 4U * 1024U * 1024U);
++    g_object_set(parser, "config-interval", -1, nullptr);
++
++    const QByteArray clientName = QByteArrayLiteral("KDE Connect Continuity Camera");
++    const QByteArray camDesc = QStringLiteral("KDE Connect Camera (%1)").arg(m_deviceName).toUtf8();
++    configurePipeWireProvideSink(pwSink, clientName, "Video", "Camera", "Video/Source", camDesc);
++
++    gst_bin_add_many(GST_BIN(d->videoPipeline), d->videoAppSrc, parser, decoder, convert, pwSink, nullptr);
++    if (!gst_element_link_many(d->videoAppSrc, parser, decoder, convert, pwSink, nullptr)) {
++        if (errorOut) {
++            *errorOut = QStringLiteral("Failed to link Continuity Camera PipeWire video pipeline");
++        }
++        shutdown();
++        return false;
++    }
++
++    if (gst_element_set_state(d->videoPipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
++        if (errorOut) {
++            *errorOut = QStringLiteral("Failed to start Continuity Camera video pipeline");
++        }
++        shutdown();
++        return false;
++    }
++
++    if (m_enableAudio) {
++        d->audioPipeline = gst_pipeline_new("continuity-camera-audio");
++        d->audioAppSrc = gst_element_factory_make("appsrc", "asrc");
++        GstElement *aconv = gst_element_factory_make("audioconvert", "aconv");
++        GstElement *aresamp = gst_element_factory_make("audioresample", "aresamp");
++        GstElement *apwSink = gst_element_factory_make("pipewiresink", "asink");
++
++        if (d->audioPipeline && d->audioAppSrc && aconv && aresamp && apwSink) {
++            configureLiveAppSrc(d->audioAppSrc, "audio/x-raw,format=(string)S16LE,channels=(int)1,rate=(int)48000,layout=(string)interleaved", 512U * 1024U);
++            const QByteArray micDesc = QStringLiteral("KDE Connect Mic (%1)").arg(m_deviceName).toUtf8();
++            configurePipeWireProvideSink(apwSink, clientName, "Audio", "Communication", "Audio/Source", micDesc);
++            gst_bin_add_many(GST_BIN(d->audioPipeline), d->audioAppSrc, aconv, aresamp, apwSink, nullptr);
++            if (gst_element_link_many(d->audioAppSrc, aconv, aresamp, apwSink, nullptr)) {
++                gst_element_set_state(d->audioPipeline, GST_STATE_PLAYING);
++            } else {
++                teardownGstPipeline(d->audioPipeline, d->audioAppSrc);
++            }
++        } else {
++            if (d->audioAppSrc && !GST_OBJECT_PARENT(d->audioAppSrc)) gst_object_unref(d->audioAppSrc);
++            if (aconv && !GST_OBJECT_PARENT(aconv)) gst_object_unref(aconv);
++            if (aresamp && !GST_OBJECT_PARENT(aresamp)) gst_object_unref(aresamp);
++            if (apwSink && !GST_OBJECT_PARENT(apwSink)) gst_object_unref(apwSink);
++            teardownGstPipeline(d->audioPipeline, d->audioAppSrc);
++        }
++    }
++
++    return true;
++}
++
++void PipeWireBridge::shutdown()
++{
++    if (m_socket) {
++        disconnect(m_socket, nullptr, this, nullptr);
++        m_socket->close();
++        m_socket->deleteLater();
++        m_socket = nullptr;
++    }
++    if (d) {
++        teardownGstPipeline(d->videoPipeline, d->videoAppSrc);
++        teardownGstPipeline(d->audioPipeline, d->audioAppSrc);
++    }
++}
++
++void PipeWireBridge::onSocketReadyRead()
++{
++    if (!m_socket) {
++        return;
++    }
++    const QByteArray data = m_socket->readAll();
++    if (data.isEmpty()) {
++        return;
++    }
++
++    QList<ContinuityCameraProtocol::StreamFrame> frames;
++    if (!m_parser.feed(data, &frames)) {
++        shutdown();
++        QCoreApplication::quit();
++        return;
++    }
++
++    for (const auto &frame : std::as_const(frames)) {
++        if (frame.kind == ContinuityCameraProtocol::FrameKind::ControlEos) {
++            onSocketDisconnected();
++            return;
++        }
++        handleFrame(frame);
++    }
++}
++
++void PipeWireBridge::handleFrame(const ContinuityCameraProtocol::StreamFrame &frame)
++{
++    switch (frame.kind) {
++    case ContinuityCameraProtocol::FrameKind::CodecConfig:
++        m_codecConfig = frame.payload;
++        pushBufferToAppSrc(d->videoAppSrc, frame.payload, frame.ptsUs, true, true);
++        break;
++    case ContinuityCameraProtocol::FrameKind::VideoAccessUnit: {
++        const bool keyframe = (frame.flags & ContinuityCameraProtocol::FlagKeyframe) != 0;
++        QByteArray packet = frame.payload;
++        if (keyframe && !m_codecConfig.isEmpty() && !packet.startsWith(m_codecConfig)) {
++            packet.prepend(m_codecConfig);
++        }
++        pushBufferToAppSrc(d->videoAppSrc, packet, frame.ptsUs, true, keyframe);
++        break;
++    }
++    case ContinuityCameraProtocol::FrameKind::AudioPcmChunk:
++        if (d->audioAppSrc) {
++            pushBufferToAppSrc(d->audioAppSrc, frame.payload, frame.ptsUs, false, false);
++        }
++        break;
++    case ContinuityCameraProtocol::FrameKind::ControlEos:
++        break;
++    }
++}
++
++void PipeWireBridge::onSocketDisconnected()
++{
++    shutdown();
++    QCoreApplication::quit();
++}
++
++#include "moc_pipewirebridge.cpp"
+diff --git a/plugins/continuity_camera/bridge/pipewirebridge.h b/plugins/continuity_camera/bridge/pipewirebridge.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d0919fe6eb4fb6a05ade687a7cce98dab0903fd
+--- /dev/null
++++ b/plugins/continuity_camera/bridge/pipewirebridge.h
+@@ -0,0 +1,45 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QByteArray>
++#include <QObject>
++#include <QString>
++
++#include "continuitycameraprotocol.h"
++
++class QLocalSocket;
++
++class PipeWireBridge : public QObject
++{
++    Q_OBJECT
++
++public:
++    explicit PipeWireBridge(const QString &socketPath, const QString &deviceName, bool enableAudio, QObject *parent = nullptr);
++    ~PipeWireBridge() override;
++
++    bool start(QString *errorOut = nullptr);
++    void shutdown();
++
++private Q_SLOTS:
++    void onSocketReadyRead();
++    void onSocketDisconnected();
++
++private:
++    bool initPipelines(QString *errorOut);
++    void handleFrame(const ContinuityCameraProtocol::StreamFrame &frame);
++
++    QString m_socketPath;
++    QString m_deviceName;
++    bool m_enableAudio = false;
++    QLocalSocket *m_socket = nullptr;
++    ContinuityCameraProtocol::StreamFrameParser m_parser;
++    QByteArray m_codecConfig;
++
++    struct Private;
++    Private *d = nullptr;
++};
+diff --git a/plugins/continuity_camera/continuitycameraplugin.cpp b/plugins/continuity_camera/continuitycameraplugin.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..c489a8d48c565ca351695b2fd9f6e7b0465628fd
+--- /dev/null
++++ b/plugins/continuity_camera/continuitycameraplugin.cpp
+@@ -0,0 +1,462 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "continuitycameraplugin.h"
++
++#include "plugin_continuitycamera_debug.h"
++
++#include <KLocalizedString>
++#include <KPluginFactory>
++#include <KJob>
++
++#include <QCoreApplication>
++#include <QDateTime>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++#include <QLocalServer>
++#include <QLocalSocket>
++#include <QProcess>
++#include <QStandardPaths>
++#include <QUrl>
++#include <QUuid>
++
++#include <core/daemon.h>
++#include <core/filetransferjob.h>
++
++K_PLUGIN_CLASS_WITH_JSON(ContinuityCameraPlugin, "kdeconnect_continuitycamera.json")
++
++namespace
++{
++inline constexpr qsizetype kMaxPendingFrames = 32;
++inline constexpr qint64 kMaxBridgeWriteQueueBytes = 4LL * 1024LL * 1024LL;
++}
++
++ContinuityCameraPlugin::ContinuityCameraPlugin(QObject *parent, const QVariantList &args)
++    : KdeConnectPlugin(parent, args)
++{
++}
++
++ContinuityCameraPlugin::~ContinuityCameraPlugin()
++{
++    m_stopping = true;
++    teardownSession(true, false);
++}
++
++bool ContinuityCameraPlugin::isStreaming() const
++{
++    return m_session.state() == ContinuityCameraProtocol::CameraSessionMachine::State::Streaming;
++}
++
++QString ContinuityCameraPlugin::state() const
++{
++    return m_session.stateName();
++}
++
++QString ContinuityCameraPlugin::dbusPath() const
++{
++    return QLatin1String("/modules/kdeconnect/devices/%1/continuitycamera").arg(device()->id());
++}
++
++bool ContinuityCameraPlugin::startCamera(int maxWidth, int maxHeight, int fps, bool includeMic, const QString &lens)
++{
++    const ContinuityCameraProtocol::StreamConfig cfg = ContinuityCameraProtocol::clampStreamConfig(maxWidth, maxHeight, fps);
++    m_stopping = false;
++    m_session.beginStart();
++    Q_EMIT stateChanged();
++
++    NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST);
++    np.set(QStringLiteral("action"), QStringLiteral("start_stream"));
++    np.set(QStringLiteral("maxWidth"), cfg.width);
++    np.set(QStringLiteral("maxHeight"), cfg.height);
++    np.set(QStringLiteral("fps"), cfg.fps);
++    np.set(QStringLiteral("includeMic"), includeMic);
++    np.set(QStringLiteral("lens"), ContinuityCameraProtocol::normalizeLens(lens));
++    return sendPacket(np);
++}
++
++void ContinuityCameraPlugin::stopCamera()
++{
++    m_stopping = true;
++    m_session.beginStop();
++    NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST, {{QStringLiteral("action"), QStringLiteral("stop_stream")}});
++    sendPacket(np);
++    teardownSession(true, false);
++}
++
++void ContinuityCameraPlugin::switchLens(const QString &lens)
++{
++    NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST);
++    np.set(QStringLiteral("action"), QStringLiteral("switch_lens"));
++    np.set(QStringLiteral("lens"), ContinuityCameraProtocol::normalizeLens(lens));
++    sendPacket(np);
++}
++
++void ContinuityCameraPlugin::requestPhotoCapture()
++{
++    NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST, {{QStringLiteral("action"), QStringLiteral("capture_photo")}});
++    sendPacket(np);
++}
++
++void ContinuityCameraPlugin::requestDocumentScan()
++{
++    NetworkPacket np(PACKET_TYPE_CONTINUITYCAMERA_REQUEST, {{QStringLiteral("action"), QStringLiteral("scan_document")}});
++    sendPacket(np);
++}
++
++void ContinuityCameraPlugin::receivePacket(const NetworkPacket &np)
++{
++    if (np.type() != PACKET_TYPE_CONTINUITYCAMERA) {
++        return;
++    }
++
++    const QString event = np.get<QString>(QStringLiteral("event"));
++    if (event == QLatin1String("capture_result")) {
++        handleCaptureResult(np);
++        return;
++    }
++
++    if (event == QLatin1String("stopped")) {
++        teardownSession(true, false);
++        return;
++    }
++
++    if (event == QLatin1String("state")) {
++        const QString remoteState = np.get<QString>(QStringLiteral("state"));
++        if (remoteState == QLatin1String("error") || remoteState == QLatin1String("stopped")) {
++            teardownSession(true, remoteState == QLatin1String("error"));
++        }
++        return;
++    }
++
++    if (event == QLatin1String("stream_open")) {
++        if (!np.hasPayload() || !np.payload()) {
++            teardownSession(true, true);
++            return;
++        }
++        const bool includeMic = np.get<bool>(QStringLiteral("audioEnabled"), false);
++        teardownSession(true, false);
++        m_stopping = false;
++        m_parser.reset();
++        m_cachedCodecConfig.clear();
++        m_pendingFrames.clear();
++
++        if (!ensureLocalServer() || !launchBridge(includeMic)) {
++            teardownSession(true, true);
++            return;
++        }
++
++        m_payload = np.payload();
++        connect(m_payload.data(), &QIODevice::readyRead, this, &ContinuityCameraPlugin::onPayloadReadyRead);
++        connect(m_payload.data(), &QIODevice::readChannelFinished, this, &ContinuityCameraPlugin::onPayloadClosed);
++        connect(m_payload.data(), &QIODevice::aboutToClose, this, &ContinuityCameraPlugin::onPayloadClosed);
++
++        m_session.onStreamOpen();
++        Q_EMIT streamingChanged(true);
++        Q_EMIT stateChanged();
++
++        if (m_payload->bytesAvailable() > 0) {
++            onPayloadReadyRead();
++        }
++    }
++}
++
++void ContinuityCameraPlugin::handleCaptureResult(const NetworkPacket &np)
++{
++    if (!np.hasPayload() || np.payloadSize() <= 0 || np.payloadSize() > ContinuityCameraProtocol::kMaxCaptureBytes) {
++        qCWarning(KDECONNECT_PLUGIN_CONTINUITYCAMERA) << "Ignoring capture_result with missing or oversized payload:" << np.payloadSize();
++        return;
++    }
++
++    const QString mimeType = np.get<QString>(QStringLiteral("mimeType")).trimmed().toLower();
++    const QString safeName = ContinuityCameraProtocol::sanitizeCaptureFilename(np.get<QString>(QStringLiteral("filename")), mimeType);
++    if (safeName.isEmpty()) {
++        qCWarning(KDECONNECT_PLUGIN_CONTINUITYCAMERA) << "Ignoring capture_result with invalid filename or mimeType";
++        return;
++    }
++
++    QString dlDir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
++    if (dlDir.isEmpty()) {
++        dlDir = QDir::homePath();
++    }
++    QDir().mkpath(dlDir);
++    QString destPath = QDir(dlDir).filePath(safeName);
++    if (QFileInfo::exists(destPath)) {
++        const QFileInfo fi(safeName);
++        const QString unique = QStringLiteral("%1-%2.%3")
++                                   .arg(fi.completeBaseName())
++                                   .arg(QDateTime::currentMSecsSinceEpoch())
++                                   .arg(fi.suffix());
++        destPath = QDir(dlDir).filePath(unique);
++    }
++
++    FileTransferJob *job = np.createPayloadTransferJob(QUrl::fromLocalFile(destPath));
++    connect(job, &KJob::result, this, [this, job, destPath, mimeType] {
++        if (job->error()) {
++            qCWarning(KDECONNECT_PLUGIN_CONTINUITYCAMERA) << "Capture download failed:" << job->errorString();
++            QFile::remove(destPath);
++            return;
++        }
++        if (QFileInfo(destPath).size() > ContinuityCameraProtocol::kMaxCaptureBytes) {
++            qCWarning(KDECONNECT_PLUGIN_CONTINUITYCAMERA) << "Downloaded capture exceeded size bound";
++            QFile::remove(destPath);
++            return;
++        }
++        Daemon::instance()->sendSimpleNotification(
++            QStringLiteral("continuityCameraCapture"),
++            device()->name(),
++            i18n("Imported capture to %1", destPath),
++            QStringLiteral("camera-photo"));
++        Q_EMIT captureImported(destPath, mimeType);
++    });
++    job->start();
++}
++
++bool ContinuityCameraPlugin::ensureLocalServer()
++{
++    if (m_localServer) {
++        m_localServer->close();
++        m_localServer->deleteLater();
++        m_localServer = nullptr;
++    }
++    removeSocketFile();
++
++    QString baseDir = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
++    if (baseDir.isEmpty() || !QDir().mkpath(baseDir)) {
++        m_fallbackSocketDir = QDir(QDir::tempPath()).filePath(
++            QStringLiteral("kdeconnect-ccam-%1").arg(QUuid::createUuid().toString(QUuid::Id128).left(12)));
++        if (!QDir().mkpath(m_fallbackSocketDir)) {
++            return false;
++        }
++        QFile::setPermissions(m_fallbackSocketDir, QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
++        baseDir = m_fallbackSocketDir;
++    }
++
++    m_socketPath = QDir(baseDir).filePath(
++        QStringLiteral("kdeconnect-ccam-%1-%2.sock")
++            .arg(QCoreApplication::applicationPid())
++            .arg(QUuid::createUuid().toString(QUuid::Id128).left(10)));
++    QLocalServer::removeServer(m_socketPath);
++
++    m_localServer = new QLocalServer(this);
++    m_localServer->setSocketOptions(QLocalServer::UserAccessOption);
++    connect(m_localServer, &QLocalServer::newConnection, this, &ContinuityCameraPlugin::onNewBridgeConnection);
++    return m_localServer->listen(m_socketPath);
++}
++
++bool ContinuityCameraPlugin::launchBridge(bool includeMic)
++{
++    QString bridgeExe = QStandardPaths::findExecutable(QStringLiteral("kdeconnect-continuitycamera-bridge"));
++    if (bridgeExe.isEmpty()) {
++        const QString sibling = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("kdeconnect-continuitycamera-bridge"));
++        if (QFileInfo::exists(sibling) && QFileInfo(sibling).isExecutable()) {
++            bridgeExe = sibling;
++        }
++    }
++    if (bridgeExe.isEmpty()) {
++        qCWarning(KDECONNECT_PLUGIN_CONTINUITYCAMERA) << "kdeconnect-continuitycamera-bridge executable not found";
++        return false;
++    }
++
++    auto *process = new QProcess(this);
++#ifdef Q_OS_UNIX
++    process->setUnixProcessParameters(QProcess::UnixProcessFlag::CloseFileDescriptors);
++#endif
++    process->setProcessChannelMode(QProcess::ForwardedChannels);
++    process->setProgram(bridgeExe);
++    process->setArguments({
++        QStringLiteral("--device"),
++        device()->id(),
++        QStringLiteral("--device-name"),
++        device()->name(),
++        QStringLiteral("--socket"),
++        m_socketPath,
++        QStringLiteral("--audio"),
++        includeMic ? QStringLiteral("1") : QStringLiteral("0"),
++    });
++
++    connect(process, &QProcess::finished, this, &ContinuityCameraPlugin::onBridgeFinished);
++    m_bridgeProcess = process;
++    process->start();
++    if (!process->waitForStarted(3000)) {
++        disconnect(process, &QProcess::finished, this, nullptr);
++        process->deleteLater();
++        m_bridgeProcess = nullptr;
++        return false;
++    }
++    return true;
++}
++
++void ContinuityCameraPlugin::teardownSession(bool terminateBridge, bool error)
++{
++    const bool wasStreaming = isStreaming();
++    if (m_payload) {
++        disconnect(m_payload.data(), nullptr, this, nullptr);
++        m_payload.clear();
++    }
++    if (m_bridgeSocket) {
++        disconnect(m_bridgeSocket, nullptr, this, nullptr);
++        m_bridgeSocket->close();
++        m_bridgeSocket->deleteLater();
++        m_bridgeSocket = nullptr;
++    }
++    if (m_localServer) {
++        m_localServer->close();
++        m_localServer->deleteLater();
++        m_localServer = nullptr;
++    }
++    if (m_bridgeProcess) {
++        disconnect(m_bridgeProcess, nullptr, this, nullptr);
++        if (terminateBridge && m_bridgeProcess->state() != QProcess::NotRunning) {
++            m_bridgeProcess->terminate();
++            if (!m_bridgeProcess->waitForFinished(1500)) {
++                m_bridgeProcess->kill();
++            }
++        }
++        m_bridgeProcess->deleteLater();
++        m_bridgeProcess = nullptr;
++    }
++    removeSocketFile();
++    m_cachedCodecConfig.clear();
++    m_pendingFrames.clear();
++    m_parser.reset();
++    m_session.onTeardown(error);
++    if (wasStreaming) {
++        Q_EMIT streamingChanged(false);
++    }
++    Q_EMIT stateChanged();
++}
++
++void ContinuityCameraPlugin::removeSocketFile()
++{
++    if (!m_socketPath.isEmpty()) {
++        QLocalServer::removeServer(m_socketPath);
++        QFile::remove(m_socketPath);
++        m_socketPath.clear();
++    }
++    if (!m_fallbackSocketDir.isEmpty()) {
++        QDir(m_fallbackSocketDir).removeRecursively();
++        m_fallbackSocketDir.clear();
++    }
++}
++
++void ContinuityCameraPlugin::onNewBridgeConnection()
++{
++    if (!m_localServer) {
++        return;
++    }
++    while (QLocalSocket *sock = m_localServer->nextPendingConnection()) {
++        if (m_bridgeSocket) {
++            sock->close();
++            sock->deleteLater();
++            continue;
++        }
++        m_bridgeSocket = sock;
++        connect(sock, &QLocalSocket::disconnected, this, &ContinuityCameraPlugin::onBridgeSocketDisconnected);
++        flushPendingFrames();
++    }
++}
++
++void ContinuityCameraPlugin::onBridgeSocketDisconnected()
++{
++    if (m_bridgeSocket) {
++        m_bridgeSocket->deleteLater();
++        m_bridgeSocket = nullptr;
++    }
++}
++
++void ContinuityCameraPlugin::onBridgeFinished()
++{
++    if (!m_bridgeProcess) {
++        return;
++    }
++    const bool abnormal = m_bridgeProcess->exitStatus() != QProcess::NormalExit || m_bridgeProcess->exitCode() != 0;
++    m_bridgeProcess->deleteLater();
++    m_bridgeProcess = nullptr;
++    if (!m_stopping) {
++        stopCamera();
++        if (abnormal) {
++            m_session.onTeardown(true);
++            Q_EMIT stateChanged();
++        }
++    }
++}
++
++void ContinuityCameraPlugin::onPayloadReadyRead()
++{
++    if (!m_payload) {
++        return;
++    }
++    const QByteArray data = m_payload->readAll();
++    if (data.isEmpty()) {
++        return;
++    }
++
++    QList<ContinuityCameraProtocol::StreamFrame> frames;
++    if (!m_parser.feed(data, &frames)) {
++        teardownSession(true, true);
++        return;
++    }
++
++    for (const auto &frame : std::as_const(frames)) {
++        if (frame.kind == ContinuityCameraProtocol::FrameKind::ControlEos) {
++            onPayloadClosed();
++            return;
++        }
++        enqueueOrSendFrame(frame);
++    }
++}
++
++void ContinuityCameraPlugin::onPayloadClosed()
++{
++    if (m_bridgeSocket && m_bridgeSocket->state() == QLocalSocket::ConnectedState) {
++        m_bridgeSocket->write(ContinuityCameraProtocol::encodeFrame(ContinuityCameraProtocol::FrameKind::ControlEos, 0, 0, QByteArray()));
++        m_bridgeSocket->flush();
++    }
++    teardownSession(false, false);
++}
++
++void ContinuityCameraPlugin::enqueueOrSendFrame(const ContinuityCameraProtocol::StreamFrame &frame)
++{
++    const QByteArray encoded = ContinuityCameraProtocol::encodeFrame(frame.kind, frame.flags, frame.ptsUs, frame.payload);
++    if (frame.kind == ContinuityCameraProtocol::FrameKind::CodecConfig) {
++        m_cachedCodecConfig = encoded;
++    }
++
++    if (m_bridgeSocket && m_bridgeSocket->state() == QLocalSocket::ConnectedState) {
++        if (m_bridgeSocket->bytesToWrite() < kMaxBridgeWriteQueueBytes
++            || frame.kind == ContinuityCameraProtocol::FrameKind::CodecConfig
++            || (frame.flags & ContinuityCameraProtocol::FlagKeyframe) != 0) {
++            m_bridgeSocket->write(encoded);
++        }
++        return;
++    }
++
++    if (frame.kind == ContinuityCameraProtocol::FrameKind::VideoAccessUnit && (frame.flags & ContinuityCameraProtocol::FlagKeyframe) != 0) {
++        m_pendingFrames.clear();
++        if (!m_cachedCodecConfig.isEmpty()) {
++            m_pendingFrames.append(m_cachedCodecConfig);
++        }
++    }
++    if (m_pendingFrames.size() >= kMaxPendingFrames) {
++        m_pendingFrames.removeFirst();
++    }
++    m_pendingFrames.append(encoded);
++}
++
++void ContinuityCameraPlugin::flushPendingFrames()
++{
++    if (!m_bridgeSocket || m_bridgeSocket->state() != QLocalSocket::ConnectedState) {
++        return;
++    }
++    for (const QByteArray &item : std::as_const(m_pendingFrames)) {
++        m_bridgeSocket->write(item);
++    }
++    m_pendingFrames.clear();
++}
++
++#include "continuitycameraplugin.moc"
++#include "moc_continuitycameraplugin.cpp"
+diff --git a/plugins/continuity_camera/continuitycameraplugin.h b/plugins/continuity_camera/continuitycameraplugin.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8d5258ab527c729729fa176f3f4cc5583eceea04
+--- /dev/null
++++ b/plugins/continuity_camera/continuitycameraplugin.h
+@@ -0,0 +1,82 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QByteArray>
++#include <QList>
++#include <QPointer>
++#include <QSharedPointer>
++#include <QString>
++
++#include <core/kdeconnectplugin.h>
++
++#include "continuitycameraprotocol.h"
++
++class QIODevice;
++class QLocalServer;
++class QLocalSocket;
++class QProcess;
++
++#define PACKET_TYPE_CONTINUITYCAMERA QStringLiteral("kdeconnect.continuitycamera")
++#define PACKET_TYPE_CONTINUITYCAMERA_REQUEST QStringLiteral("kdeconnect.continuitycamera.request")
++
++class ContinuityCameraPlugin : public KdeConnectPlugin
++{
++    Q_OBJECT
++    Q_CLASSINFO("D-Bus Interface", "org.kde.kdeconnect.device.continuitycamera")
++    Q_PROPERTY(bool isStreaming READ isStreaming NOTIFY streamingChanged)
++    Q_PROPERTY(QString state READ state NOTIFY stateChanged)
++
++public:
++    explicit ContinuityCameraPlugin(QObject *parent, const QVariantList &args);
++    ~ContinuityCameraPlugin() override;
++
++    bool isStreaming() const;
++    QString state() const;
++
++    void receivePacket(const NetworkPacket &np) override;
++    QString dbusPath() const override;
++
++    Q_SCRIPTABLE bool startCamera(int maxWidth = 1280, int maxHeight = 720, int fps = 30, bool includeMic = true, const QString &lens = QStringLiteral("back"));
++    Q_SCRIPTABLE void stopCamera();
++    Q_SCRIPTABLE void switchLens(const QString &lens);
++    Q_SCRIPTABLE void requestPhotoCapture();
++    Q_SCRIPTABLE void requestDocumentScan();
++
++Q_SIGNALS:
++    Q_SCRIPTABLE void streamingChanged(bool streaming);
++    Q_SCRIPTABLE void stateChanged();
++    Q_SCRIPTABLE void captureImported(const QString &localPath, const QString &mimeType);
++
++private Q_SLOTS:
++    void onPayloadReadyRead();
++    void onPayloadClosed();
++    void onNewBridgeConnection();
++    void onBridgeSocketDisconnected();
++    void onBridgeFinished();
++
++private:
++    bool ensureLocalServer();
++    bool launchBridge(bool includeMic);
++    void teardownSession(bool terminateBridge, bool error = false);
++    void removeSocketFile();
++    void enqueueOrSendFrame(const ContinuityCameraProtocol::StreamFrame &frame);
++    void flushPendingFrames();
++    void handleCaptureResult(const NetworkPacket &np);
++
++    ContinuityCameraProtocol::CameraSessionMachine m_session;
++    ContinuityCameraProtocol::StreamFrameParser m_parser;
++    QSharedPointer<QIODevice> m_payload;
++    QLocalServer *m_localServer = nullptr;
++    QPointer<QLocalSocket> m_bridgeSocket;
++    QProcess *m_bridgeProcess = nullptr;
++    QString m_socketPath;
++    QString m_fallbackSocketDir;
++    QByteArray m_cachedCodecConfig;
++    QList<QByteArray> m_pendingFrames;
++    bool m_stopping = false;
++};
+diff --git a/plugins/continuity_camera/continuitycameraprotocol.cpp b/plugins/continuity_camera/continuitycameraprotocol.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..d4a105b028211f7459f13408fa635d043f64f398
+--- /dev/null
++++ b/plugins/continuity_camera/continuitycameraprotocol.cpp
+@@ -0,0 +1,250 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "continuitycameraprotocol.h"
++
++#include <QtEndian>
++
++#include <cstring>
++
++namespace ContinuityCameraProtocol
++{
++bool isValidFrameKind(quint8 rawKind, FrameKind *outKind)
++{
++    switch (rawKind) {
++    case 0x01:
++        if (outKind) {
++            *outKind = FrameKind::CodecConfig;
++        }
++        return true;
++    case 0x02:
++        if (outKind) {
++            *outKind = FrameKind::VideoAccessUnit;
++        }
++        return true;
++    case 0x03:
++        if (outKind) {
++            *outKind = FrameKind::AudioPcmChunk;
++        }
++        return true;
++    case 0x04:
++        if (outKind) {
++            *outKind = FrameKind::ControlEos;
++        }
++        return true;
++    default:
++        return false;
++    }
++}
++
++bool isValidPayloadLength(FrameKind kind, quint32 length)
++{
++    switch (kind) {
++    case FrameKind::CodecConfig:
++    case FrameKind::VideoAccessUnit:
++        return length > 0 && length <= kMaxVideoFrameBytes;
++    case FrameKind::AudioPcmChunk:
++        return length > 0 && length <= kMaxAudioChunkBytes;
++    case FrameKind::ControlEos:
++        return length == 0;
++    }
++    return false;
++}
++
++QByteArray encodeFrame(FrameKind kind, quint8 flags, quint64 ptsUs, const QByteArray &payload)
++{
++    const quint32 len = static_cast<quint32>(payload.size());
++    QByteArray out(kHeaderBytes + payload.size(), Qt::Uninitialized);
++    char *raw = out.data();
++    qToBigEndian<quint16>(kStreamMagic, raw);
++    raw[2] = static_cast<char>(kind);
++    raw[3] = static_cast<char>(flags & FlagValidMask);
++    qToBigEndian<quint32>(len, raw + 4);
++    qToBigEndian<quint64>(ptsUs, raw + 8);
++    if (!payload.isEmpty()) {
++        std::memcpy(raw + kHeaderBytes, payload.constData(), static_cast<size_t>(payload.size()));
++    }
++    return out;
++}
++
++StreamConfig clampStreamConfig(int maxWidth, int maxHeight, int fps)
++{
++    int w = qBound(kMinDimension, maxWidth, kMaxDimension);
++    int h = qBound(kMinDimension, maxHeight, kMaxDimension);
++    w &= ~1;
++    h &= ~1;
++    StreamConfig cfg;
++    cfg.width = qMax(kMinDimension, w);
++    cfg.height = qMax(kMinDimension, h);
++    cfg.fps = qBound(kMinFps, fps, kMaxFps);
++    return cfg;
++}
++
++QString normalizeLens(const QString &raw)
++{
++    return raw.trimmed().compare(QLatin1String("front"), Qt::CaseInsensitive) == 0 ? QStringLiteral("front") : QStringLiteral("back");
++}
++
++QString sanitizeCaptureFilename(const QString &raw, const QString &mimeType)
++{
++    QString requiredExt;
++    QString altExt;
++    if (mimeType == QLatin1String("image/jpeg")) {
++        requiredExt = QStringLiteral(".jpg");
++        altExt = QStringLiteral(".jpeg");
++    } else if (mimeType == QLatin1String("application/pdf")) {
++        requiredExt = QStringLiteral(".pdf");
++    } else {
++        return {};
++    }
++
++    const QString trimmed = raw.trimmed();
++    if (trimmed.isEmpty() || trimmed.size() > 128) {
++        return {};
++    }
++    if (trimmed.contains(QLatin1Char('/')) || trimmed.contains(QLatin1Char('\\')) || trimmed.contains(QLatin1String(".."))) {
++        return {};
++    }
++
++    QString out;
++    out.reserve(trimmed.size());
++    for (const QChar ch : trimmed) {
++        const ushort code = ch.unicode();
++        if (code < 0x20 || code == 0x7F || ch == QLatin1Char(':')) {
++            return {};
++        }
++        out.append(ch);
++    }
++    if (out.startsWith(QLatin1Char('.'))) {
++        return {};
++    }
++
++    const QString lower = out.toLower();
++    if (lower.endsWith(requiredExt) || (!altExt.isEmpty() && lower.endsWith(altExt))) {
++        return out;
++    }
++    return {};
++}
++
++void StreamFrameParser::reset()
++{
++    m_buffer.clear();
++    m_hasError = false;
++    m_errorString.clear();
++}
++
++void StreamFrameParser::setError(const QString &message)
++{
++    m_hasError = true;
++    m_errorString = message;
++    m_buffer.clear();
++}
++
++bool StreamFrameParser::feed(const QByteArray &chunk, QList<StreamFrame> *outFrames)
++{
++    if (m_hasError) {
++        return false;
++    }
++    if (outFrames) {
++        outFrames->clear();
++    }
++    if (!chunk.isEmpty()) {
++        if (m_buffer.size() + chunk.size() > static_cast<qsizetype>(kMaxVideoFrameBytes * 2U + kHeaderBytes)) {
++            setError(QStringLiteral("Incoming continuity camera buffer overflow"));
++            return false;
++        }
++        m_buffer.append(chunk);
++    }
++
++    qsizetype pos = 0;
++    while (m_buffer.size() - pos >= kHeaderBytes) {
++        const char *hdr = m_buffer.constData() + pos;
++        const quint16 magic = qFromBigEndian<quint16>(hdr);
++        if (magic != kStreamMagic) {
++            setError(QStringLiteral("Invalid stream magic"));
++            return false;
++        }
++
++        const quint8 rawKind = static_cast<quint8>(hdr[2]);
++        FrameKind kind = FrameKind::ControlEos;
++        if (!isValidFrameKind(rawKind, &kind)) {
++            setError(QStringLiteral("Invalid frame kind"));
++            return false;
++        }
++
++        const quint8 flags = static_cast<quint8>(hdr[3]);
++        if ((flags & ~FlagValidMask) != 0) {
++            setError(QStringLiteral("Invalid frame flags"));
++            return false;
++        }
++
++        const quint32 len = qFromBigEndian<quint32>(hdr + 4);
++        if (!isValidPayloadLength(kind, len)) {
++            setError(QStringLiteral("Invalid payload length"));
++            return false;
++        }
++
++        const quint64 ptsUs = qFromBigEndian<quint64>(hdr + 8);
++        if (m_buffer.size() - pos < kHeaderBytes + static_cast<qsizetype>(len)) {
++            break;
++        }
++
++        if (outFrames) {
++            StreamFrame frame;
++            frame.kind = kind;
++            frame.flags = flags;
++            frame.ptsUs = ptsUs;
++            if (len > 0) {
++                frame.payload = QByteArray(hdr + kHeaderBytes, static_cast<qsizetype>(len));
++            }
++            outFrames->append(frame);
++        }
++        pos += kHeaderBytes + static_cast<qsizetype>(len);
++    }
++
++    if (pos > 0) {
++        m_buffer.remove(0, pos);
++    }
++    return true;
++}
++
++QString CameraSessionMachine::stateName() const
++{
++    switch (m_state) {
++    case State::Idle:
++        return QStringLiteral("idle");
++    case State::Starting:
++        return QStringLiteral("starting");
++    case State::Streaming:
++        return QStringLiteral("streaming");
++    case State::Stopping:
++        return QStringLiteral("stopping");
++    case State::Error:
++        return QStringLiteral("error");
++    }
++    return QStringLiteral("idle");
++}
++
++void CameraSessionMachine::beginStart()
++{
++    m_state = State::Starting;
++}
++
++void CameraSessionMachine::onStreamOpen()
++{
++    m_state = State::Streaming;
++}
++
++void CameraSessionMachine::beginStop()
++{
++    m_state = State::Stopping;
++}
++
++void CameraSessionMachine::onTeardown(bool error)
++{
++    m_state = error ? State::Error : State::Idle;
++}
++}
+diff --git a/plugins/continuity_camera/continuitycameraprotocol.h b/plugins/continuity_camera/continuitycameraprotocol.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..24d940a1d1d3e08b25ca2edd2074728c1310d91a
+--- /dev/null
++++ b/plugins/continuity_camera/continuitycameraprotocol.h
+@@ -0,0 +1,108 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QByteArray>
++#include <QList>
++#include <QString>
++
++namespace ContinuityCameraProtocol
++{
++inline constexpr quint16 kStreamMagic = 0x4B43;
++inline constexpr int kHeaderBytes = 16;
++inline constexpr quint32 kMaxVideoFrameBytes = 4U * 1024U * 1024U;
++inline constexpr quint32 kMaxAudioChunkBytes = 65536U;
++inline constexpr int kMaxControlJsonBytes = 8192;
++inline constexpr qint64 kMaxCaptureBytes = 50LL * 1024LL * 1024LL;
++
++inline constexpr int kMinDimension = 320;
++inline constexpr int kMaxDimension = 1920;
++inline constexpr int kMinFps = 10;
++inline constexpr int kMaxFps = 60;
++
++enum class FrameKind : quint8 {
++    CodecConfig = 0x01,
++    VideoAccessUnit = 0x02,
++    AudioPcmChunk = 0x03,
++    ControlEos = 0x04,
++};
++
++enum FrameFlags : quint8 {
++    FlagNone = 0x00,
++    FlagKeyframe = 0x01,
++    FlagValidMask = 0x01,
++};
++
++struct StreamFrame {
++    FrameKind kind = FrameKind::ControlEos;
++    quint8 flags = FlagNone;
++    quint64 ptsUs = 0;
++    QByteArray payload;
++};
++
++struct StreamConfig {
++    int width = 1280;
++    int height = 720;
++    int fps = 30;
++};
++
++bool isValidFrameKind(quint8 rawKind, FrameKind *outKind);
++bool isValidPayloadLength(FrameKind kind, quint32 length);
++QByteArray encodeFrame(FrameKind kind, quint8 flags, quint64 ptsUs, const QByteArray &payload);
++
++StreamConfig clampStreamConfig(int maxWidth, int maxHeight, int fps);
++QString normalizeLens(const QString &raw);
++QString sanitizeCaptureFilename(const QString &raw, const QString &mimeType);
++
++class StreamFrameParser
++{
++public:
++    bool feed(const QByteArray &chunk, QList<StreamFrame> *outFrames);
++    bool hasError() const
++    {
++        return m_hasError;
++    }
++    QString errorString() const
++    {
++        return m_errorString;
++    }
++    void reset();
++
++private:
++    void setError(const QString &message);
++
++    QByteArray m_buffer;
++    bool m_hasError = false;
++    QString m_errorString;
++};
++
++class CameraSessionMachine
++{
++public:
++    enum class State {
++        Idle,
++        Starting,
++        Streaming,
++        Stopping,
++        Error,
++    };
++
++    State state() const
++    {
++        return m_state;
++    }
++    QString stateName() const;
++
++    void beginStart();
++    void onStreamOpen();
++    void beginStop();
++    void onTeardown(bool error = false);
++
++private:
++    State m_state = State::Idle;
++};
++}
+diff --git a/plugins/continuity_camera/continuitycameratest.cpp b/plugins/continuity_camera/continuitycameratest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb2473ff7ad2e9be1f38d523b9549ca3491ce9e5
+--- /dev/null
++++ b/plugins/continuity_camera/continuitycameratest.cpp
+@@ -0,0 +1,105 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "continuitycameraprotocol.h"
++
++#include <QtTest>
++
++class ContinuityCameraTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testStreamConfigClampingAndLens()
++    {
++        const auto low = ContinuityCameraProtocol::clampStreamConfig(100, 120, 2);
++        QCOMPARE(low.width, ContinuityCameraProtocol::kMinDimension);
++        QCOMPARE(low.height, ContinuityCameraProtocol::kMinDimension);
++        QCOMPARE(low.fps, ContinuityCameraProtocol::kMinFps);
++
++        const auto odd = ContinuityCameraProtocol::clampStreamConfig(1281, 721, 90);
++        QCOMPARE(odd.width, 1280);
++        QCOMPARE(odd.height, 720);
++        QCOMPARE(odd.fps, ContinuityCameraProtocol::kMaxFps);
++
++        QCOMPARE(ContinuityCameraProtocol::normalizeLens(QStringLiteral("FRONT")), QStringLiteral("front"));
++        QCOMPARE(ContinuityCameraProtocol::normalizeLens(QStringLiteral("weird")), QStringLiteral("back"));
++    }
++
++    void testFrameSerializationChunkedParsingAndBounds()
++    {
++        const QByteArray cfg = QByteArrayLiteral("\x00\x00\x00\x01\x67\x42");
++        const QByteArray vid = QByteArrayLiteral("\x00\x00\x00\x01\x65\x88");
++        const QByteArray pcm(640, 'P');
++        const QByteArray wire =
++            ContinuityCameraProtocol::encodeFrame(ContinuityCameraProtocol::FrameKind::CodecConfig, 0, 1000ULL, cfg)
++            + ContinuityCameraProtocol::encodeFrame(ContinuityCameraProtocol::FrameKind::VideoAccessUnit,
++                                                    ContinuityCameraProtocol::FlagKeyframe,
++                                                    2000ULL,
++                                                    vid)
++            + ContinuityCameraProtocol::encodeFrame(ContinuityCameraProtocol::FrameKind::AudioPcmChunk, 0, 2500ULL, pcm)
++            + ContinuityCameraProtocol::encodeFrame(ContinuityCameraProtocol::FrameKind::ControlEos, 0, 3000ULL, QByteArray());
++
++        ContinuityCameraProtocol::StreamFrameParser parser;
++        QList<ContinuityCameraProtocol::StreamFrame> parsed;
++        for (int i = 0; i < wire.size(); i += 7) {
++            QList<ContinuityCameraProtocol::StreamFrame> step;
++            QVERIFY(parser.feed(wire.mid(i, 7), &step));
++            parsed.append(step);
++        }
++        QCOMPARE(parsed.size(), 4);
++        QCOMPARE(parsed[0].kind, ContinuityCameraProtocol::FrameKind::CodecConfig);
++        QCOMPARE(parsed[1].kind, ContinuityCameraProtocol::FrameKind::VideoAccessUnit);
++        QCOMPARE(parsed[1].flags, static_cast<quint8>(ContinuityCameraProtocol::FlagKeyframe));
++        QCOMPARE(parsed[2].payload.size(), 640);
++        QCOMPARE(parsed[3].kind, ContinuityCameraProtocol::FrameKind::ControlEos);
++
++        ContinuityCameraProtocol::StreamFrameParser badMagic;
++        QList<ContinuityCameraProtocol::StreamFrame> out;
++        QVERIFY(!badMagic.feed(QByteArray(16, '\x00'), &out));
++        QVERIFY(badMagic.hasError());
++
++        QByteArray oversizedHdr = ContinuityCameraProtocol::encodeFrame(
++            ContinuityCameraProtocol::FrameKind::AudioPcmChunk,
++            0,
++            0,
++            QByteArray(4, 'A'));
++        // Patch payload length to > kMaxAudioChunkBytes
++        oversizedHdr[4] = '\x00';
++        oversizedHdr[5] = '\x02';
++        oversizedHdr[6] = '\x00';
++        oversizedHdr[7] = '\x00';
++        ContinuityCameraProtocol::StreamFrameParser badLen;
++        QVERIFY(!badLen.feed(oversizedHdr, &out));
++    }
++
++    void testCaptureFilenameSanitizationAndSessionMachine()
++    {
++        QCOMPARE(ContinuityCameraProtocol::sanitizeCaptureFilename(QStringLiteral("scan_01.pdf"), QStringLiteral("application/pdf")),
++                 QStringLiteral("scan_01.pdf"));
++        QCOMPARE(ContinuityCameraProtocol::sanitizeCaptureFilename(QStringLiteral("photo.jpeg"), QStringLiteral("image/jpeg")),
++                 QStringLiteral("photo.jpeg"));
++        QVERIFY(ContinuityCameraProtocol::sanitizeCaptureFilename(QStringLiteral("../evil.jpg"), QStringLiteral("image/jpeg")).isEmpty());
++        QVERIFY(ContinuityCameraProtocol::sanitizeCaptureFilename(QStringLiteral("sub/photo.jpg"), QStringLiteral("image/jpeg")).isEmpty());
++        QVERIFY(ContinuityCameraProtocol::sanitizeCaptureFilename(QStringLiteral("wrong.exe"), QStringLiteral("image/jpeg")).isEmpty());
++        QVERIFY(ContinuityCameraProtocol::sanitizeCaptureFilename(QStringLiteral("ok.jpg"), QStringLiteral("text/plain")).isEmpty());
++
++        ContinuityCameraProtocol::CameraSessionMachine fsm;
++        QCOMPARE(fsm.state(), ContinuityCameraProtocol::CameraSessionMachine::State::Idle);
++        fsm.beginStart();
++        QCOMPARE(fsm.stateName(), QStringLiteral("starting"));
++        fsm.onStreamOpen();
++        QCOMPARE(fsm.stateName(), QStringLiteral("streaming"));
++        fsm.beginStop();
++        QCOMPARE(fsm.stateName(), QStringLiteral("stopping"));
++        fsm.onTeardown(false);
++        QCOMPARE(fsm.stateName(), QStringLiteral("idle"));
++    }
++};
++
++QTEST_MAIN(ContinuityCameraTest)
++
++#include "continuitycameratest.moc"
+diff --git a/plugins/continuity_camera/kdeconnect_continuitycamera.json b/plugins/continuity_camera/kdeconnect_continuitycamera.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..e22f6246aa8a5b37e152e31e25dbcb522dee6457
+--- /dev/null
++++ b/plugins/continuity_camera/kdeconnect_continuitycamera.json
+@@ -0,0 +1,22 @@
++{
++    "$schema": "../kdeconnect.schema.json",
++    "KPlugin": {
++        "Authors": [
++            {
++                "Email": "dennshield@duck.com",
++                "Name": "Dmitriy Volkov"
++            }
++        ],
++        "Description": "Use your Android device camera, microphone, and document scanner from desktop applications",
++        "EnabledByDefault": true,
++        "Icon": "camera-video",
++        "License": "GPL",
++        "Name": "Continuity Camera"
++    },
++    "X-KdeConnect-OutgoingPacketType": [
++        "kdeconnect.continuitycamera.request"
++    ],
++    "X-KdeConnect-SupportedPacketType": [
++        "kdeconnect.continuitycamera"
++    ]
++}

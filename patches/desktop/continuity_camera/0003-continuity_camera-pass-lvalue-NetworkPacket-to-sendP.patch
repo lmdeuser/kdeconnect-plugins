@@ -1,0 +1,21 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 16:45:40 +0500
+Subject: [PATCH 3/4] continuity_camera: pass lvalue NetworkPacket to
+ sendPacket
+
+
+diff --git a/plugins/continuity_camera/continuitycameraplugin.cpp b/plugins/continuity_camera/continuitycameraplugin.cpp
+index 2cc3abefb6c745883ec366b52e86621d31059df4..2cd803eeb770de9c5b556b691198a25adf32f657 100644
+--- a/plugins/continuity_camera/continuitycameraplugin.cpp
++++ b/plugins/continuity_camera/continuitycameraplugin.cpp
+@@ -154,7 +154,8 @@ void ContinuityCameraPlugin::receivePacket(const NetworkPacket &np)
+             if (np.payload()) {
+                 np.payload()->close();
+             }
+-            sendPacket(NetworkPacket(PACKET_TYPE_CONTINUITYCAMERA_REQUEST, {{QStringLiteral("action"), QStringLiteral("stop_stream")}}));
++            NetworkPacket stopNp(PACKET_TYPE_CONTINUITYCAMERA_REQUEST, {{QStringLiteral("action"), QStringLiteral("stop_stream")}});
++            sendPacket(stopNp);
+             return;
+         }
+         if (!np.hasPayload() || !np.payload()) {

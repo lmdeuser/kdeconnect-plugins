@@ -1,0 +1,488 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:19:02 +0500
+Subject: [PATCH 1/3] notifications: auto-copy incoming OTP codes with secret
+ hint and timer
+
+
+diff --git a/plugins/notifications/CMakeLists.txt b/plugins/notifications/CMakeLists.txt
+index a502eebf27bf2cd39325cfd130dd1e22b52de120..ac8551b003297dead2765bce50402413a7f81f80 100644
+--- a/plugins/notifications/CMakeLists.txt
++++ b/plugins/notifications/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-kdeconnect_add_plugin(kdeconnect_notifications SOURCES sendreplydialog.cpp notificationsplugin.cpp notification.cpp)
++kdeconnect_add_plugin(kdeconnect_notifications SOURCES sendreplydialog.cpp notificationsplugin.cpp notification.cpp otpcodeextractor.cpp)
+ 
+ target_include_directories(kdeconnect_notifications PRIVATE ${CMAKE_BINARY_DIR})
+ 
+diff --git a/plugins/notifications/notification.h b/plugins/notifications/notification.h
+index e1ba92b3267f4584b6901c8124e8502b95ee58ca..686f4178ecd8b94d6a03cb185921762ef7fb26bf 100644
+--- a/plugins/notifications/notification.h
++++ b/plugins/notifications/notification.h
+@@ -70,6 +70,10 @@ public:
+     {
+         return m_contents.iconPath;
+     }
++    QStringList actions() const
++    {
++        return m_contents.actions;
++    }
+     bool dismissable() const
+     {
+         return m_contents.dismissable;
+diff --git a/plugins/notifications/notificationsplugin.cpp b/plugins/notifications/notificationsplugin.cpp
+index 6f1056b55a014ba09ed4c7ffa4d1ebf6e5455ea1..76f91c0b60605faa5e212cb32111bc4c0f1b4b17 100644
+--- a/plugins/notifications/notificationsplugin.cpp
++++ b/plugins/notifications/notificationsplugin.cpp
+@@ -21,6 +21,10 @@
+ #endif
+ 
+ #include <QMimeData>
++#include <QPointer>
++#include <QTimer>
++
++#include "otpcodeextractor.h"
+ 
+ K_PLUGIN_CLASS_WITH_JSON(NotificationsPlugin, "kdeconnect_notifications.json")
+ 
+@@ -67,6 +71,7 @@ void NotificationsPlugin::receivePacket(const NetworkPacket &np)
+         QString pubId = m_internalIdToPublicId.value(id);
+         noti = m_notifications.value(pubId);
+         noti->update(np);
++        maybeAutoCopyAuthCode(noti);
+     }
+ }
+ 
+@@ -121,6 +126,7 @@ void NotificationsPlugin::addNotification(Notification *noti)
+                                                  noti,
+                                                  QDBusConnection::ExportScriptableContents);
+     Q_EMIT notificationPosted(publicId);
++    maybeAutoCopyAuthCode(noti);
+ }
+ 
+ void NotificationsPlugin::removeNotification(const QString &internalId)
+@@ -194,28 +200,56 @@ void NotificationsPlugin::sendAction(const QString &key, const QString &action)
+     copyAuthCodeIfPresent(action);
+ }
+ 
++namespace
++{
++void writeOtpToClipboard(const QString &code, bool markSecret)
++{
++    auto mimeData = new QMimeData;
++    mimeData->setText(code);
++    if (markSecret) {
++        mimeData->setData(QStringLiteral("x-kde-passwordManagerHint"), QByteArrayLiteral("secret"));
++    }
++    KSystemClipboard::instance()->setMimeData(mimeData, QClipboard::Clipboard);
++}
++}
++
+ void NotificationsPlugin::copyAuthCodeIfPresent(const QString &action)
+ {
+-    // The auth code we receive has invisible characters in it for some reason.
+-    // (U+2063 INVISIBLE SEPARATOR between each digit).
+-    // Remove them if present before continuing.
+-    QString sanitizedAction = action;
+-    sanitizedAction.remove(QChar(0x2063));
++    const QString text = OtpCodeExtractor::extractFromAction(action);
++    if (text.isEmpty()) {
++        return;
++    }
++
++    writeOtpToClipboard(text, false);
++}
+ 
+-    // Match blocks of digits, 4-10 digits long. This should match auth codes
+-    // in any language without relying on the action text having a specific
+-    // keyword in it such as "Copy" in English.
+-    QRegularExpression authCodeRegex(QStringLiteral("\\b(\\d{4,10})\\b"));
+-    QRegularExpressionMatch match = authCodeRegex.match(sanitizedAction);
++void NotificationsPlugin::maybeAutoCopyAuthCode(Notification *noti)
++{
++    if (!noti || noti->silent() || !config()->getBool(QStringLiteral("autoCopyAuthCode"), true)) {
++        return;
++    }
+ 
+-    if (!match.hasMatch()) {
++    const QString code = OtpCodeExtractor::extractFromNotification(noti->title(), noti->text(), noti->actions());
++    if (code.isEmpty()) {
++        return;
++    }
++    if (m_lastAutoCopiedNotificationId == noti->internalId() && m_lastAutoCopiedCode == code) {
+         return;
+     }
+ 
+-    QString text = match.captured(1);
+-    auto mimeData = new QMimeData;
+-    mimeData->setText(text);
+-    KSystemClipboard::instance()->setMimeData(mimeData, QClipboard::Clipboard);
++    m_lastAutoCopiedNotificationId = noti->internalId();
++    m_lastAutoCopiedCode = code;
++    writeOtpToClipboard(code, true);
++
++    QPointer<NotificationsPlugin> guard(this);
++    QTimer::singleShot(60000, this, [guard, code] {
++        if (!guard) {
++            return;
++        }
++        if (KSystemClipboard::instance()->text(QClipboard::Clipboard) == code) {
++            KSystemClipboard::instance()->clear(QClipboard::Clipboard);
++        }
++    });
+ }
+ 
+ QString NotificationsPlugin::newId()
+diff --git a/plugins/notifications/notificationsplugin.h b/plugins/notifications/notificationsplugin.h
+index b24c5ed9a559e733f5f39d2aef8abb2755655f6b..85a1520160ee1da87f6d7b9aff019ef475de60c0 100644
+--- a/plugins/notifications/notificationsplugin.h
++++ b/plugins/notifications/notificationsplugin.h
+@@ -51,6 +51,7 @@ private:
+      * that are not the foreground app since Android 10.
+      */
+     void copyAuthCodeIfPresent(const QString &action);
++    void maybeAutoCopyAuthCode(Notification *noti);
+ 
+     void removeNotification(const QString &internalId);
+     QString newId(); // Generates successive identifiers to use as public ids
+@@ -60,4 +61,6 @@ private:
+     QHash<QString, QString> m_internalIdToPublicId;
+     QHash<QString, Notification *> m_pendingNotifications; // By internal id, waiting for their icon to download
+     int m_lastId = 0;
++    QString m_lastAutoCopiedNotificationId;
++    QString m_lastAutoCopiedCode;
+ };
+diff --git a/plugins/notifications/otpcodeextractor.cpp b/plugins/notifications/otpcodeextractor.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..94926275361685b51cb1f81a77b66fdd746985e2
+--- /dev/null
++++ b/plugins/notifications/otpcodeextractor.cpp
+@@ -0,0 +1,209 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "otpcodeextractor.h"
++
++#include <QList>
++#include <QPair>
++#include <QRegularExpression>
++
++namespace
++{
++constexpr int MAX_ACTION_LENGTH = 256;
++constexpr int MAX_TITLE_LENGTH = 512;
++constexpr int MAX_TEXT_LENGTH = 4096;
++constexpr int MAX_ACTIONS_COUNT = 16;
++
++bool isCurrencyChar(QChar ch)
++{
++    return ch == QLatin1Char('$') || ch == QChar(0x20BD) || ch == QChar(0x20AC) || ch == QChar(0x00A3);
++}
++
++bool hasCurrencyPrefix(const QString &text, int start)
++{
++    if (start <= 0) {
++        return false;
++    }
++    const QString before = text.mid(qMax(0, start - 10), start - qMax(0, start - 10)).trimmed().toLower();
++    if (before.isEmpty()) {
++        return false;
++    }
++    if (isCurrencyChar(before.back())) {
++        return true;
++    }
++    static const QRegularExpression prefixRegex(
++        QStringLiteral("(?:^|[^\\p{L}])(?:rub|usd|eur|gbp|rur|kzt|\u0440\u0443\u0431)\\.?$"),
++        QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
++    return prefixRegex.match(before).hasMatch();
++}
++
++bool hasCurrencySuffix(const QString &text, int end)
++{
++    if (end >= text.size()) {
++        return false;
++    }
++    const QString after = text.mid(end, qMin(10, text.size() - end)).trimmed().toLower();
++    if (after.isEmpty()) {
++        return false;
++    }
++    if (isCurrencyChar(after.front())) {
++        return true;
++    }
++    static const QRegularExpression suffixRegex(
++        QStringLiteral("^(?:rub|usd|eur|gbp|rur|kzt|\u0440\u0443\u0431)(?:$|[^\\p{L}])"),
++        QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
++    if (suffixRegex.match(after).hasMatch()) {
++        return true;
++    }
++    return after == QStringLiteral("\u0440") || after.startsWith(QStringLiteral("\u0440."))
++        || after.startsWith(QStringLiteral("\u0440 ")) || after.startsWith(QStringLiteral("\u0440,"));
++}
++
++QList<QPair<int, int>> findPhoneSpans(const QString &text)
++{
++    static const QRegularExpression phoneRegex(QStringLiteral("\\+\\d[\\d\\s()-]{6,20}\\d"));
++    QList<QPair<int, int>> spans;
++    QRegularExpressionMatchIterator it = phoneRegex.globalMatch(text);
++    while (it.hasNext()) {
++        const QRegularExpressionMatch match = it.next();
++        spans.append({static_cast<int>(match.capturedStart()), static_cast<int>(match.capturedEnd())});
++    }
++    return spans;
++}
++
++bool overlapsAnySpan(int start, int end, const QList<QPair<int, int>> &spans)
++{
++    for (const auto &span : spans) {
++        if (start < span.second && end > span.first) {
++            return true;
++        }
++    }
++    return false;
++}
++
++bool hasOtpKeywordContext(const QString &text)
++{
++    static const QRegularExpression enKeywordRegex(
++        QStringLiteral("\\b(?:code|otp|verification|verify|passcode|2fa|one[- ]time|mfa|pin|auth(?:enticator|entication|orize|orized|orization)?)\\b"),
++        QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
++    if (enKeywordRegex.match(text).hasMatch()) {
++        return true;
++    }
++
++    static const QRegularExpression ruKeywordRegex(
++        QStringLiteral("(?:^|[^\\p{L}])(?:\u043a\u043e\u0434|\u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434|\u043f\u0440\u043e\u0432\u0435\u0440\u043e\u0447\u043d|\u043e\u0434\u043d\u043e\u0440\u0430\u0437\u043e\u0432|\u043f\u0430\u0440\u043e\u043b)"),
++        QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
++    return ruKeywordRegex.match(text).hasMatch();
++}
++}
++
++namespace OtpCodeExtractor
++{
++QString extractFromAction(const QString &action)
++{
++    if (action.isEmpty() || action.size() > MAX_ACTION_LENGTH) {
++        return {};
++    }
++
++    QString sanitized = action;
++    sanitized.remove(QChar(0x2063));
++
++    static const QRegularExpression actionCodeRegex(QStringLiteral("\\b(\\d{4,10})\\b"));
++    const QRegularExpressionMatch match = actionCodeRegex.match(sanitized);
++    return match.hasMatch() ? match.captured(1) : QString();
++}
++
++QString extractFromNotification(const QString &title, const QString &text, const QStringList &actions)
++{
++    if (title.size() > MAX_TITLE_LENGTH || text.size() > MAX_TEXT_LENGTH || actions.size() > MAX_ACTIONS_COUNT) {
++        return {};
++    }
++
++    for (const QString &action : actions) {
++        const QString code = extractFromAction(action);
++        if (!code.isEmpty()) {
++            return code;
++        }
++    }
++
++    QString cleanTitle = title;
++    cleanTitle.remove(QChar(0x2063));
++    QString cleanText = text;
++    cleanText.remove(QChar(0x2063));
++
++    const QString combined = cleanTitle + QLatin1Char('\n') + cleanText;
++    if (!hasOtpKeywordContext(combined)) {
++        return {};
++    }
++
++    const QList<QPair<int, int>> phoneSpans = findPhoneSpans(combined);
++    static const QRegularExpression candidateRegex(QStringLiteral("(\\d{3}[-\\s]\\d{3}|\\d{4,8})"));
++    QRegularExpressionMatchIterator it = candidateRegex.globalMatch(combined);
++
++    while (it.hasNext()) {
++        const QRegularExpressionMatch match = it.next();
++        const int start = static_cast<int>(match.capturedStart(1));
++        const int end = static_cast<int>(match.capturedEnd(1));
++
++        if (overlapsAnySpan(start, end, phoneSpans)) {
++            continue;
++        }
++
++        if (start > 0) {
++            const QChar prev = combined.at(start - 1);
++            if (prev.isDigit() || prev.isLetter() || prev == QLatin1Char('+') || isCurrencyChar(prev)) {
++                continue;
++            }
++            if ((prev == QLatin1Char('-') || prev == QLatin1Char('.') || prev == QLatin1Char(','))
++                && start >= 2 && combined.at(start - 2).isDigit()) {
++                continue;
++            }
++        }
++        if (hasCurrencyPrefix(combined, start)) {
++            continue;
++        }
++
++        if (end < combined.size()) {
++            const QChar next = combined.at(end);
++            if (next.isDigit() || next.isLetter() || next == QLatin1Char('%')) {
++                continue;
++            }
++            if ((next == QLatin1Char('-') || next == QLatin1Char('.') || next == QLatin1Char(','))
++                && end + 1 < combined.size() && combined.at(end + 1).isDigit()) {
++                continue;
++            }
++        }
++        if (hasCurrencySuffix(combined, end)) {
++            continue;
++        }
++
++        const QString raw = match.captured(1);
++        const bool hasSeparator = raw.contains(QLatin1Char('-')) || raw.contains(QLatin1Char(' '))
++            || raw.contains(QLatin1Char('\t'));
++        QString digits;
++        digits.reserve(raw.size());
++        for (QChar ch : raw) {
++            if (ch.isDigit()) {
++                digits.append(ch);
++            }
++        }
++
++        if (digits.size() < 4 || digits.size() > 8) {
++            continue;
++        }
++        if (!hasSeparator && digits.size() == 4) {
++            const int year = digits.toInt();
++            if (year >= 1990 && year <= 2039) {
++                continue;
++            }
++        }
++
++        return digits;
++    }
++
++    return {};
++}
++}
+diff --git a/plugins/notifications/otpcodeextractor.h b/plugins/notifications/otpcodeextractor.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..092fdb8ee6ad15c4a82cbbf496b40be788fceb01
+--- /dev/null
++++ b/plugins/notifications/otpcodeextractor.h
+@@ -0,0 +1,16 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QString>
++#include <QStringList>
++
++namespace OtpCodeExtractor
++{
++QString extractFromAction(const QString &action);
++QString extractFromNotification(const QString &title, const QString &text, const QStringList &actions = {});
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index f3ab3ac91a4651b6d9125a9c0d76181063bff85b..7766bc804ab01abdab51b8aba115f615e81f7ec5 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -18,6 +18,9 @@ set(kdeconnect_libraries
+ )
+ 
+ ecm_add_test(notificationstest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
++ecm_add_test(otpextractortest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
++target_sources(otpextractortest PRIVATE ../plugins/notifications/otpcodeextractor.cpp)
++set_tests_properties(otpextractortest PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+ ecm_add_test(pluginloadtest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+ ecm_add_test(sendfiletest.cpp LINK_LIBRARIES ${kdeconnect_libraries})
+ target_sources(sendfiletest PRIVATE testdevice.cpp)
+diff --git a/tests/otpextractortest.cpp b/tests/otpextractortest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..29cd021b371e66efaf40e1e42a86cfa202062b8e
+--- /dev/null
++++ b/tests/otpextractortest.cpp
+@@ -0,0 +1,77 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "../plugins/notifications/otpcodeextractor.h"
++
++#include <QtTest>
++
++class OtpExtractorTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testExtractFromActionInvisibleSeparators()
++    {
++        const QString action = QStringLiteral("Copy \"6\u20637\u20631\u20637\u20633\u20633\"");
++        QCOMPARE(OtpCodeExtractor::extractFromAction(action), QStringLiteral("671733"));
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(QStringLiteral("Messages"), QStringLiteral("Code incoming"), {action}),
++                 QStringLiteral("671733"));
++    }
++
++    void testEnglishAndGoogleFormats()
++    {
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(QStringLiteral("Security Alert"), QStringLiteral("Your verification code is 482910.")),
++                 QStringLiteral("482910"));
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(QStringLiteral("Messages"), QStringLiteral("G-123456 is your Google verification code.")),
++                 QStringLiteral("123456"));
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(QStringLiteral("GitHub"), QStringLiteral("Use 2FA code 123-456 to sign in.")),
++                 QStringLiteral("123456"));
++    }
++
++    void testRussianOtpFormats()
++    {
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(
++                     QStringLiteral("\u0411\u0430\u043d\u043a"),
++                     QStringLiteral("\u0412\u0430\u0448 \u043a\u043e\u0434 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f: 7391")),
++                 QStringLiteral("7391"));
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(
++                     QStringLiteral("\u0421\u0435\u0440\u0432\u0438\u0441"),
++                     QStringLiteral("\u041e\u0434\u043d\u043e\u0440\u0430\u0437\u043e\u0432\u044b\u0439 \u043f\u0430\u0440\u043e\u043b\u044c: 849201")),
++                 QStringLiteral("849201"));
++    }
++
++    void testMixedCurrencyAndOtpSelectsOtp()
++    {
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(QStringLiteral("Bank"), QStringLiteral("Verification: 1500 RUB, code 482910")),
++                 QStringLiteral("482910"));
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(
++                     QStringLiteral("\u0411\u0430\u043d\u043a"),
++                     QStringLiteral("\u041a\u043e\u0434 \u043f\u043e\u0434\u0442\u0432\u0435\u0440\u0436\u0434\u0435\u043d\u0438\u044f \u043e\u043f\u043b\u0430\u0442\u044b 1500 \u0440\u0443\u0431.: 482910")),
++                 QStringLiteral("482910"));
++    }
++
++    void testRejectsFalsePositives()
++    {
++        QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Support"), QStringLiteral("Verification from +79991234567")).isEmpty());
++        QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Support"), QStringLiteral("Verification from +7 999 123 4567")).isEmpty());
++        QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Bank"), QStringLiteral("Verify purchase 1500 RUB")).isEmpty());
++        QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Bank"), QStringLiteral("Verify charge $4500")).isEmpty());
++        QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Notice"), QStringLiteral("Verification policy updated for 2026")).isEmpty());
++        QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Shop"), QStringLiteral("Order 482910 shipped")).isEmpty());
++    }
++
++    void testRejectsOversizedInputs()
++    {
++        const QString oversizedBody = QString(5000, QLatin1Char('a')) + QStringLiteral(" code 123456");
++        QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Alert"), oversizedBody).isEmpty());
++        const QString oversizedAction = QString(300, QLatin1Char('a')) + QStringLiteral(" 123456");
++        QVERIFY(OtpCodeExtractor::extractFromAction(oversizedAction).isEmpty());
++    }
++};
++
++QTEST_MAIN(OtpExtractorTest)
++
++#include "otpextractortest.moc"

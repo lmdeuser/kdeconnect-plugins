@@ -1,0 +1,307 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 16:21:49 +0500
+Subject: [PATCH 2/2] remoteauth: fix challenge deadline tracking, lockscreen
+ display, and displaced requests
+
+
+diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
+index 50f740ea47319e248564ca14346792274938e6ac..a6ea28a6e8c3e27d99e963e244997b984f72fb51 100644
+--- a/src/main/AndroidManifest.xml
++++ b/src/main/AndroidManifest.xml
+@@ -292,7 +292,8 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+             android:name="org.kde.kdeconnect.plugins.remoteauth.RemoteAuthPromptActivity"
+             android:exported="false"
+             android:excludeFromRecents="true"
+-            android:noHistory="true"
++            android:showWhenLocked="true"
++            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+             android:theme="@style/Theme.Transparent"
+             tools:targetApi="r" />
+         <activity
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPlugin.kt
+index 59f53d84dfea13aeb66d3c38769e33734555e98c..de8314ed0adfc50a8ca52cded0cd453d4363e1c7 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPlugin.kt
+@@ -12,15 +12,16 @@ import android.app.PendingIntent
+ import android.os.Build
+ import android.os.Handler
+ import android.os.Looper
++import android.os.SystemClock
+ import androidx.annotation.RequiresApi
+ import androidx.core.app.NotificationCompat
+ import androidx.core.content.getSystemService
+ import org.kde.kdeconnect.NetworkPacket
++import org.kde.kdeconnect.helpers.LifecycleHelper
+ import org.kde.kdeconnect.helpers.NotificationHelper
+ import org.kde.kdeconnect.plugins.Plugin
+ import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
+ import org.kde.kdeconnect_tp.R
+-import kotlin.math.abs
+ 
+ @LoadablePlugin
+ @RequiresApi(Build.VERSION_CODES.R)
+@@ -52,8 +53,10 @@ class RemoteAuthPlugin : Plugin() {
+         }
+ 
+     override fun onDestroy() {
+-        cancelTimeout()
+-        activeChallenge = null
++        synchronized(this) {
++            cancelTimeoutLocked()
++            activeChallenge = null
++        }
+         cancelNotification()
+         super.onDestroy()
+     }
+@@ -64,7 +67,10 @@ class RemoteAuthPlugin : Plugin() {
+         }
+         val challenge = RemoteAuthProtocol.parseChallenge(np) ?: return false
+ 
++        val displaced: RemoteAuthProtocol.Challenge?
++        val expiresAtElapsedMs = SystemClock.elapsedRealtime() + challenge.ttlMs.toLong()
+         synchronized(this) {
++            displaced = activeChallenge
+             cancelTimeoutLocked()
+             activeChallenge = challenge
+             val expireTask = Runnable {
+@@ -79,7 +85,41 @@ class RemoteAuthPlugin : Plugin() {
+             mainHandler.postDelayed(expireTask, challenge.ttlMs.toLong())
+         }
+ 
+-        postPromptNotification(challenge)
++        if (displaced != null) {
++            val displacedPacket = RemoteAuthProtocol.buildResponsePacket(
++                challengeId = displaced.challengeId,
++                nonceBase64 = displaced.nonceBase64,
++                approved = false,
++                authType = "denied",
++            )
++            device.sendPacket(displacedPacket)
++        }
++
++        val promptIntent = RemoteAuthPromptActivity.createIntent(
++            context = context,
++            deviceId = device.deviceId,
++            deviceName = device.name,
++            challenge = challenge,
++            expiresAtElapsedMs = expiresAtElapsedMs,
++        )
++
++        if (LifecycleHelper.isInForeground) {
++            cancelNotification()
++            context.startActivity(promptIntent)
++            return true
++        }
++
++        if (!canPostPromptNotification()) {
++            submitPromptResult(
++                challengeId = challenge.challengeId,
++                nonceBase64 = challenge.nonceBase64,
++                approved = false,
++                authType = "denied",
++            )
++            return true
++        }
++
++        postPromptNotification(challenge, promptIntent)
+         return true
+     }
+ 
+@@ -108,14 +148,20 @@ class RemoteAuthPlugin : Plugin() {
+         device.sendPacket(packet)
+     }
+ 
+-    private fun postPromptNotification(challenge: RemoteAuthProtocol.Challenge) {
++    private fun canPostPromptNotification(): Boolean {
++        val nm = context.getSystemService<NotificationManager>() ?: return false
++        if (!nm.areNotificationsEnabled()) {
++            return false
++        }
++        return Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
++            isPermissionGranted(Manifest.permission.POST_NOTIFICATIONS)
++    }
++
++    private fun postPromptNotification(
++        challenge: RemoteAuthProtocol.Challenge,
++        promptIntent: android.content.Intent,
++    ) {
+         val nm = context.getSystemService<NotificationManager>() ?: return
+-        val promptIntent = RemoteAuthPromptActivity.createIntent(
+-            context = context,
+-            deviceId = device.deviceId,
+-            deviceName = device.name,
+-            challenge = challenge,
+-        )
+         val pending = PendingIntent.getActivity(
+             context,
+             notificationId(),
+@@ -147,21 +193,11 @@ class RemoteAuthPlugin : Plugin() {
+     }
+ 
+     private fun notificationId(): Int {
+-        return NOTIFICATION_ID_BASE + (abs(device.deviceId.hashCode()) % 10000)
+-    }
+-
+-    private fun cancelTimeout() {
+-        synchronized(this) {
+-            cancelTimeoutLocked()
+-        }
++        return RemoteAuthProtocol.notificationIdForDevice(device.deviceId)
+     }
+ 
+     private fun cancelTimeoutLocked() {
+         timeoutRunnable?.let { mainHandler.removeCallbacks(it) }
+         timeoutRunnable = null
+     }
+-
+-    companion object {
+-        private const val NOTIFICATION_ID_BASE = 48100
+-    }
+ }
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPromptActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPromptActivity.kt
+index eb361a325c21a0c6ae60069424c0aee0ad88a4ea..210cada6770ca4fd2efee227f8c45290cbe8f603 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPromptActivity.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthPromptActivity.kt
+@@ -15,6 +15,7 @@ import android.os.Bundle
+ import android.os.CancellationSignal
+ import android.os.Handler
+ import android.os.Looper
++import android.os.SystemClock
+ import androidx.annotation.RequiresApi
+ import androidx.appcompat.app.AppCompatActivity
+ import org.kde.kdeconnect.KdeConnect
+@@ -37,6 +38,7 @@ class RemoteAuthPromptActivity : AppCompatActivity() {
+ 
+     override fun onCreate(savedInstanceState: Bundle?) {
+         setTurnScreenOn(true)
++        setShowWhenLocked(true)
+         super.onCreate(savedInstanceState)
+ 
+         deviceId = intent.getStringExtra(EXTRA_DEVICE_ID).orEmpty()
+@@ -47,12 +49,24 @@ class RemoteAuthPromptActivity : AppCompatActivity() {
+         val deviceName = intent.getStringExtra(EXTRA_DEVICE_NAME).orEmpty().ifEmpty { "KDE Connect" }
+         val ttlMs = intent.getIntExtra(EXTRA_TTL_MS, RemoteAuthProtocol.DEFAULT_TTL_MS)
+             .coerceIn(RemoteAuthProtocol.MIN_TTL_MS, RemoteAuthProtocol.MAX_TTL_MS)
++        val expiresAtElapsedMs = intent.getLongExtra(EXTRA_EXPIRES_AT_ELAPSED_MS, 0L)
+ 
+         if (deviceId.isEmpty() || challengeId.isEmpty() || nonceBase64.isEmpty()) {
+             finish()
+             return
+         }
+ 
++        val remainingMs = RemoteAuthProtocol.remainingTtlMs(
++            expiresAtElapsedMs = expiresAtElapsedMs,
++            nowElapsedMs = SystemClock.elapsedRealtime(),
++            fallbackTtlMs = ttlMs,
++        )
++        if (remainingMs <= 0L) {
++            deliverOutcome(approved = false, authType = "denied")
++            finish()
++            return
++        }
++
+         val authenticators =
+             BiometricManager.Authenticators.BIOMETRIC_STRONG or
+                 BiometricManager.Authenticators.DEVICE_CREDENTIAL
+@@ -78,7 +92,7 @@ class RemoteAuthPromptActivity : AppCompatActivity() {
+ 
+         val signal = CancellationSignal()
+         cancellationSignal = signal
+-        mainHandler.postDelayed(timeoutRunnable, ttlMs.toLong())
++        mainHandler.postDelayed(timeoutRunnable, remainingMs)
+ 
+         prompt.authenticate(
+             signal,
+@@ -105,6 +119,9 @@ class RemoteAuthPromptActivity : AppCompatActivity() {
+         mainHandler.removeCallbacks(timeoutRunnable)
+         cancellationSignal?.cancel()
+         cancellationSignal = null
++        if (isFinishing && !delivered && deviceId.isNotEmpty() && challengeId.isNotEmpty() && nonceBase64.isNotEmpty()) {
++            deliverOutcome(approved = false, authType = "denied")
++        }
+         super.onDestroy()
+     }
+ 
+@@ -127,12 +144,14 @@ class RemoteAuthPromptActivity : AppCompatActivity() {
+         private const val EXTRA_PURPOSE = "purpose"
+         private const val EXTRA_SUMMARY = "summary"
+         private const val EXTRA_TTL_MS = "ttlMs"
++        private const val EXTRA_EXPIRES_AT_ELAPSED_MS = "expiresAtElapsedMs"
+ 
+         fun createIntent(
+             context: Context,
+             deviceId: String,
+             deviceName: String,
+             challenge: RemoteAuthProtocol.Challenge,
++            expiresAtElapsedMs: Long,
+         ): Intent = Intent(context, RemoteAuthPromptActivity::class.java).apply {
+             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+             putExtra(EXTRA_DEVICE_ID, deviceId)
+@@ -142,6 +161,7 @@ class RemoteAuthPromptActivity : AppCompatActivity() {
+             putExtra(EXTRA_PURPOSE, challenge.purpose)
+             putExtra(EXTRA_SUMMARY, challenge.summary)
+             putExtra(EXTRA_TTL_MS, challenge.ttlMs)
++            putExtra(EXTRA_EXPIRES_AT_ELAPSED_MS, expiresAtElapsedMs)
+         }
+     }
+ }
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocol.kt b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocol.kt
+index 9b3dcd01b0813c98c5a861a63726be6c1675abae..60ee236fb3aebd336a638ec97eeb577d2a1357ef 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocol.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocol.kt
+@@ -19,6 +19,19 @@ object RemoteAuthProtocol {
+     const val MAX_SUMMARY_LENGTH = 240
+     const val MIN_CHALLENGE_ID_LENGTH = 8
+     const val MAX_CHALLENGE_ID_LENGTH = 128
++    const val NOTIFICATION_ID_BASE = 48100
++    const val NOTIFICATION_ID_SPAN = 100
++
++    fun notificationIdForDevice(deviceId: String): Int {
++        return NOTIFICATION_ID_BASE + ((deviceId.hashCode() and 0x7FFFFFFF) % NOTIFICATION_ID_SPAN)
++    }
++
++    fun remainingTtlMs(expiresAtElapsedMs: Long, nowElapsedMs: Long, fallbackTtlMs: Int): Long {
++        if (expiresAtElapsedMs <= 0L) {
++            return fallbackTtlMs.coerceIn(MIN_TTL_MS, MAX_TTL_MS).toLong()
++        }
++        return (expiresAtElapsedMs - nowElapsedMs).coerceAtLeast(0L)
++    }
+ 
+     private val CHALLENGE_ID_REGEX = Regex("^[A-Za-z0-9_-]{8,128}$")
+ 
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocolTest.kt b/src/test/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocolTest.kt
+index 01384f380ac722eedbd307fa9e1395a36036b28f..6c92b175b5b047fadada95cded03f71142c1fe22 100644
+--- a/src/test/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocolTest.kt
++++ b/src/test/java/org/kde/kdeconnect/plugins/remoteauth/RemoteAuthProtocolTest.kt
+@@ -9,6 +9,7 @@ package org.kde.kdeconnect.plugins.remoteauth
+ import org.junit.Assert.assertEquals
+ import org.junit.Assert.assertNotNull
+ import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
+ import org.kde.kdeconnect.NetworkPacket
+ import org.junit.Test
+ import java.util.Base64
+@@ -68,4 +69,22 @@ class RemoteAuthProtocolTest {
+         assertEquals(true, np.getBoolean("approved", false))
+         assertEquals("biometric", np.getString("authType"))
+     }
++
++    @Test
++    fun notificationIdStaysBoundedNonNegativeAndDisjointFromContinuityCamera() {
++        // Includes a known string with Int.MIN_VALUE hashCode: "polygenelubricants"
++        val samples = listOf("", "dev1", "polygenelubricants", "01234567-89ab-cdef-0123-456789abcdef")
++        for (id in samples) {
++            val nid = RemoteAuthProtocol.notificationIdForDevice(id)
++            assertTrue("Expected $nid in [48100, 48199]", nid in 48100..48199)
++        }
++    }
++
++    @Test
++    fun remainingTtlUsesElapsedDeadlineAndClampsExpired() {
++        assertEquals(12_000L, RemoteAuthProtocol.remainingTtlMs(expiresAtElapsedMs = 50_000L, nowElapsedMs = 38_000L, fallbackTtlMs = 30_000))
++        assertEquals(0L, RemoteAuthProtocol.remainingTtlMs(expiresAtElapsedMs = 50_000L, nowElapsedMs = 55_000L, fallbackTtlMs = 30_000))
++        assertEquals(30_000L, RemoteAuthProtocol.remainingTtlMs(expiresAtElapsedMs = 0L, nowElapsedMs = 38_000L, fallbackTtlMs = 30_000))
++        assertEquals(RemoteAuthProtocol.MIN_TTL_MS.toLong(), RemoteAuthProtocol.remainingTtlMs(expiresAtElapsedMs = 0L, nowElapsedMs = 0L, fallbackTtlMs = 100))
++    }
+ }

@@ -1,0 +1,302 @@
+{
+  "schema_version": 1,
+  "targets": {
+    "desktop": {
+      "upstream_url": "https://invent.kde.org/network/kdeconnect-kde.git",
+      "base_sha": "69ce9c5c49ce209600873bf10ddf61bfe4dfab1c",
+      "expected_tree_sha": "ee449b8169a6b4d44422cf88ed1e8f0c14aee93f",
+      "expected_head_sha": "9fffc4ac59fcd49bb4ea1aa45b1e36d145ac2736",
+      "plugins": [
+        {
+          "id": "screenstream",
+          "branch": "work/screenstream",
+          "expected_tree_sha": "f6c7d7498d318c3173b65f11811dd68c6bad00cd",
+          "expected_head_sha": "faa31616e0a1acde3edba915493653f7d0d9cd6b",
+          "patches": [
+            {
+              "path": "patches/desktop/screenstream/0001-Add-screenstream-plugin-and-Wayland-viewer-helper.patch",
+              "sha256": "8d5ee7d2dfab077b2ad9fe73a38d44be88e2eaefc78956caa384dd6d41278621",
+              "bytes": 123766
+            },
+            {
+              "path": "patches/desktop/screenstream/0002-feat-screenstream-add-Wake-Screen-action-and-fix-vie.patch",
+              "sha256": "6b696599a795c18543dc6298fa1acd6a4c34978e50670f61fa28fa30dea56b74",
+              "bytes": 15282
+            },
+            {
+              "path": "patches/desktop/screenstream/0003-feat-screenstream-support-stationary-left-button-lon.patch",
+              "sha256": "0945adfa675a308d50112be619cde8ef3692558196708c6fa7c3b96e2886494f",
+              "bytes": 6277
+            },
+            {
+              "path": "patches/desktop/screenstream/0004-screenstream-forward-viewer-logs-and-repeat-H.264-SP.patch",
+              "sha256": "4744ec570544c9815a85f05e6e4d6d143f247c1582ec26c4402cc645541b70e2",
+              "bytes": 1570
+            },
+            {
+              "path": "patches/desktop/screenstream/0005-screenstream-add-Drag-Drop-file-share-and-Open-on-Ph.patch",
+              "sha256": "fa37edfbc703d9953a177ccd73778d4c3bc62948c7a46320bdbdb48ed528a748",
+              "bytes": 9187
+            },
+            {
+              "path": "patches/desktop/screenstream/0006-screenstream-fix-geometry-scaling-D-Bus-deadlock-Gst.patch",
+              "sha256": "9f68b21b5893f04831ce1ac7a6f662af4efbb28ff635c6109230b724738fd845",
+              "bytes": 29401
+            },
+            {
+              "path": "patches/desktop/screenstream/0007-screenstream-clamp-viewer-window-within-monitor-boun.patch",
+              "sha256": "7c6f569c5a68098567dad37e9e53ce2c43af01924166caa309f190284591c351",
+              "bytes": 20159
+            },
+            {
+              "path": "patches/desktop/screenstream/0008-screenstream-add-mutually-exclusive-screencast-Bluet.patch",
+              "sha256": "8bef2eb87d15ff385bd5f0fa230be267504a348db2d8cadb1eaa286e55f10b57",
+              "bytes": 21018
+            }
+          ]
+        },
+        {
+          "id": "clipboard_images",
+          "branch": "work/clipboard_images",
+          "expected_tree_sha": "92d56690121b1f0af0ec44382b9bebb34a19e9f8",
+          "expected_head_sha": "ec723ee89b5459ba4d94f8c67ef6e1feb4e09526",
+          "patches": [
+            {
+              "path": "patches/desktop/clipboard_images/0001-clipboard-expose-local-image-files-as-QImage-clipboa.patch",
+              "sha256": "29357070e31340a077b6bf31b84a401c0c8a1be3c4b56d92ddbcf94a6f509978",
+              "bytes": 994
+            }
+          ]
+        },
+        {
+          "id": "otp_autofill",
+          "branch": "work/otp_autofill",
+          "expected_tree_sha": "6186a6d022bcf8078c3eb2de2edba4b87215b957",
+          "expected_head_sha": "52d215a79b6eb014843a1876eabd1a0df2b818f8",
+          "patches": [
+            {
+              "path": "patches/desktop/otp_autofill/0001-notifications-auto-copy-incoming-OTP-codes-with-secr.patch",
+              "sha256": "e64f441d376b701ecf58d2c0e3079e1289dafd65134f7ab0ff6dc48d828b7fea",
+              "bytes": 19639
+            },
+            {
+              "path": "patches/desktop/otp_autofill/0002-otp_autofill-skip-shortcode-titles-and-extract-lates.patch",
+              "sha256": "7b6db7d2d81649f5488f647839e5be375888611e6033c037258b4233834896ad",
+              "bytes": 8247
+            },
+            {
+              "path": "patches/desktop/otp_autofill/0003-notifications-fall-back-to-fresh-inbox-SMS-packets-f.patch",
+              "sha256": "ef2fd571ee02c9c9e5c00dd326f422665f19bb73970f3eff0b5a700dd7f08a29",
+              "bytes": 10986
+            }
+          ]
+        },
+        {
+          "id": "continuity_camera",
+          "branch": "work/continuity_camera",
+          "expected_tree_sha": "fcccc5494c601cac0634f07bc174bde0051e0d46",
+          "expected_head_sha": "1589bb8229cf7efe7a6e781f76cd99feef8dd0eb",
+          "patches": [
+            {
+              "path": "patches/desktop/continuity_camera/0001-plugins-add-continuity_camera-PipeWire-virtual-camer.patch",
+              "sha256": "fb99643510bcc08a698b7ded42dabb6f1c5e1ff30bd1084d3349a143d59b3e92",
+              "bytes": 55455
+            },
+            {
+              "path": "patches/desktop/continuity_camera/0002-continuity_camera-fix-live-PTS-stall-capture-collisi.patch",
+              "sha256": "5ad6729b604f0a102d6326874278ebac922fb5915ed992a46b689f105913ed31",
+              "bytes": 17158
+            },
+            {
+              "path": "patches/desktop/continuity_camera/0003-continuity_camera-pass-lvalue-NetworkPacket-to-sendP.patch",
+              "sha256": "60c4a2193f3b99485106ab6642e8e3983d734bf2f1a6a58800eb555179e51bb7",
+              "bytes": 1134
+            },
+            {
+              "path": "patches/desktop/continuity_camera/0004-continuity_camera-add-QML-D-Bus-webcam-controls-and-.patch",
+              "sha256": "a8134eb695a1a23f8cb2cd999f06129dc585c8b6f31f84f4d30495b79cd7b90f",
+              "bytes": 20698
+            }
+          ]
+        },
+        {
+          "id": "remote_auth",
+          "branch": "work/remote_auth",
+          "expected_tree_sha": "c226c45c55d0b43500a10516ab04a960f69e74a5",
+          "expected_head_sha": "bc11525a6c052cc39d5d9039b9415bd711c9a098",
+          "patches": [
+            {
+              "path": "patches/desktop/remote_auth/0001-plugins-add-remote_auth-biometric-confirmation-and-s.patch",
+              "sha256": "62dac221ac75e96fc1374c7d2eccc5d84e4e7bad69b2b4c8cb3822ad4eed5c76",
+              "bytes": 23752
+            },
+            {
+              "path": "patches/desktop/remote_auth/0002-remote_auth-use-monotonic-clock-cancel-failed-sends-.patch",
+              "sha256": "595abb579d890ea6c806ab4e0efcf404d4bee2aaeb04d7acc94dcd3c896ee86c",
+              "bytes": 10649
+            }
+          ]
+        },
+        {
+          "id": "bt_audio_switch",
+          "branch": "work/bt_audio_switch",
+          "expected_tree_sha": "fccab92c47d716a34680ac368d3f0c70f44345b6",
+          "expected_head_sha": "9baeaab2df3f0419975944d4c4fb01aa23801a2c",
+          "patches": [
+            {
+              "path": "patches/desktop/bt_audio_switch/0001-plugins-add-bt_audio_switch-headset-handoff-plugin.patch",
+              "sha256": "3bc1b458ba97347e3921d415e739f7f662e0677fe10ca120f8dbd7f04322b0c6",
+              "bytes": 26100
+            },
+            {
+              "path": "patches/desktop/bt_audio_switch/0002-bt_audio_switch-fix-stale-claim-timer-async-sink-sel.patch",
+              "sha256": "d9b683374fa1bb790c0a78ade43788bc4248e11f975dbd3318d8e7f0feef6322",
+              "bytes": 16359
+            }
+          ]
+        }
+      ]
+    },
+    "android": {
+      "upstream_url": "https://invent.kde.org/network/kdeconnect-android.git",
+      "base_sha": "d0534acc70cd9403fb56d78f645f228e21097492",
+      "expected_tree_sha": "64277d665336b89b268367e34b6647edee16d0f0",
+      "expected_head_sha": "e5f4c0619dd4d47d08cb0df74d7317ee6c500f5a",
+      "plugins": [
+        {
+          "id": "screenstream",
+          "branch": "work/screenstream",
+          "expected_tree_sha": "fd4b96aed96b67dbaeeb1291f1e7a1a9c9fa2ff9",
+          "expected_head_sha": "cec3a02b96b3473e32ac733580555d09d4f48831",
+          "patches": [
+            {
+              "path": "patches/android/screenstream/0001-feat-screenstream-add-Android-screen-and-playback-au.patch",
+              "sha256": "7fee64ea7825b523ea0bbd1789f7b2e7a5d031e00fb69716263c59e7918b5518",
+              "bytes": 112743
+            },
+            {
+              "path": "patches/android/screenstream/0002-feat-screenstream-add-wake-pulse-keep-screen-on-and-.patch",
+              "sha256": "2bb385826f5a74b836d08aa8d3a1a0b1784f7f9d82bc4daf2e1ce829eee6519a",
+              "bytes": 18599
+            },
+            {
+              "path": "patches/android/screenstream/0003-screenstream-recreate-H.264-encoder-on-wake-and-fix-.patch",
+              "sha256": "52fb7d2c7055c343bb7d5d16b79abafa3dd314c93d455d114e531ab89c1dce6a",
+              "bytes": 18573
+            },
+            {
+              "path": "patches/android/screenstream/0004-notifications-support-remote-open-action-for-Screen-.patch",
+              "sha256": "799dc029c5cb2f900515deabfca34595b7239144366a86a10adc9d283eedc8d3",
+              "bytes": 4447
+            },
+            {
+              "path": "patches/android/screenstream/0005-screenstream-harden-consent-encoder-and-service-life.patch",
+              "sha256": "a18acec76b0304a88d6ba732551430191ac6b1b1c8defd714533885db72e4080",
+              "bytes": 44913
+            },
+            {
+              "path": "patches/android/screenstream/0006-screenstream-add-live-audio-route-switching-and-Blue.patch",
+              "sha256": "4391bfe71c6a66648a3966a9ab461f6da5ac3aa67efa926b269c3c4f15186d22",
+              "bytes": 20638
+            }
+          ]
+        },
+        {
+          "id": "clipboard_images",
+          "branch": "work/clipboard_images",
+          "expected_tree_sha": "8b608634047d9d8a2f29db6e4ebfa07bf2a512ab",
+          "expected_head_sha": "27874541eb3950f5aaaad7178de5e5f7320022c0",
+          "patches": [
+            {
+              "path": "patches/android/clipboard_images/0001-clipboard-add-bidirectional-clipboard-image-sync.patch",
+              "sha256": "fef8e53514b41a5136086904b6e6dfced43ebe6f010a2c25c635ccb3a97ed317",
+              "bytes": 23293
+            },
+            {
+              "path": "patches/android/clipboard_images/0002-clipboard-validate-capability-and-format-support-pre.patch",
+              "sha256": "f71af48a926214db8000ee971bec8eb7b9d637364b7eb879bd3f36ea4c3dac2c",
+              "bytes": 9342
+            }
+          ]
+        },
+        {
+          "id": "otp_autofill",
+          "branch": "work/otp_autofill",
+          "expected_tree_sha": "520d12e57ef5d757ac203ee0cd474edf8bbfa346",
+          "expected_head_sha": "6722b4717285b77b468df8935185450600a32bbd",
+          "patches": [
+            {
+              "path": "patches/android/otp_autofill/0001-sms-push-strictly-newer-inbox-messages-for-OTP-redac.patch",
+              "sha256": "6fab150fb7923df70baa26e74b8496cce9ce47dd044c76ae5c8fd0c8ba49412d",
+              "bytes": 9939
+            }
+          ]
+        },
+        {
+          "id": "continuity_camera",
+          "branch": "work/continuity_camera",
+          "expected_tree_sha": "3512daf8418c73c53e529f140c18d667a616f14a",
+          "expected_head_sha": "f92e72f705c1c5e7cd26e301837d49ed1c26b0af",
+          "patches": [
+            {
+              "path": "patches/android/continuity_camera/0001-plugins-add-ContinuityCamera-streaming-and-capture-p.patch",
+              "sha256": "837f317f1a390801a77ed85d5149b046d02ac81892d2be89a83b25b53b0a593a",
+              "bytes": 65968
+            },
+            {
+              "path": "patches/android/continuity_camera/0002-continuity_camera-fix-FGS-lifecycle-AudioRecord-stop.patch",
+              "sha256": "11806297e91c26d0141408e251340e2613738fae57791c30d76d17b8df94bd5d",
+              "bytes": 66628
+            },
+            {
+              "path": "patches/android/continuity_camera/0003-continuity_camera-add-webcam-start-lens-switch-and-s.patch",
+              "sha256": "5a726f5e8bd2fea9f6a916eb029b257271d8adae44367b89175ad5ca96429fb0",
+              "bytes": 7383
+            }
+          ]
+        },
+        {
+          "id": "remote_auth",
+          "branch": "work/remote_auth",
+          "expected_tree_sha": "7163d265954edc15694886a37e1a3d57c7577777",
+          "expected_head_sha": "01c92af34ce941f91269c00d920d82bd02efd90e",
+          "patches": [
+            {
+              "path": "patches/android/remote_auth/0001-plugins-add-RemoteAuth-biometric-prompt-plugin.patch",
+              "sha256": "eed8a95722a0226fd5ddc44d0bb49e5e6dc0406b729fdf3e658bec8fa6b5fff2",
+              "bytes": 23956
+            },
+            {
+              "path": "patches/android/remote_auth/0002-remoteauth-fix-challenge-deadline-tracking-lockscree.patch",
+              "sha256": "7d323c0c723a20d0547d6d65dd99c0cd701624a8a8b865b14143554fa474a254",
+              "bytes": 13387
+            }
+          ]
+        },
+        {
+          "id": "bt_audio_switch",
+          "branch": "work/bt_audio_switch",
+          "expected_tree_sha": "d9b687e574161a23f2a5860dc86f48628dc73f06",
+          "expected_head_sha": "c1c0e3de0ddfd84734654dd14b09a3f54842c1df",
+          "patches": [
+            {
+              "path": "patches/android/bt_audio_switch/0001-plugins-add-BtAudioSwitch-headset-handoff-plugin.patch",
+              "sha256": "4376f04ee9037d62b14c1722f53ec02c7d3dd81f8117fa17d26a180ff778018c",
+              "bytes": 22171
+            },
+            {
+              "path": "patches/android/bt_audio_switch/0002-btaudioswitch-add-settings-UI-filter-playback-events.patch",
+              "sha256": "dbeaa5dfbf005e679fd59d26d48746f13972753f2acb67ba9a3379304cf497cf",
+              "bytes": 17372
+            },
+            {
+              "path": "patches/android/bt_audio_switch/0003-bt_audio_switch-defer-automatic-media-claims-while-s.patch",
+              "sha256": "e6cd47e5d664f1335753590787bae51874af99906306095a4d5a671db31f4e51",
+              "bytes": 1926
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 13:44:21 +0500
+Subject: [PATCH 4/8] screenstream: forward viewer logs and repeat H.264
+ SPS/PPS on IDR
+
+
+diff --git a/plugins/screenstream/screenstreamplugin.cpp b/plugins/screenstream/screenstreamplugin.cpp
+index 1436909ae54f96704b942cdceafb307dbf77f061..1fc3388b06428080031311b7733ff310d7fa1da0 100644
+--- a/plugins/screenstream/screenstreamplugin.cpp
++++ b/plugins/screenstream/screenstreamplugin.cpp
+@@ -455,6 +455,7 @@ bool ScreenStreamPlugin::launchViewer()
+ #ifdef Q_OS_UNIX
+     process->setUnixProcessParameters(QProcess::UnixProcessFlag::CloseFileDescriptors);
+ #endif
++    process->setProcessChannelMode(QProcess::ForwardedChannels);
+     process->setProgram(viewerExe);
+     process->setArguments({
+         QStringLiteral("--device"),
+diff --git a/plugins/screenstream/viewer/gstvideodecoder.cpp b/plugins/screenstream/viewer/gstvideodecoder.cpp
+index 994a13b1273f1abd3187f428c405f66cfce21528..5de000e09a945607c74e92071af6560971359d73 100644
+--- a/plugins/screenstream/viewer/gstvideodecoder.cpp
++++ b/plugins/screenstream/viewer/gstvideodecoder.cpp
+@@ -181,6 +181,8 @@ bool ScreenStreamVideoDecoder::initialize(QString *errorOut)
+                  nullptr);
+     gst_caps_unref(srcCaps);
+ 
++    g_object_set(parser, "config-interval", -1, nullptr);
++
+     GstCaps *rawCaps = gst_caps_from_string("video/x-raw,format=(string)RGBA");
+     g_object_set(capsfilter, "caps", rawCaps, nullptr);
+     gst_caps_unref(rawCaps);

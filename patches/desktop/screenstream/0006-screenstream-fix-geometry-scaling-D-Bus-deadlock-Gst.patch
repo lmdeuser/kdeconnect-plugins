@@ -1,0 +1,632 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 16:08:20 +0500
+Subject: [PATCH 6/8] screenstream: fix geometry scaling, D-Bus deadlock,
+ GstVideoFrame stride, and session guards
+
+
+diff --git a/plugins/notifications/notificationsplugin.cpp b/plugins/notifications/notificationsplugin.cpp
+index 1bf9b23f805998e40a0bcee4a4393567508d7c95..008a8617bed4c1ad2acb250e7a36500a99602a3d 100644
+--- a/plugins/notifications/notificationsplugin.cpp
++++ b/plugins/notifications/notificationsplugin.cpp
+@@ -15,7 +15,7 @@
+ #include <KPluginFactory>
+ #include <KSystemClipboard>
+ #include <QDBusConnection>
+-#include <QDBusInterface>
++#include <QMetaObject>
+ 
+ #if WITH_X11
+ #include <KStartupInfo>
+@@ -238,18 +238,9 @@ void NotificationsPlugin::openNotification(const QString &key)
+     np.set<bool>(QStringLiteral("open"), true);
+     sendPacket(np);
+ 
+-    const QString streamPath = QStringLiteral("/modules/kdeconnect/devices/%1/screenstream").arg(device()->id());
+-    QDBusInterface streamIface(QStringLiteral("org.kde.kdeconnect"),
+-                               streamPath,
+-                               QStringLiteral("org.kde.kdeconnect.device.screenstream"),
+-                               QDBusConnection::sessionBus());
+-    if (!streamIface.isValid()) {
+-        return;
+-    }
+-    if (streamIface.property("isStreaming").toBool()) {
+-        streamIface.asyncCall(QStringLiteral("wakeScreen"));
+-    } else {
+-        streamIface.asyncCall(QStringLiteral("startStream"));
++    if (KdeConnectPlugin *ss = device()->plugin(QStringLiteral("kdeconnect_screenstream"))) {
++        const char *method = ss->property("isStreaming").toBool() ? "wakeScreen" : "startStream";
++        QMetaObject::invokeMethod(ss, method);
+     }
+ }
+ 
+diff --git a/plugins/screenstream/screenstreamplugin.cpp b/plugins/screenstream/screenstreamplugin.cpp
+index 1fc3388b06428080031311b7733ff310d7fa1da0..a7da5edd66980c01df10a4858bbaa50a0d08ac80 100644
+--- a/plugins/screenstream/screenstreamplugin.cpp
++++ b/plugins/screenstream/screenstreamplugin.cpp
+@@ -26,12 +26,16 @@
+ 
+ #include <algorithm>
+ 
++#include <utility>
++
+ K_PLUGIN_CLASS_WITH_JSON(ScreenStreamPlugin, "kdeconnect_screenstream.json")
+ 
+ namespace
+ {
+ inline constexpr qsizetype kMaxPendingViewerFrames = 32;
+ inline constexpr qint64 kMaxViewerWriteQueueBytes = 4LL * 1024LL * 1024LL;
++inline constexpr qint64 kMaxHardViewerWriteQueueBytes = kMaxViewerWriteQueueBytes * 2LL;
++inline constexpr qint64 kPayloadReadChunkBytes = 65536LL;
+ } // namespace
+ 
+ ScreenStreamPlugin::ScreenStreamPlugin(QObject *parent, const QVariantList &args)
+@@ -175,18 +179,24 @@ bool ScreenStreamPlugin::startStream()
+ 
+     m_session.setRemoteControlAllowed(device()->isPluginEnabled(QStringLiteral("kdeconnect_remotecontrol")));
+     m_session.onExplicitStart();
+-    sendStartPacket();
++    if (!sendStartPacket()) {
++        setLastError(i18n("Failed to send screen stream start request."));
++        m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error, false);
++        syncStateSignals(wasActive, wasStreaming);
++        Q_EMIT stateChanged();
++        return false;
++    }
+ 
+     syncStateSignals(wasActive, wasStreaming);
+     Q_EMIT stateChanged();
+     return true;
+ }
+ 
+-void ScreenStreamPlugin::sendStartPacket()
++bool ScreenStreamPlugin::sendStartPacket()
+ {
+     const QVariantMap body = ScreenStreamProtocol::buildStartRequestBody(m_maxWidth, m_maxHeight, m_maxFps, m_maxBitrateKbps, m_requestAudio);
+     NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST, body);
+-    sendPacket(np);
++    return sendPacket(np);
+ }
+ 
+ void ScreenStreamPlugin::stopStream()
+@@ -231,7 +241,10 @@ bool ScreenStreamPlugin::wakeScreen()
+     }
+     setLastError(QString());
+     NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST, ScreenStreamProtocol::buildWakeRequestBody());
+-    sendPacket(np);
++    if (!sendPacket(np)) {
++        setLastError(i18n("Failed to send wake screen request."));
++        return false;
++    }
+     return true;
+ }
+ 
+@@ -257,9 +270,30 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+             qCWarning(KDECONNECT_PLUGIN_SCREENSTREAM) << "Ignoring unknown state value in screenstream packet";
+             return;
+         }
++        if (m_stopping) {
++            if (*parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Stopped
++                || *parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error) {
++                m_stopping = false;
++            } else {
++                if (peerSupportsScreenStream()
++                    && (*parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Streaming
++                        || *parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::AwaitingConsent)) {
++                    NetworkPacket stopNp(PACKET_TYPE_SCREENSTREAM_REQUEST,
++                                         {
++                                             {QStringLiteral("action"), QStringLiteral("stop")},
++                                             {QStringLiteral("explicitStop"), true},
++                                         });
++                    sendPacket(stopNp);
++                }
++                return;
++            }
++        }
+         const bool peerExplicitStop = np.get<bool>(QStringLiteral("explicitStop"), false);
+-        if (peerExplicitStop != m_explicitStop) {
+-            m_explicitStop = peerExplicitStop;
++        const bool effectiveExplicitStop = (*parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Stopped)
++            ? (m_explicitStop || peerExplicitStop)
++            : peerExplicitStop;
++        if (effectiveExplicitStop != m_explicitStop) {
++            m_explicitStop = effectiveExplicitStop;
+             config()->set(QStringLiteral("explicitStop"), m_explicitStop);
+         }
+ 
+@@ -276,7 +310,7 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+             Q_EMIT geometryChanged(m_displayWidth, m_displayHeight, m_rotation);
+         }
+ 
+-        m_session.onPeerState(*parsedState, peerExplicitStop);
++        m_session.onPeerState(*parsedState, effectiveExplicitStop);
+         if (*parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Stopped
+             || *parsedState == ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error) {
+             teardownSession(true);
+@@ -294,6 +328,8 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+     if (event == QLatin1String("geometry_changed")) {
+         const int w = np.get<int>(QStringLiteral("width"), 0);
+         const int h = np.get<int>(QStringLiteral("height"), 0);
++        const int dw = np.get<int>(QStringLiteral("displayWidth"), 0);
++        const int dh = np.get<int>(QStringLiteral("displayHeight"), 0);
+         const int rot = np.get<int>(QStringLiteral("rotation"), m_rotation);
+         if (w < 2 || h < 2 || !ScreenStreamProtocol::isValidRotation(rot)) {
+             qCWarning(KDECONNECT_PLUGIN_SCREENSTREAM) << "Ignoring invalid geometry_changed values";
+@@ -302,22 +338,29 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+         m_streamWidth = w;
+         m_streamHeight = h;
+         m_rotation = rot;
+-        if (m_displayWidth <= 0 || m_displayHeight <= 0) {
++        if (dw > 1 && dh > 1) {
++            m_displayWidth = dw;
++            m_displayHeight = dh;
++        } else if (m_displayWidth > 1 && m_displayHeight > 1 && ((w > h) != (m_displayWidth > m_displayHeight))) {
++            std::swap(m_displayWidth, m_displayHeight);
++        } else if (m_displayWidth <= 0 || m_displayHeight <= 0) {
+             m_displayWidth = w;
+             m_displayHeight = h;
+         }
+-        Q_EMIT geometryChanged(w, h, rot);
++        Q_EMIT geometryChanged(m_displayWidth, m_displayHeight, rot);
+         return;
+     }
+ 
+     if (event == QLatin1String("stopped")) {
+         const bool peerExplicitStop = np.get<bool>(QStringLiteral("explicitStop"), false);
+         const QString reason = np.get<QString>(QStringLiteral("reason"));
+-        if (peerExplicitStop) {
+-            m_explicitStop = true;
+-            config()->set(QStringLiteral("explicitStop"), true);
++        m_stopping = false;
++        const bool effectiveExplicitStop = m_explicitStop || peerExplicitStop;
++        if (effectiveExplicitStop != m_explicitStop) {
++            m_explicitStop = effectiveExplicitStop;
++            config()->set(QStringLiteral("explicitStop"), m_explicitStop);
+         }
+-        m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Stopped, peerExplicitStop);
++        m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Stopped, effectiveExplicitStop);
+         teardownSession(true);
+         if (!reason.isEmpty() && reason != QLatin1String("user_stopped") && reason != QLatin1String("remote_stopped")) {
+             setLastError(reason);
+@@ -328,10 +371,26 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+     }
+ 
+     if (event == QLatin1String("stream_open")) {
++        if (!m_session.shouldAcceptStreamOpen(m_stopping)) {
++            if (np.payload()) {
++                np.payload()->close();
++            }
++            if (peerSupportsScreenStream()) {
++                NetworkPacket stopNp(PACKET_TYPE_SCREENSTREAM_REQUEST,
++                                     {
++                                         {QStringLiteral("action"), QStringLiteral("stop")},
++                                         {QStringLiteral("explicitStop"), m_explicitStop},
++                                     });
++                sendPacket(stopNp);
++            }
++            return;
++        }
+         const QString videoCodec = np.get<QString>(QStringLiteral("videoCodec"));
+         const QString audioCodec = np.get<QString>(QStringLiteral("audioCodec"), QStringLiteral("none"));
+         const int w = np.get<int>(QStringLiteral("width"), 0);
+         const int h = np.get<int>(QStringLiteral("height"), 0);
++        const int dw = np.get<int>(QStringLiteral("displayWidth"), 0);
++        const int dh = np.get<int>(QStringLiteral("displayHeight"), 0);
+         const int rot = np.get<int>(QStringLiteral("rotation"), 0);
+         const int fps = np.get<int>(QStringLiteral("fps"), m_maxFps);
+ 
+@@ -354,7 +413,12 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+ 
+         m_streamWidth = w;
+         m_streamHeight = h;
+-        if (m_displayWidth <= 0 || m_displayHeight <= 0) {
++        if (dw > 1 && dh > 1) {
++            m_displayWidth = dw;
++            m_displayHeight = dh;
++        } else if (m_displayWidth > 1 && m_displayHeight > 1 && ((w > h) != (m_displayWidth > m_displayHeight))) {
++            std::swap(m_displayWidth, m_displayHeight);
++        } else if (m_displayWidth <= 0 || m_displayHeight <= 0) {
+             m_displayWidth = w;
+             m_displayHeight = h;
+         }
+@@ -381,17 +445,24 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+         connect(m_payload.data(), &QIODevice::readChannelFinished, this, &ScreenStreamPlugin::onPayloadClosed);
+         if (auto *absSock = qobject_cast<QAbstractSocket *>(m_payload.data())) {
+             connect(absSock, &QAbstractSocket::disconnected, this, &ScreenStreamPlugin::onPayloadClosed);
++            connect(absSock, &QAbstractSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
++                onPayloadClosed();
++            });
++            if (absSock->state() == QAbstractSocket::UnconnectedState) {
++                onPayloadClosed();
++                return;
++            }
+         }
+ 
+         m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Streaming, false);
+         setLastError(QString());
+ 
+-        Q_EMIT geometryChanged(m_streamWidth, m_streamHeight, m_rotation);
++        Q_EMIT geometryChanged(m_displayWidth, m_displayHeight, m_rotation);
+         Q_EMIT audioStatusChanged(m_audioAvailable, m_audioReason);
+         syncStateSignals(wasActive, wasStreaming);
+         Q_EMIT stateChanged();
+ 
+-        if (m_payload->bytesAvailable() > 0) {
++        if (m_payload && m_payload->bytesAvailable() > 0) {
+             onPayloadReadyRead();
+         }
+         return;
+@@ -557,31 +628,30 @@ void ScreenStreamPlugin::onPayloadReadyRead()
+     if (!m_payload) {
+         return;
+     }
+-    const QByteArray data = m_payload->readAll();
+-    if (data.isEmpty()) {
+-        return;
+-    }
+ 
+-    QList<ScreenStreamProtocol::ScreenStreamFrame> frames;
+-    if (!m_parser.feed(data, &frames)) {
+-        const QString err = m_parser.errorString();
+-        qCWarning(KDECONNECT_PLUGIN_SCREENSTREAM) << "Closing corrupted stream payload:" << err;
+-        const bool wasActive = active();
+-        const bool wasStreaming = isStreaming();
+-        setLastError(err);
+-        m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error, false);
+-        teardownSession(true);
+-        syncStateSignals(wasActive, wasStreaming);
+-        Q_EMIT stateChanged();
+-        return;
+-    }
+-
+-    for (const auto &frame : std::as_const(frames)) {
+-        if (frame.kind == ScreenStreamProtocol::FrameKind::ControlEos) {
+-            onPayloadClosed();
++    QByteArray data;
++    while (m_payload && !(data = m_payload->read(kPayloadReadChunkBytes)).isEmpty()) {
++        QList<ScreenStreamProtocol::ScreenStreamFrame> frames;
++        if (!m_parser.feed(data, &frames)) {
++            const QString err = m_parser.errorString();
++            qCWarning(KDECONNECT_PLUGIN_SCREENSTREAM) << "Closing corrupted stream payload:" << err;
++            const bool wasActive = active();
++            const bool wasStreaming = isStreaming();
++            setLastError(err);
++            m_session.onPeerState(ScreenStreamProtocol::ScreenStreamSessionMachine::State::Error, false);
++            teardownSession(true);
++            syncStateSignals(wasActive, wasStreaming);
++            Q_EMIT stateChanged();
+             return;
+         }
+-        enqueueOrSendFrame(frame);
++
++        for (const auto &frame : std::as_const(frames)) {
++            if (frame.kind == ScreenStreamProtocol::FrameKind::ControlEos) {
++                onPayloadClosed();
++                return;
++            }
++            enqueueOrSendFrame(frame);
++        }
+     }
+ }
+ 
+@@ -593,7 +663,11 @@ void ScreenStreamPlugin::enqueueOrSendFrame(const ScreenStreamProtocol::ScreenSt
+     }
+ 
+     if (m_viewerSocket && m_viewerSocket->state() == QLocalSocket::ConnectedState) {
+-        if (m_viewerSocket->bytesToWrite() < kMaxViewerWriteQueueBytes) {
++        const qint64 pendingBytes = m_viewerSocket->bytesToWrite();
++        if (pendingBytes >= kMaxHardViewerWriteQueueBytes) {
++            return;
++        }
++        if (pendingBytes < kMaxViewerWriteQueueBytes) {
+             m_viewerSocket->write(encoded);
+         } else if (frame.kind == ScreenStreamProtocol::FrameKind::CodecConfig
+                    || (frame.flags & ScreenStreamProtocol::FlagKeyframe) != 0) {
+diff --git a/plugins/screenstream/screenstreamplugin.h b/plugins/screenstream/screenstreamplugin.h
+index 583e419805d9b53e2d7976ece322266aa49fab8b..e156695e67ffcbf0a0d7f3f58104028ae4c92aff 100644
+--- a/plugins/screenstream/screenstreamplugin.h
++++ b/plugins/screenstream/screenstreamplugin.h
+@@ -94,7 +94,7 @@ private:
+     void setLastError(const QString &error);
+     void syncStateSignals(bool wasActive, bool wasStreaming);
+     void scheduleReconnectIfNeeded();
+-    void sendStartPacket();
++    bool sendStartPacket();
+     void enqueueOrSendFrame(const ScreenStreamProtocol::ScreenStreamFrame &frame);
+     void flushPendingFrames();
+ 
+diff --git a/plugins/screenstream/screenstreamprotocol.cpp b/plugins/screenstream/screenstreamprotocol.cpp
+index f3e1f4facc23984a0ed619672528da0814933100..834ed04deda6538830d55ab774c7946b76ae371b 100644
+--- a/plugins/screenstream/screenstreamprotocol.cpp
++++ b/plugins/screenstream/screenstreamprotocol.cpp
+@@ -19,6 +19,7 @@ namespace ScreenStreamProtocol
+ namespace
+ {
+ inline constexpr int kReconnectDelaysMs[] = {2000, 4000, 8000};
++inline constexpr qsizetype kMaxParserBufferBytes = static_cast<qsizetype>(ScreenStreamProtocol::kMaxVideoFrameBytes * 2U) + ScreenStreamProtocol::kScreenStreamHeaderBytes;
+ }
+ 
+ bool isValidFrameKind(quint8 rawKind, FrameKind *outKind)
+@@ -54,9 +55,9 @@ bool isValidPayloadLength(FrameKind kind, quint32 length)
+     switch (kind) {
+     case FrameKind::CodecConfig:
+     case FrameKind::VideoAccessUnit:
+-        return length <= kMaxVideoFrameBytes;
++        return length > 0 && length <= kMaxVideoFrameBytes;
+     case FrameKind::AudioPcmChunk:
+-        return length <= kMaxAudioChunkBytes;
++        return length > 0 && length <= kMaxAudioChunkBytes;
+     case FrameKind::ControlEos:
+         return length == 0;
+     }
+@@ -88,11 +89,16 @@ bool ScreenStreamFrameParser::feed(const QByteArray &chunk, QList<ScreenStreamFr
+         return false;
+     }
+     if (!chunk.isEmpty()) {
++        if (m_buffer.size() + chunk.size() > kMaxParserBufferBytes) {
++            setError(QStringLiteral("Incoming screen stream buffer exceeded maximum protocol limit"));
++            return false;
++        }
+         m_buffer.append(chunk);
+     }
+ 
+-    while (m_buffer.size() >= kScreenStreamHeaderBytes) {
+-        const auto *hdr = reinterpret_cast<const uchar *>(m_buffer.constData());
++    qsizetype pos = 0;
++    while (m_buffer.size() - pos >= kScreenStreamHeaderBytes) {
++        const auto *hdr = reinterpret_cast<const uchar *>(m_buffer.constData() + pos);
+         const quint16 magic = qFromBigEndian<quint16>(hdr);
+         if (magic != kScreenStreamMagic) {
+             setError(QStringLiteral("Invalid stream frame magic header"));
+@@ -118,7 +124,7 @@ bool ScreenStreamFrameParser::feed(const QByteArray &chunk, QList<ScreenStreamFr
+         }
+ 
+         const qsizetype totalNeeded = static_cast<qsizetype>(kScreenStreamHeaderBytes) + static_cast<qsizetype>(payloadLength);
+-        if (m_buffer.size() < totalNeeded) {
++        if (m_buffer.size() - pos < totalNeeded) {
+             break;
+         }
+ 
+@@ -127,15 +133,19 @@ bool ScreenStreamFrameParser::feed(const QByteArray &chunk, QList<ScreenStreamFr
+         frame.flags = flags;
+         frame.ptsUs = qFromBigEndian<quint64>(hdr + 8);
+         if (payloadLength > 0) {
+-            frame.payload = m_buffer.mid(kScreenStreamHeaderBytes, static_cast<qsizetype>(payloadLength));
++            frame.payload = QByteArray(m_buffer.constData() + pos + kScreenStreamHeaderBytes, static_cast<qsizetype>(payloadLength));
+         }
+ 
+-        m_buffer.remove(0, totalNeeded);
++        pos += totalNeeded;
+         if (outFrames) {
+             outFrames->append(std::move(frame));
+         }
+     }
+ 
++    if (pos > 0) {
++        m_buffer.remove(0, pos);
++    }
++
+     return true;
+ }
+ 
+@@ -323,6 +333,14 @@ bool ScreenStreamSessionMachine::shouldAutoStartOnConnect() const
+     return m_autoStartEnabled && !m_explicitStop;
+ }
+ 
++bool ScreenStreamSessionMachine::shouldAcceptStreamOpen(bool stopping) const
++{
++    if (stopping) {
++        return false;
++    }
++    return !(m_state == State::Stopped && m_explicitStop);
++}
++
+ int ScreenStreamSessionMachine::consumeReconnectDelayMs()
+ {
+     if (m_explicitStop) {
+diff --git a/plugins/screenstream/screenstreamprotocol.h b/plugins/screenstream/screenstreamprotocol.h
+index 0ca3ac2a174a41a51cd28d749fdc2e935b505ae7..9fa4c78eefda6dd43aab9b1110cafd4c60c20913 100644
+--- a/plugins/screenstream/screenstreamprotocol.h
++++ b/plugins/screenstream/screenstreamprotocol.h
+@@ -137,6 +137,7 @@ public:
+     void onTransportLost();
+ 
+     bool shouldAutoStartOnConnect() const;
++    bool shouldAcceptStreamOpen(bool stopping) const;
+     int consumeReconnectDelayMs();
+     bool canForwardInput() const;
+ 
+diff --git a/plugins/screenstream/viewer/gstvideodecoder.cpp b/plugins/screenstream/viewer/gstvideodecoder.cpp
+index 5de000e09a945607c74e92071af6560971359d73..63da3b1076d6d651c596c793233ff2ad354dfad0 100644
+--- a/plugins/screenstream/viewer/gstvideodecoder.cpp
++++ b/plugins/screenstream/viewer/gstvideodecoder.cpp
+@@ -76,25 +76,35 @@ struct ScreenStreamVideoDecoder::Private {
+         if (caps && buffer) {
+             GstVideoInfo vinfo;
+             if (gst_video_info_from_caps(&vinfo, caps) && GST_VIDEO_INFO_WIDTH(&vinfo) > 0 && GST_VIDEO_INFO_HEIGHT(&vinfo) > 0) {
+-                GstMapInfo map;
+-                if (gst_buffer_map(buffer, &map, GST_MAP_READ)) {
+-                    const int width = GST_VIDEO_INFO_WIDTH(&vinfo);
+-                    const int height = GST_VIDEO_INFO_HEIGHT(&vinfo);
+-                    const int stride = GST_VIDEO_INFO_PLANE_STRIDE(&vinfo, 0);
+-                    QImage img(map.data, width, height, stride, QImage::Format_RGBA8888);
+-                    QImage detached = img.copy();
+-                    gst_buffer_unmap(buffer, &map);
+-
+-                    QPointer<ScreenStreamVideoDecoder> target(self->q);
+-                    if (target) {
+-                        QMetaObject::invokeMethod(
+-                            target.data(),
+-                            [target, detached]() {
+-                                if (target) {
+-                                    Q_EMIT target->frameDecoded(detached);
+-                                }
+-                            },
+-                            Qt::QueuedConnection);
++                GstVideoFrame vframe;
++                if (gst_video_frame_map(&vframe, &vinfo, buffer, GST_MAP_READ)) {
++                    const int width = GST_VIDEO_FRAME_WIDTH(&vframe);
++                    const int height = GST_VIDEO_FRAME_HEIGHT(&vframe);
++                    const int stride = GST_VIDEO_FRAME_PLANE_STRIDE(&vframe, 0);
++                    const auto *planeData = static_cast<const uchar *>(GST_VIDEO_FRAME_PLANE_DATA(&vframe, 0));
++                    const gsize neededBytes = (width > 0 && height > 0 && stride >= width * 4)
++                        ? static_cast<gsize>(stride) * static_cast<gsize>(height - 1) + static_cast<gsize>(width) * 4U
++                        : 0U;
++
++                    QImage detached;
++                    if (planeData && neededBytes > 0U && vframe.info.size >= neededBytes) {
++                        QImage img(planeData, width, height, stride, QImage::Format_RGBA8888);
++                        detached = img.copy();
++                    }
++                    gst_video_frame_unmap(&vframe);
++
++                    if (!detached.isNull()) {
++                        QPointer<ScreenStreamVideoDecoder> target(self->q);
++                        if (target) {
++                            QMetaObject::invokeMethod(
++                                target.data(),
++                                [target, detached]() {
++                                    if (target) {
++                                        Q_EMIT target->frameDecoded(detached);
++                                    }
++                                },
++                                Qt::QueuedConnection);
++                        }
+                     }
+                 }
+             }
+diff --git a/plugins/screenstream/viewer/viewerwindow.cpp b/plugins/screenstream/viewer/viewerwindow.cpp
+index 132f3c46d68cf482afbf306acc5374ad31f1c72e..d5553c39af462a7931ea52cd6ea7b0442ad3b149 100644
+--- a/plugins/screenstream/viewer/viewerwindow.cpp
++++ b/plugins/screenstream/viewer/viewerwindow.cpp
+@@ -182,6 +182,9 @@ void ScreenCanvasWidget::mouseReleaseEvent(QMouseEvent *event)
+         return;
+     }
+     if (event->button() == Qt::LeftButton) {
++        if (!m_leftButtonDown) {
++            return;
++        }
+         const auto mapped = mapEventPos(event->position());
+         if (m_holdActive) {
+             if (m_dragMoved && mapped.has_value()) {
+@@ -271,6 +274,16 @@ ViewerWindow::ViewerWindow(const ViewerLaunchConfig &config, QWidget *parent)
+     connect(m_socket, &QLocalSocket::connected, this, &ViewerWindow::onSocketConnected);
+     connect(m_socket, &QLocalSocket::readyRead, this, &ViewerWindow::onSocketReadyRead);
+     connect(m_socket, &QLocalSocket::disconnected, this, &ViewerWindow::onSocketDisconnected);
++    connect(m_socket, &QLocalSocket::errorOccurred, this, [this](QLocalSocket::LocalSocketError) {
++        if (m_closing) {
++            return;
++        }
++        m_sessionActive = false;
++        if (m_socket) {
++            m_decoderError = m_socket->errorString();
++        }
++        updateBannerAndInputGate();
++    });
+ 
+     updateBannerAndInputGate();
+     m_socket->connectToServer(m_config.socketPath);
+@@ -434,6 +447,12 @@ void ViewerWindow::refreshDbusProperties()
+     m_accessibilityEnabled = m_screenstreamIface->property("accessibilityEnabled").toBool();
+     m_audioAvailable = m_screenstreamIface->property("audioAvailable").toBool();
+     m_audioReason = m_screenstreamIface->property("audioReason").toString();
++    if (m_socket && m_socket->state() == QLocalSocket::ConnectedState) {
++        const QVariant streamingProp = m_screenstreamIface->property("isStreaming");
++        if (streamingProp.isValid()) {
++            m_sessionActive = streamingProp.toBool();
++        }
++    }
+ 
+     const int dw = m_screenstreamIface->property("displayWidth").toInt();
+     const int dh = m_screenstreamIface->property("displayHeight").toInt();
+@@ -548,7 +567,7 @@ void ViewerWindow::onSocketConnected()
+     if (m_closing) {
+         return;
+     }
+-    updateBannerAndInputGate();
++    refreshDbusProperties();
+ }
+ 
+ void ViewerWindow::onSocketReadyRead()
+diff --git a/tests/screenstreamtest.cpp b/tests/screenstreamtest.cpp
+index 0b9cd1fdb31188a8b3d3593af25d1bc16b3b7c0b..b467675e3272ca2219251d53e064bd725ed74563 100644
+--- a/tests/screenstreamtest.cpp
++++ b/tests/screenstreamtest.cpp
+@@ -120,6 +120,41 @@ private Q_SLOTS:
+             QVERIFY(!parser.feed(makeHeader(kScreenStreamMagic, 0x02, 0x04, 4, 0), &out));
+             QVERIFY(parser.hasError());
+         }
++        {
++            ScreenStreamFrameParser parser;
++            QList<ScreenStreamFrame> out;
++            QVERIFY(!parser.feed(makeHeader(kScreenStreamMagic, 0x01, 0x00, 0, 0), &out));
++            QVERIFY(parser.hasError());
++        }
++        {
++            ScreenStreamFrameParser parser;
++            QList<ScreenStreamFrame> out;
++            QVERIFY(!parser.feed(makeHeader(kScreenStreamMagic, 0x02, 0x01, 0, 0), &out));
++            QVERIFY(parser.hasError());
++        }
++        {
++            ScreenStreamFrameParser parser;
++            QList<ScreenStreamFrame> out;
++            QVERIFY(!parser.feed(makeHeader(kScreenStreamMagic, 0x03, 0x00, 0, 0), &out));
++            QVERIFY(parser.hasError());
++        }
++    }
++
++    void testFrameParserBatchFeedTenThousandFrames()
++    {
++        const QByteArray payload(8, '\x55');
++        const QByteArray oneFrame = encodeScreenStreamFrame(FrameKind::AudioPcmChunk, FlagNone, 1234ULL, payload);
++        QByteArray burst;
++        burst.reserve(oneFrame.size() * 10000);
++        for (int i = 0; i < 10000; ++i) {
++            burst.append(oneFrame);
++        }
++
++        ScreenStreamFrameParser parser;
++        QList<ScreenStreamFrame> frames;
++        QVERIFY(parser.feed(burst, &frames));
++        QVERIFY(!parser.hasError());
++        QCOMPARE(frames.size(), 10000);
+     }
+ 
+     void testCoordinateMapperLetterboxPillarboxAndClamp()
+@@ -160,6 +195,21 @@ private Q_SLOTS:
+         const auto br = ScreenStreamCoordinateMapper::mapViewportToRemote(bottomRightInside, tallViewport, streamLandscape, displayLandscape);
+         QVERIFY(br.has_value());
+         QCOMPARE(*br, QPoint(displayLandscape.width() - 1, displayLandscape.height() - 1));
++
++        // Regression S1: downscaled stream (864x1920 and rotated 1920x864) must map to physical 1080x2400 / 2400x1080 display coordinates.
++        const QSize physicalPortrait(1080, 2400);
++        const QSize downscaledPortrait(864, 1920);
++        const auto pCenter = ScreenStreamCoordinateMapper::mapViewportToRemote(QPointF(432.0, 960.0), QSizeF(864.0, 1920.0), downscaledPortrait, physicalPortrait);
++        QVERIFY(pCenter.has_value());
++        QVERIFY(qAbs(pCenter->x() - 540) <= 1);
++        QVERIFY(qAbs(pCenter->y() - 1200) <= 1);
++
++        const QSize physicalLandscape(2400, 1080);
++        const QSize downscaledLandscape(1920, 864);
++        const auto lBottomRight = ScreenStreamCoordinateMapper::mapViewportToRemote(
++            QPointF(1919.9, 863.9), QSizeF(1920.0, 864.0), downscaledLandscape, physicalLandscape);
++        QVERIFY(lBottomRight.has_value());
++        QCOMPARE(*lBottomRight, QPoint(2399, 1079));
+     }
+ 
+     void testComputeTargetCanvasSizeAutoFit()
+@@ -223,6 +273,13 @@ private Q_SLOTS:
+         reconnected.configure(true, sm.explicitStop());
+         QVERIFY(!reconnected.shouldAutoStartOnConnect());
+         QCOMPARE(reconnected.consumeReconnectDelayMs(), -1);
++        QVERIFY(!reconnected.shouldAcceptStreamOpen(true));
++
++        sm.onLocalExplicitStop();
++        QVERIFY(!sm.shouldAcceptStreamOpen(false));
++        QVERIFY(!sm.shouldAcceptStreamOpen(true));
++        sm.onPeerState(ScreenStreamSessionMachine::State::AwaitingConsent, false);
++        QVERIFY(sm.shouldAcceptStreamOpen(false));
+     }
+ 
+     void testSafePayloadReleaseDuringSignalEmission()

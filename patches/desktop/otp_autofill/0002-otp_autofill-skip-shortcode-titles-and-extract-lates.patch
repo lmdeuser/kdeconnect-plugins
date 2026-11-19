@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 16:09:04 +0500
+Subject: [PATCH 2/3] otp_autofill: skip shortcode titles and extract latest
+ MessagingStyle OTP
+
+
+diff --git a/plugins/notifications/otpcodeextractor.cpp b/plugins/notifications/otpcodeextractor.cpp
+index 94926275361685b51cb1f81a77b66fdd746985e2..cc0a0858d2bb1f24be07efbe5a048396be6f1e6a 100644
+--- a/plugins/notifications/otpcodeextractor.cpp
++++ b/plugins/notifications/otpcodeextractor.cpp
+@@ -98,50 +98,12 @@ bool hasOtpKeywordContext(const QString &text)
+         QRegularExpression::CaseInsensitiveOption | QRegularExpression::UseUnicodePropertiesOption);
+     return ruKeywordRegex.match(text).hasMatch();
+ }
+-}
+ 
+-namespace OtpCodeExtractor
+-{
+-QString extractFromAction(const QString &action)
++QString findFirstCodeCandidate(const QString &segment)
+ {
+-    if (action.isEmpty() || action.size() > MAX_ACTION_LENGTH) {
+-        return {};
+-    }
+-
+-    QString sanitized = action;
+-    sanitized.remove(QChar(0x2063));
+-
+-    static const QRegularExpression actionCodeRegex(QStringLiteral("\\b(\\d{4,10})\\b"));
+-    const QRegularExpressionMatch match = actionCodeRegex.match(sanitized);
+-    return match.hasMatch() ? match.captured(1) : QString();
+-}
+-
+-QString extractFromNotification(const QString &title, const QString &text, const QStringList &actions)
+-{
+-    if (title.size() > MAX_TITLE_LENGTH || text.size() > MAX_TEXT_LENGTH || actions.size() > MAX_ACTIONS_COUNT) {
+-        return {};
+-    }
+-
+-    for (const QString &action : actions) {
+-        const QString code = extractFromAction(action);
+-        if (!code.isEmpty()) {
+-            return code;
+-        }
+-    }
+-
+-    QString cleanTitle = title;
+-    cleanTitle.remove(QChar(0x2063));
+-    QString cleanText = text;
+-    cleanText.remove(QChar(0x2063));
+-
+-    const QString combined = cleanTitle + QLatin1Char('\n') + cleanText;
+-    if (!hasOtpKeywordContext(combined)) {
+-        return {};
+-    }
+-
+-    const QList<QPair<int, int>> phoneSpans = findPhoneSpans(combined);
++    const QList<QPair<int, int>> phoneSpans = findPhoneSpans(segment);
+     static const QRegularExpression candidateRegex(QStringLiteral("(\\d{3}[-\\s]\\d{3}|\\d{4,8})"));
+-    QRegularExpressionMatchIterator it = candidateRegex.globalMatch(combined);
++    QRegularExpressionMatchIterator it = candidateRegex.globalMatch(segment);
+ 
+     while (it.hasNext()) {
+         const QRegularExpressionMatch match = it.next();
+@@ -153,30 +115,30 @@ QString extractFromNotification(const QString &title, const QString &text, const
+         }
+ 
+         if (start > 0) {
+-            const QChar prev = combined.at(start - 1);
++            const QChar prev = segment.at(start - 1);
+             if (prev.isDigit() || prev.isLetter() || prev == QLatin1Char('+') || isCurrencyChar(prev)) {
+                 continue;
+             }
+             if ((prev == QLatin1Char('-') || prev == QLatin1Char('.') || prev == QLatin1Char(','))
+-                && start >= 2 && combined.at(start - 2).isDigit()) {
++                && start >= 2 && segment.at(start - 2).isDigit()) {
+                 continue;
+             }
+         }
+-        if (hasCurrencyPrefix(combined, start)) {
++        if (hasCurrencyPrefix(segment, start)) {
+             continue;
+         }
+ 
+-        if (end < combined.size()) {
+-            const QChar next = combined.at(end);
++        if (end < segment.size()) {
++            const QChar next = segment.at(end);
+             if (next.isDigit() || next.isLetter() || next == QLatin1Char('%')) {
+                 continue;
+             }
+             if ((next == QLatin1Char('-') || next == QLatin1Char('.') || next == QLatin1Char(','))
+-                && end + 1 < combined.size() && combined.at(end + 1).isDigit()) {
++                && end + 1 < segment.size() && segment.at(end + 1).isDigit()) {
+                 continue;
+             }
+         }
+-        if (hasCurrencySuffix(combined, end)) {
++        if (hasCurrencySuffix(segment, end)) {
+             continue;
+         }
+ 
+@@ -207,3 +169,65 @@ QString extractFromNotification(const QString &title, const QString &text, const
+     return {};
+ }
+ }
++
++namespace OtpCodeExtractor
++{
++QString extractFromAction(const QString &action)
++{
++    if (action.isEmpty() || action.size() > MAX_ACTION_LENGTH) {
++        return {};
++    }
++
++    QString sanitized = action;
++    sanitized.remove(QChar(0x2063));
++
++    static const QRegularExpression actionCodeRegex(QStringLiteral("\\b(\\d{4,10})\\b"));
++    const QRegularExpressionMatch match = actionCodeRegex.match(sanitized);
++    return match.hasMatch() ? match.captured(1) : QString();
++}
++
++QString extractFromNotification(const QString &title, const QString &text, const QStringList &actions)
++{
++    if (title.size() > MAX_TITLE_LENGTH || text.size() > MAX_TEXT_LENGTH || actions.size() > MAX_ACTIONS_COUNT) {
++        return {};
++    }
++
++    for (const QString &action : actions) {
++        const QString code = extractFromAction(action);
++        if (!code.isEmpty()) {
++            return code;
++        }
++    }
++
++    QString cleanTitle = title;
++    cleanTitle.remove(QChar(0x2063));
++    QString cleanText = text;
++    cleanText.remove(QChar(0x2063));
++
++    static const QRegularExpression brSplitRegex(QStringLiteral("<br\\s*/?>"), QRegularExpression::CaseInsensitiveOption);
++    static const QRegularExpression boldSenderRegex(
++        QStringLiteral("<b>.*?</b>\\s*"),
++        QRegularExpression::CaseInsensitiveOption | QRegularExpression::DotMatchesEverythingOption);
++
++    const QStringList rawSegments = cleanText.split(brSplitRegex, Qt::SkipEmptyParts);
++    for (qsizetype i = rawSegments.size() - 1; i >= 0; --i) {
++        QString seg = rawSegments.at(i);
++        seg.remove(boldSenderRegex);
++        const bool segmentHasContext = hasOtpKeywordContext(seg)
++            || (rawSegments.size() == 1 && hasOtpKeywordContext(cleanTitle));
++        if (!segmentHasContext) {
++            continue;
++        }
++        const QString candidate = findFirstCodeCandidate(seg);
++        if (!candidate.isEmpty()) {
++            return candidate;
++        }
++    }
++
++    if (hasOtpKeywordContext(cleanTitle)) {
++        return findFirstCodeCandidate(cleanTitle);
++    }
++
++    return {};
++}
++}
+diff --git a/tests/otpextractortest.cpp b/tests/otpextractortest.cpp
+index 29cd021b371e66efaf40e1e42a86cfa202062b8e..04a1623382b6a99acb2b745cbf8d048e072a31a3 100644
+--- a/tests/otpextractortest.cpp
++++ b/tests/otpextractortest.cpp
+@@ -61,6 +61,25 @@ private Q_SLOTS:
+         QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Bank"), QStringLiteral("Verify charge $4500")).isEmpty());
+         QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Notice"), QStringLiteral("Verification policy updated for 2026")).isEmpty());
+         QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("Shop"), QStringLiteral("Order 482910 shipped")).isEmpty());
++        QVERIFY(OtpCodeExtractor::extractFromNotification(QStringLiteral("32665"), QStringLiteral("Please verify your account")).isEmpty());
++    }
++
++    void testShortcodeTitleAndMultiMessageMessagingStyle()
++    {
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(QStringLiteral("32665"), QStringLiteral("Your verification code is 482910."), {}),
++                 QStringLiteral("482910"));
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(QStringLiteral("22000"), QStringLiteral("G-123456 is your Google verification code."), {}),
++                 QStringLiteral("123456"));
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(
++                     QStringLiteral("Messages"),
++                     QStringLiteral("<b>32665</b>\nYour verification code is 111222<br/>Your verification code is 999888"),
++                     {}),
++                 QStringLiteral("999888"));
++        QCOMPARE(OtpCodeExtractor::extractFromNotification(
++                     QStringLiteral("Verification code: 482910"),
++                     QStringLiteral("Tap to view"),
++                     {}),
++                 QStringLiteral("482910"));
+     }
+ 
+     void testRejectsOversizedInputs()

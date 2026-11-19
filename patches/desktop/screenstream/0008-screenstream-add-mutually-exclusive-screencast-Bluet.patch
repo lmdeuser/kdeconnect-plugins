@@ -1,0 +1,469 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 20:52:13 +0500
+Subject: [PATCH 8/8] screenstream: add mutually exclusive screencast/Bluetooth
+ audio toggle
+
+
+diff --git a/plugins/screenstream/screenstreamplugin.cpp b/plugins/screenstream/screenstreamplugin.cpp
+index a7da5edd66980c01df10a4858bbaa50a0d08ac80..b6fb90545d60216e529e667a1b92f6da30ff2585 100644
+--- a/plugins/screenstream/screenstreamplugin.cpp
++++ b/plugins/screenstream/screenstreamplugin.cpp
+@@ -90,6 +90,11 @@ QString ScreenStreamPlugin::audioReason() const
+     return m_audioReason;
+ }
+ 
++bool ScreenStreamPlugin::audioEnabled() const
++{
++    return m_sessionAudioEnabled;
++}
++
+ bool ScreenStreamPlugin::accessibilityEnabled() const
+ {
+     return m_accessibilityEnabled;
+@@ -130,6 +135,9 @@ void ScreenStreamPlugin::onConfigChanged()
+     m_explicitStop = config()->getBool(QStringLiteral("explicitStop"), false);
+     m_autoStart = config()->getBool(QStringLiteral("autoStart"), false);
+     m_requestAudio = config()->getBool(QStringLiteral("requestAudio"), true);
++    if (!active()) {
++        m_sessionAudioEnabled = m_requestAudio;
++    }
+     m_maxWidth = std::clamp(config()->getInt(QStringLiteral("maxWidth"), 1920), 320, 3840);
+     m_maxHeight = std::clamp(config()->getInt(QStringLiteral("maxHeight"), 1920), 320, 3840);
+     m_maxFps = std::clamp(config()->getInt(QStringLiteral("maxFps"), 60), 5, 60);
+@@ -176,6 +184,10 @@ bool ScreenStreamPlugin::startStream()
+     setLastError(QString());
+     m_explicitStop = false;
+     config()->set(QStringLiteral("explicitStop"), false);
++    if (m_sessionAudioEnabled != m_requestAudio) {
++        m_sessionAudioEnabled = m_requestAudio;
++        Q_EMIT audioEnabledChanged(m_sessionAudioEnabled);
++    }
+ 
+     m_session.setRemoteControlAllowed(device()->isPluginEnabled(QStringLiteral("kdeconnect_remotecontrol")));
+     m_session.onExplicitStart();
+@@ -194,7 +206,7 @@ bool ScreenStreamPlugin::startStream()
+ 
+ bool ScreenStreamPlugin::sendStartPacket()
+ {
+-    const QVariantMap body = ScreenStreamProtocol::buildStartRequestBody(m_maxWidth, m_maxHeight, m_maxFps, m_maxBitrateKbps, m_requestAudio);
++    const QVariantMap body = ScreenStreamProtocol::buildStartRequestBody(m_maxWidth, m_maxHeight, m_maxFps, m_maxBitrateKbps, m_sessionAudioEnabled);
+     NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST, body);
+     return sendPacket(np);
+ }
+@@ -233,6 +245,25 @@ void ScreenStreamPlugin::requestKeyframe()
+     sendPacket(np);
+ }
+ 
++void ScreenStreamPlugin::setAudioEnabled(bool enabled)
++{
++    if (m_sessionAudioEnabled != enabled) {
++        m_sessionAudioEnabled = enabled;
++        Q_EMIT audioEnabledChanged(enabled);
++    }
++
++    if (peerSupportsScreenStream() && active()) {
++        NetworkPacket np(PACKET_TYPE_SCREENSTREAM_REQUEST, ScreenStreamProtocol::buildSetAudioEnabledRequestBody(enabled));
++        sendPacket(np);
++    }
++
++    if (!enabled) {
++        m_audioAvailable = false;
++        m_audioReason = QStringLiteral("bluetooth_routed");
++        Q_EMIT audioStatusChanged(false, m_audioReason);
++    }
++}
++
+ bool ScreenStreamPlugin::wakeScreen()
+ {
+     if (!peerSupportsScreenStream()) {
+@@ -299,6 +330,15 @@ void ScreenStreamPlugin::receivePacket(const NetworkPacket &np)
+ 
+         m_audioAvailable = np.get<bool>(QStringLiteral("audioAvailable"), false);
+         m_audioReason = np.get<QString>(QStringLiteral("audioReason"));
++        const bool nextAudioEnabled = m_audioAvailable
++            ? true
++            : ((m_audioReason == QLatin1String("bluetooth_routed") || m_audioReason == QLatin1String("disabled_by_user"))
++                   ? false
++                   : m_sessionAudioEnabled);
++        if (nextAudioEnabled != m_sessionAudioEnabled) {
++            m_sessionAudioEnabled = nextAudioEnabled;
++            Q_EMIT audioEnabledChanged(m_sessionAudioEnabled);
++        }
+         m_accessibilityEnabled = np.get<bool>(QStringLiteral("accessibilityEnabled"), false);
+         const int dw = np.get<int>(QStringLiteral("displayWidth"), 0);
+         const int dh = np.get<int>(QStringLiteral("displayHeight"), 0);
+diff --git a/plugins/screenstream/screenstreamplugin.h b/plugins/screenstream/screenstreamplugin.h
+index e156695e67ffcbf0a0d7f3f58104028ae4c92aff..0c8459c9a40a584d38909ae76fe2a5c316043cd3 100644
+--- a/plugins/screenstream/screenstreamplugin.h
++++ b/plugins/screenstream/screenstreamplugin.h
+@@ -35,6 +35,7 @@ class ScreenStreamPlugin : public KdeConnectPlugin
+     Q_PROPERTY(QString lastError READ lastError NOTIFY lastErrorChanged)
+     Q_PROPERTY(bool audioAvailable READ audioAvailable NOTIFY audioStatusChanged)
+     Q_PROPERTY(QString audioReason READ audioReason NOTIFY audioStatusChanged)
++    Q_PROPERTY(bool audioEnabled READ audioEnabled NOTIFY audioEnabledChanged)
+     Q_PROPERTY(bool accessibilityEnabled READ accessibilityEnabled NOTIFY stateChanged)
+     Q_PROPERTY(int displayWidth READ displayWidth NOTIFY geometryChanged)
+     Q_PROPERTY(int displayHeight READ displayHeight NOTIFY geometryChanged)
+@@ -52,6 +53,7 @@ public:
+     QString lastError() const;
+     bool audioAvailable() const;
+     QString audioReason() const;
++    bool audioEnabled() const;
+     bool accessibilityEnabled() const;
+     int displayWidth() const;
+     int displayHeight() const;
+@@ -67,6 +69,7 @@ public:
+     Q_SCRIPTABLE void stopStream();
+     Q_SCRIPTABLE bool wakeScreen();
+     Q_SCRIPTABLE void requestKeyframe();
++    Q_SCRIPTABLE void setAudioEnabled(bool enabled);
+ 
+ Q_SIGNALS:
+     Q_SCRIPTABLE void activeChanged();
+@@ -74,6 +77,7 @@ Q_SIGNALS:
+     Q_SCRIPTABLE void stateChanged();
+     Q_SCRIPTABLE void lastErrorChanged();
+     Q_SCRIPTABLE void audioStatusChanged(bool available, const QString &reason);
++    Q_SCRIPTABLE void audioEnabledChanged(bool enabled);
+     Q_SCRIPTABLE void geometryChanged(int width, int height, int rotation);
+ 
+ private Q_SLOTS:
+@@ -116,6 +120,7 @@ private:
+     bool m_explicitStop = false;
+     bool m_autoStart = false;
+     bool m_requestAudio = true;
++    bool m_sessionAudioEnabled = true;
+     bool m_stopping = false;
+ 
+     int m_displayWidth = 0;
+diff --git a/plugins/screenstream/screenstreamprotocol.cpp b/plugins/screenstream/screenstreamprotocol.cpp
+index 0a2f4684217687e5ad8fc17de06bc445554433b9..3f3a7499539fbf53068b047754485599158bf8c9 100644
+--- a/plugins/screenstream/screenstreamprotocol.cpp
++++ b/plugins/screenstream/screenstreamprotocol.cpp
+@@ -422,6 +422,14 @@ QVariantMap buildWakeRequestBody()
+     };
+ }
+ 
++QVariantMap buildSetAudioEnabledRequestBody(bool requestAudio)
++{
++    return QVariantMap{
++        {QStringLiteral("action"), QStringLiteral("set_audio_enabled")},
++        {QStringLiteral("requestAudio"), requestAudio},
++    };
++}
++
+ bool isValidRotation(int rotation)
+ {
+     return rotation == 0 || rotation == 90 || rotation == 180 || rotation == 270;
+diff --git a/plugins/screenstream/screenstreamprotocol.h b/plugins/screenstream/screenstreamprotocol.h
+index 7508982e43a1c721d4a7ab5c3d075201b7121178..fd6241ddf82f6072054721cc5a1bdba6f30456e9 100644
+--- a/plugins/screenstream/screenstreamprotocol.h
++++ b/plugins/screenstream/screenstreamprotocol.h
+@@ -160,6 +160,7 @@ private:
+ 
+ QVariantMap buildStartRequestBody(int maxWidth, int maxHeight, int maxFps, int maxBitrateKbps, bool requestAudio);
+ QVariantMap buildWakeRequestBody();
++QVariantMap buildSetAudioEnabledRequestBody(bool requestAudio);
+ bool isValidRotation(int rotation);
+ void releaseStreamPayloadSafely(QSharedPointer<QIODevice> &payload, QObject *receiver = nullptr);
+ 
+diff --git a/plugins/screenstream/viewer/viewerwindow.cpp b/plugins/screenstream/viewer/viewerwindow.cpp
+index c9b2b7fea361e6d3ba293e18519ce9bcc7b3cd3d..935d2257f6b4ec3bb9728e3cdbab8dee2d7944d9 100644
+--- a/plugins/screenstream/viewer/viewerwindow.cpp
++++ b/plugins/screenstream/viewer/viewerwindow.cpp
+@@ -36,6 +36,7 @@
+ #include <QPainter>
+ #include <QPalette>
+ #include <QScreen>
++#include <QSignalBlocker>
+ #include <QStandardPaths>
+ #include <QTemporaryFile>
+ #include <QTimer>
+@@ -340,9 +341,14 @@ void ViewerWindow::setupUi()
+     auto *stopAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("media-playback-stop")), i18n("Stop"));
+     connect(stopAct, &QAction::triggered, this, &ViewerWindow::onStopClicked);
+ 
++    m_audioRouteAction = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("audio-speakers")), i18n("Audio: Screencast"));
++    m_audioRouteAction->setCheckable(true);
++    connect(m_audioRouteAction, &QAction::toggled, this, &ViewerWindow::onAudioRouteToggled);
++
+     m_muteAction = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("audio-volume-muted")), i18n("Mute Audio"));
+     m_muteAction->setCheckable(true);
+     connect(m_muteAction, &QAction::toggled, this, &ViewerWindow::onMuteToggled);
++    updateAudioRouteUi();
+ 
+     auto *keyframeAct = m_toolbar->addAction(QIcon::fromTheme(QStringLiteral("view-refresh")), i18n("Refresh Keyframe"));
+     connect(keyframeAct, &QAction::triggered, this, &ViewerWindow::onKeyframeClicked);
+@@ -431,6 +437,7 @@ void ViewerWindow::setupDbus()
+     const QString basePath = QStringLiteral("/modules/kdeconnect/devices/%1").arg(m_config.deviceId);
+ 
+     m_screenstreamIface = new QDBusInterface(service, basePath + QStringLiteral("/screenstream"), QStringLiteral("org.kde.kdeconnect.device.screenstream"), bus, this);
++    m_btAudioSwitchIface = new QDBusInterface(service, basePath + QStringLiteral("/btaudioswitch"), QStringLiteral("org.kde.kdeconnect.device.btaudioswitch"), bus, this);
+     m_remoteControlIface = new QDBusInterface(service, basePath + QStringLiteral("/remotecontrol"), QStringLiteral("org.kde.kdeconnect.device.remotecontrol"), bus, this);
+     m_remoteKeyboardIface = new QDBusInterface(service, basePath + QStringLiteral("/remotekeyboard"), QStringLiteral("org.kde.kdeconnect.device.remotekeyboard"), bus, this);
+     m_clipboardIface = new QDBusInterface(service, basePath + QStringLiteral("/clipboard"), QStringLiteral("org.kde.kdeconnect.device.clipboard"), bus, this);
+@@ -448,6 +455,12 @@ void ViewerWindow::setupDbus()
+                 QStringLiteral("audioStatusChanged"),
+                 this,
+                 SLOT(onDbusAudioStatusChanged(bool,QString)));
++    bus.connect(service,
++                basePath + QStringLiteral("/btaudioswitch"),
++                QStringLiteral("org.kde.kdeconnect.device.btaudioswitch"),
++                QStringLiteral("headsetOwnerChanged"),
++                this,
++                SLOT(onDbusHeadsetOwnerChanged(QString,QString,QString)));
+     bus.connect(service,
+                 basePath + QStringLiteral("/screenstream"),
+                 QStringLiteral("org.kde.kdeconnect.device.screenstream"),
+@@ -470,6 +483,27 @@ void ViewerWindow::refreshDbusProperties()
+     m_accessibilityEnabled = m_screenstreamIface->property("accessibilityEnabled").toBool();
+     m_audioAvailable = m_screenstreamIface->property("audioAvailable").toBool();
+     m_audioReason = m_screenstreamIface->property("audioReason").toString();
++    if (!m_audioAvailable && m_audioReason == QLatin1String("bluetooth_routed")) {
++        m_bluetoothAudioMode = true;
++        if (m_audioRouteAction) {
++            const QSignalBlocker blocker(m_audioRouteAction);
++            m_audioRouteAction->setChecked(true);
++        }
++        if (m_audioPlayer) {
++            m_audioPlayer->setMuted(true);
++            m_audioPlayer->stop();
++        }
++    } else if (m_audioAvailable && m_bluetoothAudioMode) {
++        m_bluetoothAudioMode = false;
++        if (m_audioRouteAction) {
++            const QSignalBlocker blocker(m_audioRouteAction);
++            m_audioRouteAction->setChecked(false);
++        }
++        if (m_audioPlayer) {
++            m_audioPlayer->setMuted(m_muteAction && m_muteAction->isChecked());
++        }
++    }
++    updateAudioRouteUi();
+     if (m_socket && m_socket->state() == QLocalSocket::ConnectedState) {
+         const QVariant streamingProp = m_screenstreamIface->property("isStreaming");
+         if (streamingProp.isValid()) {
+@@ -493,6 +527,24 @@ void ViewerWindow::refreshDbusProperties()
+     updateBannerAndInputGate();
+ }
+ 
++void ViewerWindow::updateAudioRouteUi()
++{
++    if (m_audioRouteAction) {
++        if (m_bluetoothAudioMode) {
++            m_audioRouteAction->setIcon(QIcon::fromTheme(QStringLiteral("network-bluetooth")));
++            m_audioRouteAction->setText(i18n("Audio: Bluetooth"));
++            m_audioRouteAction->setToolTip(i18n("Audio output: Bluetooth (click to switch to PC screencast)"));
++        } else {
++            m_audioRouteAction->setIcon(QIcon::fromTheme(QStringLiteral("audio-speakers")));
++            m_audioRouteAction->setText(i18n("Audio: Screencast"));
++            m_audioRouteAction->setToolTip(i18n("Audio output: PC screencast (click to switch to Bluetooth)"));
++        }
++    }
++    if (m_muteAction) {
++        m_muteAction->setEnabled(!m_bluetoothAudioMode);
++    }
++}
++
+ void ViewerWindow::updateBannerAndInputGate()
+ {
+     if (m_closing || !m_canvas || !m_banner) {
+@@ -518,7 +570,7 @@ void ViewerWindow::updateBannerAndInputGate()
+     if (m_protectedContentActive) {
+         notices << i18n("Protected content is currently displayed on Android and masked from capture.");
+     }
+-    if (!m_audioAvailable && !m_audioReason.isEmpty()) {
++    if (!m_audioAvailable && !m_audioReason.isEmpty() && !m_bluetoothAudioMode && m_audioReason != QLatin1String("bluetooth_routed")) {
+         notices << i18n("Audio unavailable: %1", m_audioReason);
+     }
+     if (!allowInput && m_sessionActive) {
+@@ -795,7 +847,7 @@ void ViewerWindow::onSocketReadyRead()
+             break;
+         }
+         case ScreenStreamProtocol::FrameKind::AudioPcmChunk:
+-            if (m_audioPlayer) {
++            if (m_audioPlayer && !m_bluetoothAudioMode) {
+                 m_audioPlayer->writePcm(frame.payload);
+             }
+             break;
+@@ -855,10 +907,46 @@ void ViewerWindow::onStopClicked()
+     close();
+ }
+ 
++void ViewerWindow::onAudioRouteToggled(bool bluetoothMode)
++{
++    m_bluetoothAudioMode = bluetoothMode;
++    updateAudioRouteUi();
++    updateBannerAndInputGate();
++
++    if (bluetoothMode) {
++        if (m_audioPlayer) {
++            m_audioPlayer->setMuted(true);
++            m_audioPlayer->stop();
++        }
++        if (m_screenstreamIface && m_screenstreamIface->isValid()) {
++            m_screenstreamIface->asyncCall(QStringLiteral("setAudioEnabled"), false);
++        }
++        if (m_btAudioSwitchIface && m_btAudioSwitchIface->isValid()) {
++            const QStringList macs = m_btAudioSwitchIface->property("allowedHeadsetMacs").toStringList();
++            for (const QString &mac : macs) {
++                m_btAudioSwitchIface->asyncCall(QStringLiteral("releaseHeadset"), mac);
++            }
++        }
++    } else {
++        if (m_audioPlayer) {
++            m_audioPlayer->setMuted(m_muteAction && m_muteAction->isChecked());
++        }
++        if (m_btAudioSwitchIface && m_btAudioSwitchIface->isValid()) {
++            const QStringList macs = m_btAudioSwitchIface->property("allowedHeadsetMacs").toStringList();
++            for (const QString &mac : macs) {
++                m_btAudioSwitchIface->asyncCall(QStringLiteral("claimHeadset"), mac, QStringLiteral("manual"));
++            }
++        }
++        if (m_screenstreamIface && m_screenstreamIface->isValid()) {
++            m_screenstreamIface->asyncCall(QStringLiteral("setAudioEnabled"), true);
++        }
++    }
++}
++
+ void ViewerWindow::onMuteToggled(bool checked)
+ {
+     if (m_audioPlayer) {
+-        m_audioPlayer->setMuted(checked);
++        m_audioPlayer->setMuted(checked || m_bluetoothAudioMode);
+     }
+ }
+ 
+@@ -943,9 +1031,56 @@ void ViewerWindow::onDbusAudioStatusChanged(bool available, const QString &reaso
+     }
+     m_audioAvailable = available;
+     m_audioReason = reason;
++    if (!available && reason == QLatin1String("bluetooth_routed")) {
++        m_bluetoothAudioMode = true;
++        if (m_audioRouteAction) {
++            const QSignalBlocker blocker(m_audioRouteAction);
++            m_audioRouteAction->setChecked(true);
++        }
++        if (m_audioPlayer) {
++            m_audioPlayer->setMuted(true);
++            m_audioPlayer->stop();
++        }
++        updateAudioRouteUi();
++    } else if (available && m_bluetoothAudioMode) {
++        m_bluetoothAudioMode = false;
++        if (m_audioRouteAction) {
++            const QSignalBlocker blocker(m_audioRouteAction);
++            m_audioRouteAction->setChecked(false);
++        }
++        if (m_audioPlayer) {
++            m_audioPlayer->setMuted(m_muteAction && m_muteAction->isChecked());
++        }
++        updateAudioRouteUi();
++    }
+     updateBannerAndInputGate();
+ }
+ 
++void ViewerWindow::onDbusHeadsetOwnerChanged(const QString &mac, const QString &owner, const QString &reason)
++{
++    Q_UNUSED(mac)
++    Q_UNUSED(reason)
++    if (m_closing) {
++        return;
++    }
++    if (owner == QLatin1String("remote") && !m_bluetoothAudioMode) {
++        m_bluetoothAudioMode = true;
++        if (m_audioRouteAction) {
++            const QSignalBlocker blocker(m_audioRouteAction);
++            m_audioRouteAction->setChecked(true);
++        }
++        if (m_audioPlayer) {
++            m_audioPlayer->setMuted(true);
++            m_audioPlayer->stop();
++        }
++        if (m_screenstreamIface && m_screenstreamIface->isValid()) {
++            m_screenstreamIface->asyncCall(QStringLiteral("setAudioEnabled"), false);
++        }
++        updateAudioRouteUi();
++        updateBannerAndInputGate();
++    }
++}
++
+ void ViewerWindow::onDbusStateChanged()
+ {
+     if (m_closing) {
+diff --git a/plugins/screenstream/viewer/viewerwindow.h b/plugins/screenstream/viewer/viewerwindow.h
+index 55b654a3d3dce50953ed721cfc1cf9711e34c8d0..d2120ee5500175874ecb7bf5262baf190abd2cfc 100644
+--- a/plugins/screenstream/viewer/viewerwindow.h
++++ b/plugins/screenstream/viewer/viewerwindow.h
+@@ -112,6 +112,7 @@ private Q_SLOTS:
+     void onDecoderError(const QString &message);
+ 
+     void onStopClicked();
++    void onAudioRouteToggled(bool bluetoothMode);
+     void onMuteToggled(bool checked);
+     void onKeyframeClicked();
+     void onWakeScreenClicked();
+@@ -121,6 +122,7 @@ private Q_SLOTS:
+ 
+     void onDbusGeometryChanged(int width, int height, int rotation);
+     void onDbusAudioStatusChanged(bool available, const QString &reason);
++    void onDbusHeadsetOwnerChanged(const QString &mac, const QString &owner, const QString &reason);
+     void onDbusStateChanged();
+     void onDbusStreamingChanged(bool streaming);
+ 
+@@ -128,6 +130,7 @@ private:
+     void setupUi();
+     void setupDbus();
+     void refreshDbusProperties();
++    void updateAudioRouteUi();
+     void updateBannerAndInputGate();
+     QSize effectiveStreamSize() const;
+     void fitWindowToStream(bool force = false);
+@@ -143,6 +146,7 @@ private:
+     QPointer<ScreenCanvasWidget> m_canvas;
+     QToolBar *m_toolbar = nullptr;
+     QPointer<QLabel> m_banner;
++    QAction *m_audioRouteAction = nullptr;
+     QAction *m_muteAction = nullptr;
+     QAction *m_backAction = nullptr;
+     QAction *m_homeAction = nullptr;
+@@ -150,6 +154,7 @@ private:
+     QTimer *m_waylandClampTimer = nullptr;
+ 
+     QDBusInterface *m_screenstreamIface = nullptr;
++    QDBusInterface *m_btAudioSwitchIface = nullptr;
+     QDBusInterface *m_remoteControlIface = nullptr;
+     QDBusInterface *m_remoteKeyboardIface = nullptr;
+     QDBusInterface *m_clipboardIface = nullptr;
+@@ -159,6 +164,7 @@ private:
+     bool m_sessionActive = true;
+     bool m_accessibilityEnabled = false;
+     bool m_audioAvailable = false;
++    bool m_bluetoothAudioMode = false;
+     bool m_protectedContentActive = false;
+     bool m_pendingClampAnchorCenter = false;
+     std::optional<bool> m_lastFittedLandscape;
+diff --git a/tests/screenstreamtest.cpp b/tests/screenstreamtest.cpp
+index a48c82ecde81d34a234aeaf97e519dc1efbbcc5b..6e9ba96ac77a026deba5789e2316a20d3678c984 100644
+--- a/tests/screenstreamtest.cpp
++++ b/tests/screenstreamtest.cpp
+@@ -369,6 +369,18 @@ private Q_SLOTS:
+         QCOMPARE(body.value(QStringLiteral("action")).toString(), QStringLiteral("wake"));
+     }
+ 
++    void testSetAudioEnabledRequestBody()
++    {
++        const QVariantMap mutedBody = buildSetAudioEnabledRequestBody(false);
++        QCOMPARE(mutedBody.size(), 2);
++        QCOMPARE(mutedBody.value(QStringLiteral("action")).toString(), QStringLiteral("set_audio_enabled"));
++        QCOMPARE(mutedBody.value(QStringLiteral("requestAudio")).toBool(), false);
++
++        const QVariantMap unmutedBody = buildSetAudioEnabledRequestBody(true);
++        QCOMPARE(unmutedBody.value(QStringLiteral("action")).toString(), QStringLiteral("set_audio_enabled"));
++        QCOMPARE(unmutedBody.value(QStringLiteral("requestAudio")).toBool(), true);
++    }
++
+     void testPluginMetadataDiscovery()
+     {
+         const QList<KPluginMetaData> plugins = KPluginMetaData::findPlugins(QStringLiteral("kdeconnect"));

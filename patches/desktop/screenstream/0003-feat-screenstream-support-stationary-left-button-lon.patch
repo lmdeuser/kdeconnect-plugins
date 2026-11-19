@@ -1,0 +1,204 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 08:34:59 +0500
+Subject: [PATCH 3/8] feat(screenstream): support stationary left-button
+ long-press hold
+
+
+diff --git a/plugins/screenstream/viewer/viewerwindow.cpp b/plugins/screenstream/viewer/viewerwindow.cpp
+index 6909a71f92ff184c859d7689f1a1c61a8e4fc3ca..9bec9ec490dd4d9f83e4fdabc15dcbf6e74b5ebe 100644
+--- a/plugins/screenstream/viewer/viewerwindow.cpp
++++ b/plugins/screenstream/viewer/viewerwindow.cpp
+@@ -16,6 +16,7 @@
+ #include <QDBusConnection>
+ #include <QDBusInterface>
+ #include <QFileDialog>
++#include <QFocusEvent>
+ #include <QGuiApplication>
+ #include <QIcon>
+ #include <QKeyEvent>
+@@ -26,15 +27,30 @@
+ #include <QPalette>
+ #include <QScreen>
+ #include <QStandardPaths>
++#include <QTimer>
+ #include <QToolBar>
+ #include <QVBoxLayout>
+ #include <QWheelEvent>
+ 
+ #include <algorithm>
+ 
++namespace
++{
++inline constexpr int kLongPressHoldDelayMs = 180;
++} // namespace
++
+ ScreenCanvasWidget::ScreenCanvasWidget(QWidget *parent)
+     : QWidget(parent)
++    , m_holdTimer(new QTimer(this))
+ {
++    m_holdTimer->setSingleShot(true);
++    connect(m_holdTimer, &QTimer::timeout, this, [this]() {
++        if (m_inputEnabled && m_leftButtonDown && !m_holdActive) {
++            m_holdActive = true;
++            Q_EMIT dragStarted(m_pressRemotePos);
++        }
++    });
++
+     setFocusPolicy(Qt::StrongFocus);
+     setMouseTracking(true);
+     setMinimumSize(240, 240);
+@@ -57,10 +73,26 @@ void ScreenCanvasWidget::setRemoteDisplaySize(const QSize &size)
+ 
+ void ScreenCanvasWidget::setInputEnabled(bool enabled)
+ {
++    if (!enabled) {
++        cancelPendingOrActiveHold(false);
++    }
+     m_inputEnabled = enabled;
+     setCursor(enabled ? Qt::CrossCursor : Qt::ArrowCursor);
+ }
+ 
++void ScreenCanvasWidget::cancelPendingOrActiveHold(bool emitRelease)
++{
++    if (m_holdTimer) {
++        m_holdTimer->stop();
++    }
++    if (emitRelease && m_holdActive && m_inputEnabled) {
++        Q_EMIT dragEnded(m_pressRemotePos);
++    }
++    m_leftButtonDown = false;
++    m_holdActive = false;
++    m_dragMoved = false;
++}
++
+ std::optional<QPoint> ScreenCanvasWidget::mapEventPos(const QPointF &pos) const
+ {
+     if (m_frame.isNull()) {
+@@ -99,9 +131,12 @@ void ScreenCanvasWidget::mousePressEvent(QMouseEvent *event)
+             return;
+         }
+         m_leftButtonDown = true;
+-        m_dragging = false;
++        m_holdActive = false;
++        m_dragMoved = false;
+         m_pressPos = event->position();
++        m_pressRemotePos = *mapped;
+         Q_EMIT pointerMoved(*mapped);
++        m_holdTimer->start(kLongPressHoldDelayMs);
+     }
+ }
+ 
+@@ -114,12 +149,18 @@ void ScreenCanvasWidget::mouseMoveEvent(QMouseEvent *event)
+     if (!mapped.has_value()) {
+         return;
+     }
+-    if (m_leftButtonDown && !m_dragging) {
+-        if ((event->position() - m_pressPos).manhattanLength() < 8.0) {
+-            return;
++    if (m_leftButtonDown) {
++        if (!m_dragMoved) {
++            if ((event->position() - m_pressPos).manhattanLength() < 8.0) {
++                return;
++            }
++            m_dragMoved = true;
++            m_holdTimer->stop();
++            if (!m_holdActive) {
++                m_holdActive = true;
++                Q_EMIT dragStarted(m_pressRemotePos);
++            }
+         }
+-        m_dragging = true;
+-        Q_EMIT dragStarted(*mapped);
+         Q_EMIT pointerMoved(*mapped);
+         return;
+     }
+@@ -128,26 +169,27 @@ void ScreenCanvasWidget::mouseMoveEvent(QMouseEvent *event)
+ 
+ void ScreenCanvasWidget::mouseReleaseEvent(QMouseEvent *event)
+ {
++    if (m_holdTimer) {
++        m_holdTimer->stop();
++    }
+     if (!m_inputEnabled) {
+-        m_leftButtonDown = false;
+-        m_dragging = false;
++        cancelPendingOrActiveHold(false);
+         return;
+     }
+     if (event->button() == Qt::LeftButton) {
+         const auto mapped = mapEventPos(event->position());
+-        if (m_dragging) {
+-            if (mapped.has_value()) {
++        if (m_holdActive) {
++            if (m_dragMoved && mapped.has_value()) {
+                 Q_EMIT pointerMoved(*mapped);
+-                Q_EMIT dragEnded(*mapped);
+-            } else {
+-                Q_EMIT dragEnded(QPoint(1, 1));
+             }
++            Q_EMIT dragEnded(mapped.value_or(m_pressRemotePos));
+         } else if (mapped.has_value()) {
+             Q_EMIT pointerMoved(*mapped);
+             Q_EMIT pointerClicked(*mapped);
+         }
+         m_leftButtonDown = false;
+-        m_dragging = false;
++        m_holdActive = false;
++        m_dragMoved = false;
+         return;
+     }
+     if (event->button() == Qt::RightButton) {
+@@ -159,6 +201,12 @@ void ScreenCanvasWidget::mouseReleaseEvent(QMouseEvent *event)
+     }
+ }
+ 
++void ScreenCanvasWidget::focusOutEvent(QFocusEvent *event)
++{
++    cancelPendingOrActiveHold(true);
++    QWidget::focusOutEvent(event);
++}
++
+ void ScreenCanvasWidget::wheelEvent(QWheelEvent *event)
+ {
+     if (!m_inputEnabled) {
+diff --git a/plugins/screenstream/viewer/viewerwindow.h b/plugins/screenstream/viewer/viewerwindow.h
+index ae254080a4b5ddc6af8ed980a5581ce6ee696957..991792499f625598025f63fbe495401dc9fd8dd5 100644
+--- a/plugins/screenstream/viewer/viewerwindow.h
++++ b/plugins/screenstream/viewer/viewerwindow.h
+@@ -21,11 +21,13 @@ class PcmPlayer;
+ class QAction;
+ class QCloseEvent;
+ class QDBusInterface;
++class QFocusEvent;
+ class QKeyEvent;
+ class QLabel;
+ class QLocalSocket;
+ class QMouseEvent;
+ class QPaintEvent;
++class QTimer;
+ class QToolBar;
+ class QWheelEvent;
+ 
+@@ -68,15 +70,20 @@ protected:
+     void mouseReleaseEvent(QMouseEvent *event) override;
+     void wheelEvent(QWheelEvent *event) override;
+     void keyPressEvent(QKeyEvent *event) override;
++    void focusOutEvent(QFocusEvent *event) override;
+ 
+ private:
+     std::optional<QPoint> mapEventPos(const QPointF &pos) const;
++    void cancelPendingOrActiveHold(bool emitRelease);
+ 
+     QImage m_frame;
+     QSize m_remoteDisplaySize;
+     QPointF m_pressPos;
++    QPoint m_pressRemotePos;
++    QTimer *m_holdTimer = nullptr;
+     bool m_leftButtonDown = false;
+-    bool m_dragging = false;
++    bool m_holdActive = false;
++    bool m_dragMoved = false;
+     bool m_inputEnabled = false;
+ };
+ 

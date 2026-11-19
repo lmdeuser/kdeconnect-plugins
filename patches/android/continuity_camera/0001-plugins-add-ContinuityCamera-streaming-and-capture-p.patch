@@ -1,0 +1,1653 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:59:36 +0500
+Subject: [PATCH 1/3] plugins: add ContinuityCamera streaming and capture
+ plugin
+
+
+diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
+index 8bf7ff8c5a43384bd29a33261942d580d5b4e0ce..2aa893b1a98a1f15e0284bce4e0ed4e975397058 100644
+--- a/src/main/AndroidManifest.xml
++++ b/src/main/AndroidManifest.xml
+@@ -56,6 +56,8 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <uses-permission android:name="android.permission.SEND_SMS" />
+     <uses-permission android:name="android.permission.READ_SMS" />
+     <uses-permission android:name="android.permission.RECEIVE_SMS" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
++    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+     <uses-permission android:name="android.permission.RECEIVE_MMS" />
+     <uses-permission android:name="android.permission.WAKE_LOCK" />
+     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+@@ -357,6 +359,17 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+                 android:name="android.service.chooser.chooser_target_service"
+                 android:value="org.kde.kdeconnect.plugins.share.ShareChooserTargetService" />
+         </activity>
++        <activity
++            android:name="org.kde.kdeconnect.plugins.continuitycamera.ContinuityCameraCaptureActivity"
++            android:exported="false"
++            android:label="@string/continuitycamera_capture_title"
++            android:theme="@style/KdeConnectTheme.NoActionBar"
++            tools:targetApi="r" />
++        <service
++            android:name="org.kde.kdeconnect.plugins.continuitycamera.ContinuityCameraService"
++            android:exported="false"
++            android:foregroundServiceType="camera|microphone"
++            tools:targetApi="r" />
+ 
+         <receiver android:name="org.kde.kdeconnect.plugins.share.ShareBroadcastReceiver"
+             android:exported="true">
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/CameraH264Encoder.kt b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/CameraH264Encoder.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3fdba4e3299ef5ee977bb2cd74722229e5c5231
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/CameraH264Encoder.kt
+@@ -0,0 +1,385 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.continuitycamera
++
++import android.Manifest
++import android.annotation.SuppressLint
++import android.content.Context
++import android.content.pm.PackageManager
++import android.hardware.camera2.CameraAccessException
++import android.hardware.camera2.CameraCaptureSession
++import android.hardware.camera2.CameraCharacteristics
++import android.hardware.camera2.CameraDevice
++import android.hardware.camera2.CameraManager
++import android.hardware.camera2.params.OutputConfiguration
++import android.hardware.camera2.params.SessionConfiguration
++import android.media.AudioFormat
++import android.media.AudioRecord
++import android.media.MediaCodec
++import android.media.MediaCodecInfo
++import android.media.MediaFormat
++import android.media.MediaRecorder
++import android.os.Build
++import android.os.Handler
++import android.os.HandlerThread
++import android.util.Log
++import android.view.Surface
++import androidx.annotation.RequiresApi
++import androidx.core.content.ContextCompat
++import java.io.ByteArrayOutputStream
++import java.nio.ByteBuffer
++import java.util.concurrent.Executor
++import java.util.concurrent.atomic.AtomicBoolean
++import java.util.concurrent.atomic.AtomicLong
++
++@RequiresApi(Build.VERSION_CODES.R)
++class CameraH264Encoder(
++    private val context: Context,
++    private val config: ContinuityCameraProtocol.StreamConfig,
++    private val queue: ContinuityStreamQueue,
++    private val onFatalError: (String) -> Unit,
++) {
++    private val stopRequested = AtomicBoolean(false)
++    private val lastPtsUs = AtomicLong(0L)
++
++    private var codec: MediaCodec? = null
++    private var inputSurface: Surface? = null
++    private var drainThread: Thread? = null
++    private var cameraThread: HandlerThread? = null
++    private var cameraHandler: Handler? = null
++    private var cameraDevice: CameraDevice? = null
++    private var captureSession: CameraCaptureSession? = null
++    private var audioThread: Thread? = null
++    private var audioRecord: AudioRecord? = null
++
++    @Volatile
++    private var cachedConfig: ByteArray? = null
++
++    fun start(enableMic: Boolean) {
++        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
++            onFatalError("CAMERA permission not granted")
++            return
++        }
++
++        stopRequested.set(false)
++        val createdCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
++        val surface = configureEncoder(createdCodec)
++        createdCodec.start()
++        codec = createdCodec
++        inputSurface = surface
++
++        val dThread = Thread(::drainVideoLoop, "ContinuityCamDrain").apply { start() }
++        drainThread = dThread
++
++        val cThread = HandlerThread("ContinuityCamCamera").apply { start() }
++        cameraThread = cThread
++        val handler = Handler(cThread.looper)
++        cameraHandler = handler
++
++        openCamera(config.lens, surface, handler)
++
++        if (enableMic &&
++            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
++        ) {
++            startMicCapture()
++        }
++    }
++
++    fun switchLens(newLens: String) {
++        val surface = inputSurface ?: return
++        val handler = cameraHandler ?: return
++        if (stopRequested.get()) return
++
++        handler.post {
++            closeCameraOnly()
++            openCamera(ContinuityCameraProtocol.normalizeLens(newLens), surface, handler)
++        }
++    }
++
++    fun stop() {
++        stopRequested.set(true)
++        closeCameraOnly()
++
++        cameraThread?.quitSafely()
++        try {
++            cameraThread?.join(1000)
++        } catch (_: InterruptedException) {
++            Thread.currentThread().interrupt()
++        }
++        cameraThread = null
++        cameraHandler = null
++
++        val aThread = audioThread
++        audioThread = null
++        try {
++            audioRecord?.stop()
++        } catch (_: IllegalStateException) {
++        }
++        audioRecord?.release()
++        audioRecord = null
++        aThread?.join(800)
++
++        val dThread = drainThread
++        drainThread = null
++        if (dThread != null && dThread !== Thread.currentThread()) {
++            try {
++                dThread.join(1200)
++            } catch (_: InterruptedException) {
++                Thread.currentThread().interrupt()
++            }
++        }
++
++        try {
++            codec?.stop()
++        } catch (_: IllegalStateException) {
++        }
++        try {
++            codec?.release()
++        } catch (_: RuntimeException) {
++        }
++        codec = null
++        inputSurface?.release()
++        inputSurface = null
++    }
++
++    private fun configureEncoder(encoder: MediaCodec): Surface {
++        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, config.width, config.height).apply {
++            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
++            setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
++            setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
++            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
++            setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
++        }
++        try {
++            encoder.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
++            return encoder.createInputSurface()
++        } catch (e: Exception) {
++            Log.w(TAG, "Retrying AVC configure without optional keys: ${e.message}")
++            encoder.reset()
++            val fallback = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, config.width, config.height).apply {
++                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
++                setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
++                setInteger(MediaFormat.KEY_FRAME_RATE, config.fps)
++                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
++            }
++            encoder.configure(fallback, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
++            return encoder.createInputSurface()
++        }
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun openCamera(lens: String, surface: Surface, handler: Handler) {
++        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
++            onFatalError("CAMERA permission not granted")
++            return
++        }
++        val cm = context.getSystemService(CameraManager::class.java) ?: run {
++            onFatalError("CameraManager unavailable")
++            return
++        }
++        val targetFacing = if (lens == "front") {
++            CameraCharacteristics.LENS_FACING_FRONT
++        } else {
++            CameraCharacteristics.LENS_FACING_BACK
++        }
++        val cameraId = selectCameraId(cm, targetFacing) ?: run {
++            onFatalError("No suitable camera available")
++            return
++        }
++
++        try {
++            cm.openCamera(
++                cameraId,
++                Executor { runnable -> handler.post(runnable) },
++                object : CameraDevice.StateCallback() {
++                    override fun onOpened(camera: CameraDevice) {
++                        if (stopRequested.get()) {
++                            camera.close()
++                            return
++                        }
++                        cameraDevice = camera
++                        createRepeatingSession(camera, surface, handler)
++                    }
++
++                    override fun onDisconnected(camera: CameraDevice) {
++                        camera.close()
++                        if (cameraDevice === camera) cameraDevice = null
++                    }
++
++                    override fun onError(camera: CameraDevice, error: Int) {
++                        camera.close()
++                        if (cameraDevice === camera) cameraDevice = null
++                        if (!stopRequested.get()) {
++                            onFatalError("Camera error $error")
++                        }
++                    }
++                },
++            )
++        } catch (e: CameraAccessException) {
++            onFatalError("CameraAccessException: ${e.message}")
++        }
++    }
++
++    private fun selectCameraId(cm: CameraManager, preferredFacing: Int): String? {
++        var fallback: String? = null
++        for (id in cm.cameraIdList) {
++            if (fallback == null) fallback = id
++            val facing = cm.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING)
++            if (facing == preferredFacing) {
++                return id
++            }
++        }
++        return fallback
++    }
++
++    private fun createRepeatingSession(camera: CameraDevice, surface: Surface, handler: Handler) {
++        try {
++            val sessionCfg = SessionConfiguration(
++                SessionConfiguration.SESSION_REGULAR,
++                listOf(OutputConfiguration(surface)),
++                Executor { r -> handler.post(r) },
++                object : CameraCaptureSession.StateCallback() {
++                    override fun onConfigured(session: CameraCaptureSession) {
++                        if (stopRequested.get()) {
++                            session.close()
++                            return
++                        }
++                        captureSession = session
++                        try {
++                            val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
++                                addTarget(surface)
++                            }
++                            session.setRepeatingRequest(req.build(), null, handler)
++                        } catch (e: Exception) {
++                            if (!stopRequested.get()) onFatalError("Capture request failed: ${e.message}")
++                        }
++                    }
++
++                    override fun onConfigureFailed(session: CameraCaptureSession) {
++                        if (!stopRequested.get()) {
++                            onFatalError("Camera session configuration failed")
++                        }
++                    }
++                },
++            )
++            camera.createCaptureSession(sessionCfg)
++        } catch (e: CameraAccessException) {
++            onFatalError("Failed creating capture session: ${e.message}")
++        }
++    }
++
++    private fun closeCameraOnly() {
++        try {
++            captureSession?.stopRepeating()
++        } catch (_: Exception) {
++        }
++        try {
++            captureSession?.close()
++        } catch (_: Exception) {
++        }
++        captureSession = null
++        try {
++            cameraDevice?.close()
++        } catch (_: Exception) {
++        }
++        cameraDevice = null
++    }
++
++    private fun drainVideoLoop() {
++        val encoder = codec ?: return
++        val info = MediaCodec.BufferInfo()
++        try {
++            while (!stopRequested.get()) {
++                val outIndex = encoder.dequeueOutputBuffer(info, 15_000L)
++                if (outIndex < 0) continue
++                try {
++                    val buf: ByteBuffer? = encoder.getOutputBuffer(outIndex)
++                    if (buf != null && info.size > 0) {
++                        buf.position(info.offset)
++                        buf.limit(info.offset + info.size)
++                        val bytes = ByteArray(info.size)
++                        buf.get(bytes)
++
++                        val pts = nextMonotonicPtsUs()
++                        if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
++                            cachedConfig = bytes
++                            queue.offerCodecConfig(pts, bytes)
++                        } else {
++                            val keyframe = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
++                            val payload = if (keyframe && cachedConfig != null) {
++                                ByteArrayOutputStream(cachedConfig!!.size + bytes.size).apply {
++                                    write(cachedConfig!!)
++                                    write(bytes)
++                                }.toByteArray()
++                            } else {
++                                bytes
++                            }
++                            queue.offerVideoFrame(pts, payload, keyframe)
++                        }
++                    }
++                } finally {
++                    encoder.releaseOutputBuffer(outIndex, false)
++                }
++            }
++        } catch (e: Exception) {
++            if (!stopRequested.get()) {
++                Log.w(TAG, "Encoder loop stopped: ${e.message}")
++            }
++        }
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun startMicCapture() {
++        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
++            return
++        }
++        val sampleRate = 48_000
++        val minBuf = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
++        if (minBuf <= 0) return
++
++        val record = AudioRecord(
++            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
++            sampleRate,
++            AudioFormat.CHANNEL_IN_MONO,
++            AudioFormat.ENCODING_PCM_16BIT,
++            maxOf(minBuf * 2, 4096),
++        )
++        if (record.state != AudioRecord.STATE_INITIALIZED) {
++            record.release()
++            return
++        }
++        audioRecord = record
++        record.startRecording()
++
++        val thread = Thread({
++            val chunk = ByteArray(3840)
++            while (!stopRequested.get()) {
++                val read = record.read(chunk, 0, chunk.size)
++                if (read > 0) {
++                    val copy = chunk.copyOf(read)
++                    queue.offerAudioChunk(nextMonotonicPtsUs(), copy)
++                } else if (read < 0) {
++                    break
++                }
++            }
++        }, "ContinuityCamAudio").apply { start() }
++        audioThread = thread
++    }
++
++    private fun nextMonotonicPtsUs(): Long {
++        val candidate = System.nanoTime() / 1000L
++        while (true) {
++            val prev = lastPtsUs.get()
++            val next = if (candidate > prev) candidate else prev + 1L
++            if (lastPtsUs.compareAndSet(prev, next)) return next
++        }
++    }
++
++    companion object {
++        private const val TAG = "KDE/CameraH264Encoder"
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraCaptureActivity.kt b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraCaptureActivity.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..2acce2c2902482851361103a167894aef13a064a
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraCaptureActivity.kt
+@@ -0,0 +1,293 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.continuitycamera
++
++import android.Manifest
++import android.annotation.SuppressLint
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.graphics.BitmapFactory
++import android.graphics.ImageFormat
++import android.graphics.SurfaceTexture
++import android.graphics.pdf.PdfDocument
++import android.hardware.camera2.CameraCaptureSession
++import android.hardware.camera2.CameraCharacteristics
++import android.hardware.camera2.CameraDevice
++import android.hardware.camera2.CameraManager
++import android.hardware.camera2.CaptureRequest
++import android.hardware.camera2.params.OutputConfiguration
++import android.hardware.camera2.params.SessionConfiguration
++import android.media.ImageReader
++import android.os.Build
++import android.os.Bundle
++import android.os.Handler
++import android.os.HandlerThread
++import android.view.Gravity
++import android.view.Surface
++import android.view.TextureView
++import android.view.ViewGroup
++import android.widget.Button
++import android.widget.FrameLayout
++import android.widget.LinearLayout
++import androidx.annotation.RequiresApi
++import androidx.appcompat.app.AppCompatActivity
++import androidx.core.content.ContextCompat
++import org.kde.kdeconnect.KdeConnect
++import org.kde.kdeconnect_tp.R
++import java.io.ByteArrayOutputStream
++import java.util.concurrent.Executor
++
++@RequiresApi(Build.VERSION_CODES.R)
++class ContinuityCameraCaptureActivity : AppCompatActivity() {
++
++    private var deviceId: String = ""
++    private var mode: String = MODE_PHOTO
++    private var scanPages = mutableListOf<ByteArray>()
++
++    private lateinit var textureView: TextureView
++    private var addPageBtn: Button? = null
++    private var sendPdfBtn: Button? = null
++
++    private var bgThread: HandlerThread? = null
++    private var bgHandler: Handler? = null
++    private var cameraDevice: CameraDevice? = null
++    private var captureSession: CameraCaptureSession? = null
++    private var imageReader: ImageReader? = null
++    private var previewSurface: Surface? = null
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        setTurnScreenOn(true)
++        super.onCreate(savedInstanceState)
++
++        deviceId = intent.getStringExtra(EXTRA_DEVICE_ID).orEmpty()
++        mode = intent.getStringExtra(EXTRA_MODE) ?: MODE_PHOTO
++        if (deviceId.isEmpty() ||
++            ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED
++        ) {
++            finish()
++            return
++        }
++
++        val root = FrameLayout(this)
++        textureView = TextureView(this)
++        root.addView(
++            textureView,
++            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT),
++        )
++
++        val controls = LinearLayout(this).apply {
++            orientation = LinearLayout.HORIZONTAL
++            gravity = Gravity.CENTER
++            setPadding(24, 24, 24, 48)
++        }
++
++        if (mode == MODE_SCAN) {
++            val addBtn = Button(this).apply {
++                text = getString(R.string.continuitycamera_btn_add_page, 0)
++                setOnClickListener { triggerStillCapture() }
++            }
++            val sendBtn = Button(this).apply {
++                text = getString(R.string.continuitycamera_btn_send_pdf, 0)
++                isEnabled = false
++                setOnClickListener { finishAndSendPdf() }
++            }
++            addPageBtn = addBtn
++            sendPdfBtn = sendBtn
++            controls.addView(addBtn)
++            controls.addView(sendBtn)
++        } else {
++            val photoBtn = Button(this).apply {
++                text = getString(R.string.continuitycamera_btn_photo)
++                setOnClickListener { triggerStillCapture() }
++            }
++            controls.addView(photoBtn)
++        }
++
++        val cancelBtn = Button(this).apply {
++            text = getString(R.string.continuitycamera_btn_cancel)
++            setOnClickListener { finish() }
++        }
++        controls.addView(cancelBtn)
++
++        root.addView(
++            controls,
++            FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM),
++        )
++        setContentView(root)
++
++        val thread = HandlerThread("ContinuityCapture").apply { start() }
++        bgThread = thread
++        bgHandler = Handler(thread.looper)
++
++        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
++            override fun onSurfaceTextureAvailable(st: SurfaceTexture, w: Int, h: Int) {
++                openPreviewCamera(st)
++            }
++
++            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {}
++            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean = true
++            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
++        }
++    }
++
++    @SuppressLint("MissingPermission")
++    private fun openPreviewCamera(st: SurfaceTexture) {
++        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
++            finish()
++            return
++        }
++        val handler = bgHandler ?: return
++        val cm = getSystemService(CameraManager::class.java) ?: return
++        val camId = cm.cameraIdList.firstOrNull { id ->
++            cm.getCameraCharacteristics(id).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
++        } ?: cm.cameraIdList.firstOrNull() ?: return
++
++        st.setDefaultBufferSize(1280, 720)
++        val pSurface = Surface(st)
++        previewSurface = pSurface
++
++        val reader = ImageReader.newInstance(1280, 720, ImageFormat.JPEG, 2)
++        reader.setOnImageAvailableListener({ r ->
++            val img = r.acquireLatestImage() ?: return@setOnImageAvailableListener
++            img.use {
++                val buf = it.planes[0].buffer
++                val jpeg = ByteArray(buf.remaining())
++                buf.get(jpeg)
++                runOnUiThread { onJpegCaptured(jpeg) }
++            }
++        }, handler)
++        imageReader = reader
++
++        cm.openCamera(
++            camId,
++            Executor { r -> handler.post(r) },
++            object : CameraDevice.StateCallback() {
++                override fun onOpened(camera: CameraDevice) {
++                    cameraDevice = camera
++                    val sessionCfg = SessionConfiguration(
++                        SessionConfiguration.SESSION_REGULAR,
++                        listOf(OutputConfiguration(pSurface), OutputConfiguration(reader.surface)),
++                        Executor { r -> handler.post(r) },
++                        object : CameraCaptureSession.StateCallback() {
++                            override fun onConfigured(session: CameraCaptureSession) {
++                                captureSession = session
++                                val req = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
++                                    addTarget(pSurface)
++                                }
++                                session.setRepeatingRequest(req.build(), null, handler)
++                            }
++
++                            override fun onConfigureFailed(session: CameraCaptureSession) {}
++                        },
++                    )
++                    camera.createCaptureSession(sessionCfg)
++                }
++
++                override fun onDisconnected(camera: CameraDevice) {
++                    camera.close()
++                }
++
++                override fun onError(camera: CameraDevice, error: Int) {
++                    camera.close()
++                }
++            },
++        )
++    }
++
++    private fun triggerStillCapture() {
++        val cam = cameraDevice ?: return
++        val session = captureSession ?: return
++        val reader = imageReader ?: return
++        val handler = bgHandler ?: return
++        val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
++            addTarget(reader.surface)
++            set(CaptureRequest.JPEG_QUALITY, 90.toByte())
++        }
++        session.capture(req.build(), null, handler)
++    }
++
++    private fun onJpegCaptured(jpeg: ByteArray) {
++        if (mode == MODE_PHOTO) {
++            val filename = "ccam_photo_${System.currentTimeMillis()}.jpg"
++            KdeConnect.getInstance()
++                .getDevicePlugin(deviceId, ContinuityCameraPlugin::class.java)
++                ?.deliverCaptureResult(filename, "image/jpeg", jpeg)
++            finish()
++            return
++        }
++        if (scanPages.size < 16) {
++            scanPages.add(jpeg)
++            addPageBtn?.text = getString(R.string.continuitycamera_btn_add_page, scanPages.size)
++            sendPdfBtn?.text = getString(R.string.continuitycamera_btn_send_pdf, scanPages.size)
++            sendPdfBtn?.isEnabled = true
++        }
++    }
++
++    private fun finishAndSendPdf() {
++        if (scanPages.isEmpty()) return
++        val doc = PdfDocument()
++        try {
++            scanPages.forEachIndexed { idx, jpeg ->
++                val bmp = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: return@forEachIndexed
++                try {
++                    val info = PdfDocument.PageInfo.Builder(bmp.width, bmp.height, idx + 1).create()
++                    val page = doc.startPage(info)
++                    page.canvas.drawBitmap(bmp, 0f, 0f, null)
++                    doc.finishPage(page)
++                } finally {
++                    bmp.recycle()
++                }
++            }
++            val baos = ByteArrayOutputStream()
++            doc.writeTo(baos)
++            val pdfBytes = baos.toByteArray()
++            val filename = "ccam_scan_${System.currentTimeMillis()}.pdf"
++            KdeConnect.getInstance()
++                .getDevicePlugin(deviceId, ContinuityCameraPlugin::class.java)
++                ?.deliverCaptureResult(filename, "application/pdf", pdfBytes)
++        } finally {
++            doc.close()
++        }
++        finish()
++    }
++
++    override fun onDestroy() {
++        try {
++            captureSession?.close()
++        } catch (_: Exception) {
++        }
++        captureSession = null
++        try {
++            cameraDevice?.close()
++        } catch (_: Exception) {
++        }
++        cameraDevice = null
++        imageReader?.close()
++        imageReader = null
++        previewSurface?.release()
++        previewSurface = null
++        bgThread?.quitSafely()
++        bgThread = null
++        bgHandler = null
++        super.onDestroy()
++    }
++
++    companion object {
++        const val MODE_PHOTO = "photo"
++        const val MODE_SCAN = "scan"
++        private const val EXTRA_DEVICE_ID = "deviceId"
++        private const val EXTRA_MODE = "mode"
++
++        fun createIntent(context: Context, deviceId: String, mode: String): Intent =
++            Intent(context, ContinuityCameraCaptureActivity::class.java).apply {
++                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
++                putExtra(EXTRA_DEVICE_ID, deviceId)
++                putExtra(EXTRA_MODE, mode)
++            }
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraPlugin.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f06321cc6fb65738b4859bbd0296ee750457f8fa
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraPlugin.kt
+@@ -0,0 +1,221 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.continuitycamera
++
++import android.Manifest
++import android.app.NotificationManager
++import android.app.PendingIntent
++import android.content.pm.PackageManager
++import android.os.Build
++import android.os.Handler
++import android.os.Looper
++import android.widget.Toast
++import androidx.annotation.RequiresApi
++import androidx.core.app.NotificationCompat
++import androidx.core.content.ContextCompat
++import androidx.core.content.getSystemService
++import org.kde.kdeconnect.NetworkPacket
++import org.kde.kdeconnect.helpers.NotificationHelper
++import org.kde.kdeconnect.plugins.Plugin
++import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
++import org.kde.kdeconnect_tp.R
++import kotlin.math.abs
++
++@LoadablePlugin
++@RequiresApi(Build.VERSION_CODES.R)
++class ContinuityCameraPlugin : Plugin() {
++
++    private val mainHandler = Handler(Looper.getMainLooper())
++
++    @Volatile
++    private var activeQueue: ContinuityStreamQueue? = null
++
++    @Volatile
++    private var isStreaming: Boolean = false
++
++    override val minSdk: Int = Build.VERSION_CODES.R
++
++    override val keepAliveWhenUnreachable: Boolean = true
++
++    override val displayName: String
++        get() = context.getString(R.string.pref_plugin_continuitycamera)
++
++    override val description: String
++        get() = context.getString(R.string.pref_plugin_continuitycamera_desc)
++
++    override val supportedPacketTypes: Array<String>
++        get() = arrayOf(ContinuityCameraProtocol.PACKET_TYPE_CONTINUITYCAMERA_REQUEST)
++
++    override val outgoingPacketTypes: Array<String>
++        get() = arrayOf(ContinuityCameraProtocol.PACKET_TYPE_CONTINUITYCAMERA)
++
++    override val requiredPermissions: Array<String>
++        get() = arrayOf(Manifest.permission.CAMERA)
++
++    override val permissionExplanation: Int
++        get() = R.string.continuitycamera_permission_explanation
++
++    override val optionalPermissions: Array<String>
++        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++            arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.POST_NOTIFICATIONS)
++        } else {
++            arrayOf(Manifest.permission.RECORD_AUDIO)
++        }
++
++    override val optionalPermissionExplanation: Int
++        get() = R.string.continuitycamera_optional_permission_explanation
++
++    override fun onDestroy() {
++        stopLocalService()
++        mainHandler.removeCallbacksAndMessages(null)
++    }
++
++    override fun getUiButtons(): List<PluginUiButton> {
++        return listOf(
++            if (isStreaming) {
++                PluginUiButton(
++                    context.getString(R.string.continuitycamera_action_stop),
++                    R.drawable.ic_stop,
++                ) {
++                    stopLocalService()
++                }
++            } else {
++                PluginUiButton(
++                    context.getString(R.string.continuitycamera_action_capture),
++                    R.drawable.ic_phonelink_36dp,
++                ) { parentActivity ->
++                    parentActivity.startActivity(
++                        ContinuityCameraCaptureActivity.createIntent(
++                            parentActivity,
++                            device.deviceId,
++                            ContinuityCameraCaptureActivity.MODE_PHOTO,
++                        ),
++                    )
++                }
++            },
++        )
++    }
++
++    override fun onPacketReceived(np: NetworkPacket): Boolean {
++        val req = ContinuityCameraProtocol.parseRequest(np) ?: return false
++        when (req) {
++            is ContinuityCameraProtocol.Request.StartStream -> {
++                if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
++                    sendStatePacket("error")
++                    return true
++                }
++                val startIntent = ContinuityCameraService.createStartIntent(context, device.deviceId, req.config)
++                ContextCompat.startForegroundService(context, startIntent)
++            }
++            ContinuityCameraProtocol.Request.StopStream -> {
++                stopLocalService()
++            }
++            is ContinuityCameraProtocol.Request.SwitchLens -> {
++                if (isStreaming) {
++                    context.startService(ContinuityCameraService.createSwitchLensIntent(context, req.lens))
++                }
++            }
++            ContinuityCameraProtocol.Request.CapturePhoto -> {
++                launchCaptureUi(ContinuityCameraCaptureActivity.MODE_PHOTO)
++            }
++            ContinuityCameraProtocol.Request.ScanDocument -> {
++                launchCaptureUi(ContinuityCameraCaptureActivity.MODE_SCAN)
++            }
++        }
++        return true
++    }
++
++    internal fun onServiceStreamStarted(queue: ContinuityStreamQueue, audioEnabled: Boolean) {
++        if (!isDeviceInitialized) {
++            queue.close()
++            return
++        }
++        activeQueue = queue
++        isStreaming = true
++        val openNp = NetworkPacket(ContinuityCameraProtocol.PACKET_TYPE_CONTINUITYCAMERA).apply {
++            set("event", "stream_open")
++            set("audioEnabled", audioEnabled)
++            payload = NetworkPacket.Payload(queue, -1L)
++        }
++        device.sendPacket(openNp)
++        device.onPluginsChanged()
++    }
++
++    internal fun onServiceStreamStopped(isError: Boolean) {
++        activeQueue?.close()
++        activeQueue = null
++        if (isStreaming) {
++            isStreaming = false
++            sendStatePacket(if (isError) "error" else "stopped")
++            device.onPluginsChanged()
++        }
++    }
++
++    internal fun deliverCaptureResult(filename: String, mimeType: String, bytes: ByteArray) {
++        if (!isDeviceInitialized) return
++        val packet = ContinuityCameraProtocol.buildCaptureResultPacket(filename, mimeType, bytes) ?: return
++        device.sendPacket(packet)
++        mainHandler.post {
++            Toast.makeText(context, R.string.continuitycamera_capture_sent, Toast.LENGTH_SHORT).show()
++        }
++    }
++
++    private fun stopLocalService() {
++        context.startService(ContinuityCameraService.createStopIntent(context))
++        activeQueue?.close()
++        activeQueue = null
++        if (isStreaming) {
++            isStreaming = false
++            sendStatePacket("stopped")
++            if (isDeviceInitialized) {
++                device.onPluginsChanged()
++            }
++        }
++    }
++
++    private fun sendStatePacket(state: String) {
++        if (!isDeviceInitialized) return
++        val np = NetworkPacket(ContinuityCameraProtocol.PACKET_TYPE_CONTINUITYCAMERA).apply {
++            set("event", "state")
++            set("state", state)
++        }
++        device.sendPacket(np)
++    }
++
++    private fun launchCaptureUi(mode: String) {
++        val intent = ContinuityCameraCaptureActivity.createIntent(context, device.deviceId, mode)
++        val pending = PendingIntent.getActivity(
++            context,
++            captureNotificationId(),
++            intent,
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
++        )
++        val notification = NotificationCompat.Builder(context, NotificationHelper.Channels.HIGHPRIORITY)
++            .setSmallIcon(R.drawable.ic_phonelink_36dp)
++            .setContentTitle(context.getString(R.string.continuitycamera_capture_request_title, device.name))
++            .setContentText(context.getString(R.string.continuitycamera_capture_request_body))
++            .setPriority(NotificationCompat.PRIORITY_HIGH)
++            .setAutoCancel(true)
++            .setContentIntent(pending)
++            .setFullScreenIntent(pending, true)
++            .build()
++
++        context.getSystemService<NotificationManager>()?.notify(captureNotificationId(), notification)
++        try {
++            context.startActivity(intent)
++        } catch (_: RuntimeException) {
++        }
++    }
++
++    private fun captureNotificationId(): Int {
++        return CAPTURE_NOTIFICATION_BASE + (abs(device.deviceId.hashCode()) % 10000)
++    }
++
++    companion object {
++        private const val CAPTURE_NOTIFICATION_BASE = 48300
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraProtocol.kt b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraProtocol.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..1def7d7c8db8e93cfd42b92347d93e00a792ccd1
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraProtocol.kt
+@@ -0,0 +1,354 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.continuitycamera
++
++import org.kde.kdeconnect.NetworkPacket
++import java.io.ByteArrayOutputStream
++import java.io.InputStream
++import java.nio.ByteBuffer
++import java.nio.ByteOrder
++import java.util.ArrayDeque
++import java.util.concurrent.locks.ReentrantLock
++import kotlin.concurrent.withLock
++
++object ContinuityCameraProtocol {
++    const val PACKET_TYPE_CONTINUITYCAMERA = "kdeconnect.continuitycamera"
++    const val PACKET_TYPE_CONTINUITYCAMERA_REQUEST = "kdeconnect.continuitycamera.request"
++
++    const val STREAM_MAGIC = 0x4B43
++    const val HEADER_BYTES = 16
++    const val MAX_VIDEO_FRAME_BYTES = 4 * 1024 * 1024
++    const val MAX_AUDIO_CHUNK_BYTES = 65536
++    const val MAX_CAPTURE_BYTES = 50 * 1024 * 1024
++
++    const val MIN_DIMENSION = 320
++    const val MAX_DIMENSION = 1920
++    const val MIN_FPS = 10
++    const val MAX_FPS = 60
++
++    const val MAX_VIDEO_QUEUE_FRAMES = 8
++    const val MAX_AUDIO_QUEUE_CHUNKS = 16
++
++    const val FLAG_NONE = 0x00
++    const val FLAG_KEYFRAME = 0x01
++    const val FLAG_VALID_MASK = 0x01
++
++    enum class FrameKind(val id: Int) {
++        CODEC_CONFIG(0x01),
++        VIDEO_ACCESS_UNIT(0x02),
++        AUDIO_PCM_CHUNK(0x03),
++        CONTROL_EOS(0x04);
++
++        companion object {
++            fun fromId(raw: Int): FrameKind? = entries.firstOrNull { it.id == raw }
++        }
++    }
++
++    data class StreamConfig(
++        val width: Int = 1280,
++        val height: Int = 720,
++        val fps: Int = 30,
++        val includeMic: Boolean = true,
++        val lens: String = "back",
++    )
++
++    data class Frame(
++        val kind: FrameKind,
++        val flags: Int,
++        val ptsUs: Long,
++        val payload: ByteArray,
++    )
++
++    sealed class Request {
++        data class StartStream(val config: StreamConfig) : Request()
++        data object StopStream : Request()
++        data class SwitchLens(val lens: String) : Request()
++        data object CapturePhoto : Request()
++        data object ScanDocument : Request()
++    }
++
++    fun clampConfig(
++        maxWidth: Int,
++        maxHeight: Int,
++        fps: Int,
++        includeMic: Boolean,
++        lens: String?,
++    ): StreamConfig {
++        val w = (maxWidth.coerceIn(MIN_DIMENSION, MAX_DIMENSION) and 1.inv()).coerceAtLeast(MIN_DIMENSION)
++        val h = (maxHeight.coerceIn(MIN_DIMENSION, MAX_DIMENSION) and 1.inv()).coerceAtLeast(MIN_DIMENSION)
++        val safeFps = fps.coerceIn(MIN_FPS, MAX_FPS)
++        return StreamConfig(
++            width = w,
++            height = h,
++            fps = safeFps,
++            includeMic = includeMic,
++            lens = normalizeLens(lens),
++        )
++    }
++
++    fun normalizeLens(raw: String?): String {
++        return if (raw?.trim()?.equals("front", ignoreCase = true) == true) "front" else "back"
++    }
++
++    fun parseRequest(np: NetworkPacket): Request? {
++        if (np.type != PACKET_TYPE_CONTINUITYCAMERA_REQUEST) return null
++        return when (np.getStringOrNull("action")) {
++            "start_stream" -> Request.StartStream(
++                clampConfig(
++                    maxWidth = np.getInt("maxWidth", 1280),
++                    maxHeight = np.getInt("maxHeight", 720),
++                    fps = np.getInt("fps", 30),
++                    includeMic = np.getBoolean("includeMic", true),
++                    lens = np.getStringOrNull("lens"),
++                ),
++            )
++            "stop_stream" -> Request.StopStream
++            "switch_lens" -> Request.SwitchLens(normalizeLens(np.getStringOrNull("lens")))
++            "capture_photo" -> Request.CapturePhoto
++            "scan_document" -> Request.ScanDocument
++            else -> null
++        }
++    }
++
++    fun buildCaptureResultPacket(filename: String, mimeType: String, bytes: ByteArray): NetworkPacket? {
++        if (bytes.isEmpty() || bytes.size > MAX_CAPTURE_BYTES || filename.isBlank()) {
++            return null
++        }
++        return NetworkPacket(PACKET_TYPE_CONTINUITYCAMERA).apply {
++            set("event", "capture_result")
++            set("filename", filename)
++            set("mimeType", mimeType)
++            payload = NetworkPacket.Payload(bytes)
++        }
++    }
++
++    fun isValidPayloadLength(kind: FrameKind, length: Int): Boolean {
++        return when (kind) {
++            FrameKind.CODEC_CONFIG, FrameKind.VIDEO_ACCESS_UNIT -> length in 1..MAX_VIDEO_FRAME_BYTES
++            FrameKind.AUDIO_PCM_CHUNK -> length in 1..MAX_AUDIO_CHUNK_BYTES
++            FrameKind.CONTROL_EOS -> length == 0
++        }
++    }
++
++    fun encodeFrame(kind: FrameKind, flags: Int, ptsUs: Long, payload: ByteArray): ByteArray {
++        require((flags and FLAG_VALID_MASK.inv()) == 0) { "Invalid flags" }
++        require(isValidPayloadLength(kind, payload.size)) { "Out-of-bounds payload for $kind" }
++        val bb = ByteBuffer.allocate(HEADER_BYTES + payload.size).order(ByteOrder.BIG_ENDIAN)
++        bb.putShort(STREAM_MAGIC.toShort())
++        bb.put(kind.id.toByte())
++        bb.put(flags.toByte())
++        bb.putInt(payload.size)
++        bb.putLong(ptsUs)
++        if (payload.isNotEmpty()) {
++            bb.put(payload)
++        }
++        return bb.array()
++    }
++
++    class FrameReader {
++        private val buffer = ByteArrayOutputStream()
++        var error: String? = null
++            private set
++
++        fun feed(chunk: ByteArray, outFrames: MutableList<Frame>): Boolean {
++            if (error != null) return false
++            if (chunk.isNotEmpty()) buffer.write(chunk)
++            val bytes = buffer.toByteArray()
++            var pos = 0
++
++            while (bytes.size - pos >= HEADER_BYTES) {
++                val bb = ByteBuffer.wrap(bytes, pos, HEADER_BYTES).order(ByteOrder.BIG_ENDIAN)
++                val magic = bb.short.toInt() and 0xFFFF
++                if (magic != STREAM_MAGIC) {
++                    error = "Invalid magic"
++                    return false
++                }
++                val kind = FrameKind.fromId(bb.get().toInt() and 0xFF)
++                if (kind == null) {
++                    error = "Unknown kind"
++                    return false
++                }
++                val flags = bb.get().toInt() and 0xFF
++                if ((flags and FLAG_VALID_MASK.inv()) != 0) {
++                    error = "Invalid flags"
++                    return false
++                }
++                val lenLong = bb.int.toLong() and 0xFFFFFFFFL
++                if (lenLong > MAX_VIDEO_FRAME_BYTES.toLong() || !isValidPayloadLength(kind, lenLong.toInt())) {
++                    error = "Invalid payload length"
++                    return false
++                }
++                val len = lenLong.toInt()
++                val ptsUs = bb.long
++                if (bytes.size - pos < HEADER_BYTES + len) {
++                    break
++                }
++                val payload = if (len == 0) ByteArray(0) else bytes.copyOfRange(pos + HEADER_BYTES, pos + HEADER_BYTES + len)
++                outFrames.add(Frame(kind = kind, flags = flags, ptsUs = ptsUs, payload = payload))
++                pos += HEADER_BYTES + len
++            }
++
++            if (pos > 0) {
++                val rem = if (pos < bytes.size) bytes.copyOfRange(pos, bytes.size) else ByteArray(0)
++                buffer.reset()
++                if (rem.isNotEmpty()) buffer.write(rem)
++            }
++            return true
++        }
++    }
++}
++
++class ContinuityStreamQueue(
++    private val maxVideoFrames: Int = ContinuityCameraProtocol.MAX_VIDEO_QUEUE_FRAMES,
++    private val maxAudioChunks: Int = ContinuityCameraProtocol.MAX_AUDIO_QUEUE_CHUNKS,
++    private val onClosedCallback: (() -> Unit)? = null,
++) : InputStream() {
++
++    private class QueuedPacket(
++        val kind: ContinuityCameraProtocol.FrameKind,
++        val encoded: ByteArray,
++    )
++
++    private val lock = ReentrantLock()
++    private val notEmpty = lock.newCondition()
++    private val queue = ArrayDeque<QueuedPacket>()
++    private var currentChunk: ByteArray? = null
++    private var currentOffset = 0
++    private var queuedVideo = 0
++    private var queuedAudio = 0
++    private var closed = false
++    private var eosQueued = false
++
++    fun offerCodecConfig(ptsUs: Long, data: ByteArray): Boolean {
++        if (data.isEmpty() || data.size > ContinuityCameraProtocol.MAX_VIDEO_FRAME_BYTES) return false
++        val encoded = ContinuityCameraProtocol.encodeFrame(
++            ContinuityCameraProtocol.FrameKind.CODEC_CONFIG,
++            ContinuityCameraProtocol.FLAG_NONE,
++            ptsUs,
++            data,
++        )
++        lock.withLock {
++            if (closed || eosQueued) return false
++            queue.addLast(QueuedPacket(ContinuityCameraProtocol.FrameKind.CODEC_CONFIG, encoded))
++            notEmpty.signalAll()
++            return true
++        }
++    }
++
++    fun offerVideoFrame(ptsUs: Long, data: ByteArray, isKeyframe: Boolean): Boolean {
++        if (data.isEmpty() || data.size > ContinuityCameraProtocol.MAX_VIDEO_FRAME_BYTES) return false
++        val flags = if (isKeyframe) ContinuityCameraProtocol.FLAG_KEYFRAME else ContinuityCameraProtocol.FLAG_NONE
++        val encoded = ContinuityCameraProtocol.encodeFrame(
++            ContinuityCameraProtocol.FrameKind.VIDEO_ACCESS_UNIT,
++            flags,
++            ptsUs,
++            data,
++        )
++        lock.withLock {
++            if (closed || eosQueued) return false
++            if (queuedVideo >= maxVideoFrames && !isKeyframe) {
++                return false
++            }
++            queue.addLast(QueuedPacket(ContinuityCameraProtocol.FrameKind.VIDEO_ACCESS_UNIT, encoded))
++            queuedVideo++
++            notEmpty.signalAll()
++            return true
++        }
++    }
++
++    fun offerAudioChunk(ptsUs: Long, data: ByteArray): Boolean {
++        if (data.isEmpty() || data.size > ContinuityCameraProtocol.MAX_AUDIO_CHUNK_BYTES) return false
++        val encoded = ContinuityCameraProtocol.encodeFrame(
++            ContinuityCameraProtocol.FrameKind.AUDIO_PCM_CHUNK,
++            ContinuityCameraProtocol.FLAG_NONE,
++            ptsUs,
++            data,
++        )
++        lock.withLock {
++            if (closed || eosQueued || queuedAudio >= maxAudioChunks) return false
++            queue.addLast(QueuedPacket(ContinuityCameraProtocol.FrameKind.AUDIO_PCM_CHUNK, encoded))
++            queuedAudio++
++            notEmpty.signalAll()
++            return true
++        }
++    }
++
++    fun finish() {
++        val eos = ContinuityCameraProtocol.encodeFrame(
++            ContinuityCameraProtocol.FrameKind.CONTROL_EOS,
++            ContinuityCameraProtocol.FLAG_NONE,
++            0L,
++            ByteArray(0),
++        )
++        lock.withLock {
++            if (closed || eosQueued) return
++            eosQueued = true
++            queue.addLast(QueuedPacket(ContinuityCameraProtocol.FrameKind.CONTROL_EOS, eos))
++            notEmpty.signalAll()
++        }
++    }
++
++    override fun read(): Int {
++        val single = ByteArray(1)
++        val n = read(single, 0, 1)
++        return if (n == 1) single[0].toInt() and 0xFF else -1
++    }
++
++    override fun read(b: ByteArray, off: Int, len: Int): Int {
++        if (len == 0) return 0
++        lock.withLock {
++            while (currentChunk == null) {
++                if (queue.isNotEmpty()) {
++                    val pkt = queue.removeFirst()
++                    if (pkt.kind == ContinuityCameraProtocol.FrameKind.VIDEO_ACCESS_UNIT && queuedVideo > 0) {
++                        queuedVideo--
++                    } else if (pkt.kind == ContinuityCameraProtocol.FrameKind.AUDIO_PCM_CHUNK && queuedAudio > 0) {
++                        queuedAudio--
++                    }
++                    currentChunk = pkt.encoded
++                    currentOffset = 0
++                    break
++                }
++                if (closed || eosQueued) {
++                    return -1
++                }
++                try {
++                    notEmpty.await()
++                } catch (_: InterruptedException) {
++                    Thread.currentThread().interrupt()
++                    return -1
++                }
++            }
++            val chunk = currentChunk ?: return -1
++            val avail = chunk.size - currentOffset
++            val toCopy = minOf(len, avail)
++            System.arraycopy(chunk, currentOffset, b, off, toCopy)
++            currentOffset += toCopy
++            if (currentOffset >= chunk.size) {
++                currentChunk = null
++                currentOffset = 0
++            }
++            return toCopy
++        }
++    }
++
++    override fun close() {
++        var notify = false
++        lock.withLock {
++            if (!closed) {
++                closed = true
++                queue.clear()
++                currentChunk = null
++                notEmpty.signalAll()
++                notify = true
++            }
++        }
++        if (notify) {
++            onClosedCallback?.invoke()
++        }
++    }
++}
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraService.kt b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraService.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..57e4b042452b5c053b22077ff0b4dab63c9fe6e8
+--- /dev/null
++++ b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraService.kt
+@@ -0,0 +1,203 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.continuitycamera
++
++import android.Manifest
++import android.app.PendingIntent
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.content.pm.PackageManager
++import android.content.pm.ServiceInfo
++import android.os.Build
++import android.os.Handler
++import android.os.IBinder
++import android.os.Looper
++import androidx.annotation.RequiresApi
++import androidx.core.app.NotificationCompat
++import androidx.core.app.ServiceCompat
++import androidx.core.content.ContextCompat
++import org.kde.kdeconnect.KdeConnect
++import org.kde.kdeconnect.helpers.NotificationHelper
++import org.kde.kdeconnect_tp.R
++import java.util.concurrent.atomic.AtomicBoolean
++
++@RequiresApi(Build.VERSION_CODES.R)
++class ContinuityCameraService : Service() {
++
++    private val mainHandler = Handler(Looper.getMainLooper())
++    private val stopping = AtomicBoolean(false)
++
++    private var activeDeviceId: String? = null
++    private var encoder: CameraH264Encoder? = null
++    private var streamQueue: ContinuityStreamQueue? = null
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        when (intent?.action) {
++            ACTION_STOP -> {
++                stopSession(notifyPlugin = true)
++                return START_NOT_STICKY
++            }
++            ACTION_SWITCH_LENS -> {
++                val lens = ContinuityCameraProtocol.normalizeLens(intent.getStringExtra(EXTRA_LENS))
++                encoder?.switchLens(lens)
++                return START_NOT_STICKY
++            }
++            ACTION_START -> {
++                val devId = intent.getStringExtra(EXTRA_DEVICE_ID)
++                if (devId.isNullOrEmpty()) {
++                    stopSelf()
++                    return START_NOT_STICKY
++                }
++                val cfg = ContinuityCameraProtocol.clampConfig(
++                    maxWidth = intent.getIntExtra(EXTRA_WIDTH, 1280),
++                    maxHeight = intent.getIntExtra(EXTRA_HEIGHT, 720),
++                    fps = intent.getIntExtra(EXTRA_FPS, 30),
++                    includeMic = intent.getBooleanExtra(EXTRA_INCLUDE_MIC, true),
++                    lens = intent.getStringExtra(EXTRA_LENS),
++                )
++                startSession(devId, cfg)
++                return START_NOT_STICKY
++            }
++            else -> {
++                stopSelf()
++                return START_NOT_STICKY
++            }
++        }
++    }
++
++    private fun startSession(deviceId: String, config: ContinuityCameraProtocol.StreamConfig) {
++        stopSession(notifyPlugin = false)
++        stopping.set(false)
++        activeDeviceId = deviceId
++
++        val plugin = KdeConnect.getInstance().getDevicePlugin(deviceId, ContinuityCameraPlugin::class.java)
++        if (plugin == null) {
++            stopSelf()
++            return
++        }
++
++        val audioPermGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
++        val enableMic = config.includeMic && audioPermGranted
++
++        var fgsType = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
++        if (enableMic) {
++            fgsType = fgsType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
++        }
++
++        val stopIntent = Intent(this, ContinuityCameraService::class.java).apply { action = ACTION_STOP }
++        val stopPending = PendingIntent.getService(
++            this,
++            0,
++            stopIntent,
++            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
++        )
++        val notification = NotificationCompat.Builder(this, NotificationHelper.Channels.DEFAULT)
++            .setSmallIcon(R.drawable.ic_phonelink_36dp)
++            .setContentTitle(getString(R.string.continuitycamera_notif_title))
++            .setContentText(getString(R.string.continuitycamera_notif_body, plugin.device.name))
++            .setOngoing(true)
++            .addAction(R.drawable.ic_stop, getString(R.string.continuitycamera_action_stop), stopPending)
++            .build()
++
++        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgsType)
++
++        val queue = ContinuityStreamQueue(onClosedCallback = {
++            mainHandler.post {
++                if (!stopping.get()) {
++                    stopSession(notifyPlugin = true)
++                }
++            }
++        })
++        streamQueue = queue
++
++        val enc = CameraH264Encoder(
++            context = this,
++            config = config,
++            queue = queue,
++            onFatalError = {
++                mainHandler.post {
++                    stopSession(notifyPlugin = true, isError = true)
++                }
++            },
++        )
++        encoder = enc
++        enc.start(enableMic)
++
++        plugin.onServiceStreamStarted(queue, enableMic)
++    }
++
++    private fun stopSession(notifyPlugin: Boolean, isError: Boolean = false) {
++        stopping.set(true)
++        encoder?.stop()
++        encoder = null
++
++        val queue = streamQueue
++        streamQueue = null
++        queue?.finish()
++        queue?.close()
++
++        val devId = activeDeviceId
++        activeDeviceId = null
++        if (notifyPlugin && !devId.isNullOrEmpty()) {
++            KdeConnect.getInstance()
++                .getDevicePlugin(devId, ContinuityCameraPlugin::class.java)
++                ?.onServiceStreamStopped(isError)
++        }
++        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
++        stopSelf()
++    }
++
++    override fun onDestroy() {
++        if (!stopping.get()) {
++            stopSession(notifyPlugin = true)
++        }
++        mainHandler.removeCallbacksAndMessages(null)
++        super.onDestroy()
++    }
++
++    companion object {
++        private const val NOTIFICATION_ID = 48201
++        private const val ACTION_START = "org.kde.kdeconnect.continuitycamera.START"
++        private const val ACTION_STOP = "org.kde.kdeconnect.continuitycamera.STOP"
++        private const val ACTION_SWITCH_LENS = "org.kde.kdeconnect.continuitycamera.SWITCH_LENS"
++
++        private const val EXTRA_DEVICE_ID = "deviceId"
++        private const val EXTRA_WIDTH = "width"
++        private const val EXTRA_HEIGHT = "height"
++        private const val EXTRA_FPS = "fps"
++        private const val EXTRA_INCLUDE_MIC = "includeMic"
++        private const val EXTRA_LENS = "lens"
++
++        fun createStartIntent(
++            context: Context,
++            deviceId: String,
++            config: ContinuityCameraProtocol.StreamConfig,
++        ): Intent = Intent(context, ContinuityCameraService::class.java).apply {
++            action = ACTION_START
++            putExtra(EXTRA_DEVICE_ID, deviceId)
++            putExtra(EXTRA_WIDTH, config.width)
++            putExtra(EXTRA_HEIGHT, config.height)
++            putExtra(EXTRA_FPS, config.fps)
++            putExtra(EXTRA_INCLUDE_MIC, config.includeMic)
++            putExtra(EXTRA_LENS, config.lens)
++        }
++
++        fun createStopIntent(context: Context): Intent =
++            Intent(context, ContinuityCameraService::class.java).apply {
++                action = ACTION_STOP
++            }
++
++        fun createSwitchLensIntent(context: Context, lens: String): Intent =
++            Intent(context, ContinuityCameraService::class.java).apply {
++                action = ACTION_SWITCH_LENS
++                putExtra(EXTRA_LENS, lens)
++            }
++    }
++}
+diff --git a/src/main/res/values/strings_continuity_camera.xml b/src/main/res/values/strings_continuity_camera.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..017de515568feb424a2aa7093da29c3bf903c370
+--- /dev/null
++++ b/src/main/res/values/strings_continuity_camera.xml
+@@ -0,0 +1,24 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!--
++SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++
++SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++-->
++<resources>
++    <string name="pref_plugin_continuitycamera">Continuity Camera</string>
++    <string name="pref_plugin_continuitycamera_desc">Share phone camera, microphone, and document scans with your desktop</string>
++    <string name="continuitycamera_action_stop">Stop camera stream</string>
++    <string name="continuitycamera_action_capture">Capture photo / scan</string>
++    <string name="continuitycamera_permission_explanation">Camera permission lets KDE Connect stream video and capture photos or scanned PDFs</string>
++    <string name="continuitycamera_optional_permission_explanation">Microphone and notification permissions let KDE Connect stream mic audio and keep camera controls visible</string>
++    <string name="continuitycamera_notif_title">Continuity Camera active</string>
++    <string name="continuitycamera_notif_body">Streaming camera to %s</string>
++    <string name="continuitycamera_capture_title">Continuity Camera Capture</string>
++    <string name="continuitycamera_capture_request_title">Capture requested by %s</string>
++    <string name="continuitycamera_capture_request_body">Tap to capture a photo or scan pages</string>
++    <string name="continuitycamera_btn_photo">Capture Photo</string>
++    <string name="continuitycamera_btn_add_page">Add Scan Page (%d)</string>
++    <string name="continuitycamera_btn_send_pdf">Send PDF (%d)</string>
++    <string name="continuitycamera_btn_cancel">Cancel</string>
++    <string name="continuitycamera_capture_sent">Sent capture to desktop</string>
++</resources>
+diff --git a/src/test/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraProtocolTest.kt b/src/test/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraProtocolTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..d6c1a63083ee4fa034b1c8dcf8354fec1d338ea9
+--- /dev/null
++++ b/src/test/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraProtocolTest.kt
+@@ -0,0 +1,93 @@
++/*
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++package org.kde.kdeconnect.plugins.continuitycamera
++
++import org.junit.Assert.assertArrayEquals
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertFalse
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++import org.kde.kdeconnect.NetworkPacket
++import java.io.ByteArrayOutputStream
++
++class ContinuityCameraProtocolTest {
++
++    @Test
++    fun clampConfigAndParseRequestsEnforceBounds() {
++        val cfg = ContinuityCameraProtocol.clampConfig(1281, 100, 120, true, "FRONT")
++        assertEquals(1280, cfg.width)
++        assertEquals(ContinuityCameraProtocol.MIN_DIMENSION, cfg.height)
++        assertEquals(ContinuityCameraProtocol.MAX_FPS, cfg.fps)
++        assertEquals("front", cfg.lens)
++
++        val np = NetworkPacket(ContinuityCameraProtocol.PACKET_TYPE_CONTINUITYCAMERA_REQUEST).apply {
++            set("action", "start_stream")
++            set("maxWidth", 2560)
++            set("maxHeight", 720)
++            set("fps", 2)
++            set("includeMic", false)
++            set("lens", "weird")
++        }
++        val req = ContinuityCameraProtocol.parseRequest(np) as ContinuityCameraProtocol.Request.StartStream
++        assertEquals(1920, req.config.width)
++        assertEquals(ContinuityCameraProtocol.MIN_FPS, req.config.fps)
++        assertEquals("back", req.config.lens)
++        assertFalse(req.config.includeMic)
++    }
++
++    @Test
++    fun frameRoundTripAndQueueBackpressureWork() {
++        val q = ContinuityStreamQueue(maxVideoFrames = 1, maxAudioChunks = 1)
++        val cfg = byteArrayOf(0, 0, 0, 1, 0x67, 0x42)
++        val key = byteArrayOf(0, 0, 0, 1, 0x65, 0x88.toByte())
++        val delta = byteArrayOf(0, 0, 0, 1, 0x41, 0x11)
++        assertTrue(q.offerCodecConfig(100L, cfg))
++        assertTrue(q.offerVideoFrame(200L, key, isKeyframe = true))
++        // Delta rejected while video queue already at cap = 1
++        assertFalse(q.offerVideoFrame(300L, delta, isKeyframe = false))
++        assertTrue(q.offerAudioChunk(400L, byteArrayOf(1, 2, 3, 4)))
++        q.finish()
++
++        val allBytes = ByteArrayOutputStream()
++        val buf = ByteArray(19)
++        while (true) {
++            val n = q.read(buf)
++            if (n <= 0) break
++            allBytes.write(buf, 0, n)
++        }
++        q.close()
++
++        val reader = ContinuityCameraProtocol.FrameReader()
++        val frames = mutableListOf<ContinuityCameraProtocol.Frame>()
++        val wire = allBytes.toByteArray()
++        assertTrue(reader.feed(wire.copyOfRange(0, 21), frames))
++        assertTrue(reader.feed(wire.copyOfRange(21, wire.size), frames))
++        assertEquals(4, frames.size)
++        assertEquals(ContinuityCameraProtocol.FrameKind.CODEC_CONFIG, frames[0].kind)
++        assertArrayEquals(key, frames[1].payload)
++        assertEquals(ContinuityCameraProtocol.FrameKind.AUDIO_PCM_CHUNK, frames[2].kind)
++        assertEquals(ContinuityCameraProtocol.FrameKind.CONTROL_EOS, frames[3].kind)
++    }
++
++    @Test
++    fun invalidHeaderAndOversizedCaptureRejected() {
++        val reader = ContinuityCameraProtocol.FrameReader()
++        val out = mutableListOf<ContinuityCameraProtocol.Frame>()
++        assertFalse(reader.feed(ByteArray(16), out))
++        assertNotNull(reader.error)
++
++        assertNull(
++            ContinuityCameraProtocol.buildCaptureResultPacket(
++                "shot.jpg",
++                "image/jpeg",
++                ByteArray(0),
++            ),
++        )
++    }
++}

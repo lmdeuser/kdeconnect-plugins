@@ -1,0 +1,684 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 14:51:34 +0500
+Subject: [PATCH 1/2] plugins: add remote_auth biometric confirmation and
+ session unlock plugin
+
+
+diff --git a/plugins/CMakeLists.txt b/plugins/CMakeLists.txt
+index 0afd522eaf6dfa35ffceff69e9b34070a09218bc..15cab2317d3d8c69e722658a2a51d55a32fdda9e 100644
+--- a/plugins/CMakeLists.txt
++++ b/plugins/CMakeLists.txt
+@@ -3,6 +3,9 @@ add_definitions(-DTRANSLATION_DOMAIN=\"kdeconnect-plugins\")
+ add_subdirectory(ping)
+ add_subdirectory(connectivity-report)
+ add_subdirectory(remotecommands)
++if(${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
++    add_subdirectory(remote_auth)
++endif()
+ add_subdirectory(remotecontrol)
+ add_subdirectory(remotesystemvolume)
+ add_subdirectory(clipboard)
+diff --git a/plugins/remote_auth/CMakeLists.txt b/plugins/remote_auth/CMakeLists.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..65b01eba6f59c968dc4c478f76b84d34a4cb7b32
+--- /dev/null
++++ b/plugins/remote_auth/CMakeLists.txt
+@@ -0,0 +1,32 @@
++# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++
++add_library(kdeconnectremoteauthcommon STATIC
++    remoteauthmanager.cpp
++)
++set_property(TARGET kdeconnectremoteauthcommon PROPERTY POSITION_INDEPENDENT_CODE ON)
++target_include_directories(kdeconnectremoteauthcommon PUBLIC
++    ${PROJECT_SOURCE_DIR}
++    ${CMAKE_CURRENT_SOURCE_DIR}
++)
++target_link_libraries(kdeconnectremoteauthcommon PUBLIC
++    Qt::Core
++)
++
++kdeconnect_add_plugin(kdeconnect_remoteauth SOURCES
++    remoteauthplugin.cpp
++)
++target_link_libraries(kdeconnect_remoteauth
++    kdeconnectcore
++    kdeconnectdbusinterfaces
++    kdeconnectremoteauthcommon
++    Qt::Core
++    Qt::DBus
++)
++
++if(BUILD_TESTING)
++    find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Test)
++    ecm_add_test(remoteauthtest.cpp
++        LINK_LIBRARIES kdeconnectcore kdeconnectremoteauthcommon Qt::Core Qt::Test)
++    set_tests_properties(remoteauthtest PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
++endif()
+diff --git a/plugins/remote_auth/kdeconnect_remoteauth.json b/plugins/remote_auth/kdeconnect_remoteauth.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..41d988432323cdb2690df7f1c0db50d1087dacc9
+--- /dev/null
++++ b/plugins/remote_auth/kdeconnect_remoteauth.json
+@@ -0,0 +1,22 @@
++{
++    "$schema": "../kdeconnect.schema.json",
++    "KPlugin": {
++        "Authors": [
++            {
++                "Email": "dennshield@duck.com",
++                "Name": "Dmitriy Volkov"
++            }
++        ],
++        "Description": "Confirm sensitive desktop actions and session unlock using Android biometrics",
++        "EnabledByDefault": true,
++        "Icon": "dialog-password",
++        "License": "GPL",
++        "Name": "Remote Biometric Confirmation"
++    },
++    "X-KdeConnect-OutgoingPacketType": [
++        "kdeconnect.remoteauth.request"
++    ],
++    "X-KdeConnect-SupportedPacketType": [
++        "kdeconnect.remoteauth"
++    ]
++}
+diff --git a/plugins/remote_auth/remoteauthmanager.cpp b/plugins/remote_auth/remoteauthmanager.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb3b0bc713671ead7759e0a14f4b74680d9735e6
+--- /dev/null
++++ b/plugins/remote_auth/remoteauthmanager.cpp
+@@ -0,0 +1,220 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "remoteauthmanager.h"
++
++#include <QRandomGenerator>
++
++#include <limits>
++
++namespace RemoteAuth
++{
++namespace
++{
++bool isValidPurpose(const QString &purpose)
++{
++    return purpose == QLatin1String("confirm") || purpose == QLatin1String("unlock");
++}
++
++bool constantTimeEqual32(const QByteArray &a, const QByteArray &b)
++{
++    if (a.size() != kNonceBytes || b.size() != kNonceBytes) {
++        return false;
++    }
++    quint8 diff = 0;
++    for (int i = 0; i < kNonceBytes; ++i) {
++        diff |= static_cast<quint8>(a.at(i)) ^ static_cast<quint8>(b.at(i));
++    }
++    return diff == 0;
++}
++
++QByteArray generateRandomBytes(int count)
++{
++    QByteArray out(count, Qt::Uninitialized);
++    QRandomGenerator *rng = QRandomGenerator::system();
++    for (int offset = 0; offset < count; offset += 4) {
++        const quint32 word = rng->generate();
++        const int take = qMin(4, count - offset);
++        for (int j = 0; j < take; ++j) {
++            out[offset + j] = static_cast<char>((word >> (j * 8)) & 0xFF);
++        }
++    }
++    return out;
++}
++}
++
++QString RemoteAuthManager::sanitizeSummary(const QString &raw, const QString &purpose)
++{
++    QString cleaned;
++    cleaned.reserve(qMin(raw.size(), kMaxSummaryLength));
++    for (const QChar ch : raw) {
++        if (ch.unicode() < 0x20 || ch.unicode() == 0x7F) {
++            cleaned.append(QLatin1Char(' '));
++        } else {
++            cleaned.append(ch);
++        }
++    }
++    cleaned = cleaned.simplified();
++    if (cleaned.size() > kMaxSummaryLength) {
++        cleaned.truncate(kMaxSummaryLength);
++    }
++    if (cleaned.isEmpty()) {
++        return purpose == QLatin1String("unlock")
++            ? QStringLiteral("Unlock desktop session")
++            : QStringLiteral("Confirm desktop operation");
++    }
++    return cleaned;
++}
++
++CreateResult RemoteAuthManager::createChallenge(const QString &purpose, const QString &summary, qint64 nowMs, int ttlMs)
++{
++    CreateResult result;
++    pruneExpired(nowMs);
++
++    if (isRateLimited(nowMs)) {
++        result.error = QStringLiteral("rate_limited");
++        return result;
++    }
++
++    if (!isValidPurpose(purpose)) {
++        result.error = QStringLiteral("invalid_purpose");
++        return result;
++    }
++
++    while (m_pending.size() >= kMaxPendingChallenges) {
++        QString oldestId;
++        qint64 oldestCreated = std::numeric_limits<qint64>::max();
++        for (auto it = m_pending.cbegin(); it != m_pending.cend(); ++it) {
++            if (it.value().createdAtMs < oldestCreated) {
++                oldestCreated = it.value().createdAtMs;
++                oldestId = it.key();
++            }
++        }
++        if (oldestId.isEmpty()) {
++            break;
++        }
++        m_pending.remove(oldestId);
++    }
++
++    const int boundedTtl = (ttlMs <= 0) ? kDefaultTtlMs : qBound(kMinTtlMs, ttlMs, kMaxTtlMs);
++    Challenge ch;
++    ch.challengeId = QString::fromLatin1(generateRandomBytes(16).toHex());
++    ch.nonce = generateRandomBytes(kNonceBytes);
++    ch.nonceBase64 = QString::fromLatin1(ch.nonce.toBase64());
++    ch.purpose = purpose;
++    ch.summary = sanitizeSummary(summary, purpose);
++    ch.createdAtMs = nowMs;
++    ch.expiresAtMs = nowMs + boundedTtl;
++    ch.ttlMs = boundedTtl;
++
++    m_pending.insert(ch.challengeId, ch);
++
++    result.ok = true;
++    result.challenge = ch;
++    return result;
++}
++
++EvalResult RemoteAuthManager::evaluateResponse(
++    const QString &challengeId,
++    const QString &nonceBase64,
++    bool approved,
++    bool unlockAllowed,
++    qint64 nowMs)
++{
++    EvalResult res;
++    if (challengeId.isEmpty() || challengeId.size() > 128) {
++        pruneExpired(nowMs);
++        recordFailure(nowMs);
++        res.status = EvalStatus::InvalidInput;
++        res.reason = QStringLiteral("invalid_input");
++        return res;
++    }
++
++    if (!m_pending.contains(challengeId)) {
++        pruneExpired(nowMs);
++        recordFailure(nowMs);
++        res.status = EvalStatus::UnknownChallenge;
++        res.reason = QStringLiteral("unknown_challenge");
++        return res;
++    }
++
++    const Challenge ch = m_pending.take(challengeId);
++    pruneExpired(nowMs);
++    res.purpose = ch.purpose;
++
++    if (nowMs > ch.expiresAtMs) {
++        recordFailure(nowMs);
++        res.status = EvalStatus::Expired;
++        res.reason = QStringLiteral("expired");
++        return res;
++    }
++
++    const auto decoded = QByteArray::fromBase64Encoding(nonceBase64.toLatin1(), QByteArray::AbortOnBase64DecodingErrors);
++    if (!decoded || !constantTimeEqual32(*decoded, ch.nonce)) {
++        recordFailure(nowMs);
++        res.status = EvalStatus::InvalidNonce;
++        res.reason = QStringLiteral("invalid_nonce");
++        return res;
++    }
++
++    if (!approved) {
++        recordFailure(nowMs);
++        res.status = EvalStatus::Denied;
++        res.reason = QStringLiteral("denied");
++        return res;
++    }
++
++    if (ch.purpose == QLatin1String("unlock") && !unlockAllowed) {
++        recordFailure(nowMs);
++        res.status = EvalStatus::UnlockDisabled;
++        res.reason = QStringLiteral("unlock_disabled");
++        return res;
++    }
++
++    res.status = EvalStatus::Approved;
++    res.reason = QStringLiteral("approved");
++    return res;
++}
++
++QStringList RemoteAuthManager::pruneExpired(qint64 nowMs)
++{
++    QStringList expiredIds;
++    for (auto it = m_pending.begin(); it != m_pending.end();) {
++        if (nowMs > it.value().expiresAtMs) {
++            expiredIds.append(it.key());
++            it = m_pending.erase(it);
++        } else {
++            ++it;
++        }
++    }
++    return expiredIds;
++}
++
++bool RemoteAuthManager::isRateLimited(qint64 nowMs)
++{
++    pruneFailures(nowMs);
++    return m_failureTimestampsMs.size() >= kRateLimitMaxFailures;
++}
++
++int RemoteAuthManager::pendingCount() const
++{
++    return m_pending.size();
++}
++
++void RemoteAuthManager::recordFailure(qint64 nowMs)
++{
++    pruneFailures(nowMs);
++    m_failureTimestampsMs.append(nowMs);
++}
++
++void RemoteAuthManager::pruneFailures(qint64 nowMs)
++{
++    const qint64 cutoff = nowMs - kRateLimitWindowMs;
++    while (!m_failureTimestampsMs.isEmpty() && m_failureTimestampsMs.first() < cutoff) {
++        m_failureTimestampsMs.removeFirst();
++    }
++}
++}
+diff --git a/plugins/remote_auth/remoteauthmanager.h b/plugins/remote_auth/remoteauthmanager.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..263ab495234ffc2727d9524814f400266e90685d
+--- /dev/null
++++ b/plugins/remote_auth/remoteauthmanager.h
+@@ -0,0 +1,77 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QByteArray>
++#include <QHash>
++#include <QList>
++#include <QString>
++#include <QStringList>
++
++namespace RemoteAuth
++{
++inline constexpr int kDefaultTtlMs = 30000;
++inline constexpr int kMinTtlMs = 5000;
++inline constexpr int kMaxTtlMs = 60000;
++inline constexpr int kMaxPendingChallenges = 4;
++inline constexpr int kMaxSummaryLength = 240;
++inline constexpr qint64 kRateLimitWindowMs = 60000;
++inline constexpr int kRateLimitMaxFailures = 5;
++inline constexpr int kNonceBytes = 32;
++
++struct Challenge {
++    QString challengeId;
++    QByteArray nonce;
++    QString nonceBase64;
++    QString purpose;
++    QString summary;
++    qint64 createdAtMs = 0;
++    qint64 expiresAtMs = 0;
++    int ttlMs = kDefaultTtlMs;
++};
++
++struct CreateResult {
++    bool ok = false;
++    Challenge challenge;
++    QString error;
++};
++
++enum class EvalStatus {
++    Approved,
++    Denied,
++    Expired,
++    UnknownChallenge,
++    InvalidNonce,
++    UnlockDisabled,
++    InvalidInput,
++};
++
++struct EvalResult {
++    EvalStatus status = EvalStatus::InvalidInput;
++    QString purpose;
++    QString reason;
++};
++
++class RemoteAuthManager
++{
++public:
++    static QString sanitizeSummary(const QString &raw, const QString &purpose);
++
++    CreateResult createChallenge(const QString &purpose, const QString &summary, qint64 nowMs, int ttlMs = kDefaultTtlMs);
++    EvalResult evaluateResponse(const QString &challengeId, const QString &nonceBase64, bool approved, bool unlockAllowed, qint64 nowMs);
++    QStringList pruneExpired(qint64 nowMs);
++    bool isRateLimited(qint64 nowMs);
++    int pendingCount() const;
++
++private:
++    void recordFailure(qint64 nowMs);
++    void pruneFailures(qint64 nowMs);
++
++    QHash<QString, Challenge> m_pending;
++    QList<qint64> m_failureTimestampsMs;
++};
++}
+diff --git a/plugins/remote_auth/remoteauthplugin.cpp b/plugins/remote_auth/remoteauthplugin.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f2f3a074755526006973e5e789b04091e263232
+--- /dev/null
++++ b/plugins/remote_auth/remoteauthplugin.cpp
+@@ -0,0 +1,126 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "remoteauthplugin.h"
++
++#include "plugin_remoteauth_debug.h"
++
++#include <KPluginFactory>
++#include <QDateTime>
++
++K_PLUGIN_CLASS_WITH_JSON(RemoteAuthPlugin, "kdeconnect_remoteauth.json")
++
++RemoteAuthPlugin::RemoteAuthPlugin(QObject *parent, const QVariantList &args)
++    : KdeConnectPlugin(parent, args)
++    , m_login1Interface(QStringLiteral("org.freedesktop.login1"), QStringLiteral("/org/freedesktop/login1/session/auto"), QDBusConnection::systemBus())
++{
++    m_pruneTimer.setInterval(1000);
++    connect(&m_pruneTimer, &QTimer::timeout, this, &RemoteAuthPlugin::onPruneTick);
++}
++
++QString RemoteAuthPlugin::dbusPath() const
++{
++    return QLatin1String("/modules/kdeconnect/devices/%1/remoteauth").arg(device()->id());
++}
++
++bool RemoteAuthPlugin::unlockAllowed() const
++{
++    return config()->getBool(QStringLiteral("unlockAllowed"), false);
++}
++
++void RemoteAuthPlugin::setUnlockAllowed(bool allowed)
++{
++    config()->set(QStringLiteral("unlockAllowed"), allowed);
++    Q_EMIT unlockAllowedChanged(allowed);
++}
++
++QString RemoteAuthPlugin::requestApproval(const QString &summary, int ttlMs)
++{
++    return sendChallenge(QStringLiteral("confirm"), summary, ttlMs);
++}
++
++QString RemoteAuthPlugin::requestSessionUnlock(const QString &summary)
++{
++    if (!unlockAllowed()) {
++        qCWarning(KDECONNECT_PLUGIN_REMOTEAUTH) << "Session unlock request rejected because unlockAllowed is disabled";
++        return {};
++    }
++    return sendChallenge(QStringLiteral("unlock"), summary, RemoteAuth::kDefaultTtlMs);
++}
++
++QString RemoteAuthPlugin::sendChallenge(const QString &purpose, const QString &summary, int ttlMs)
++{
++    const auto caps = device()->incomingCapabilities();
++    if (!caps.isEmpty() && !caps.contains(PACKET_TYPE_REMOTEAUTH_REQUEST)) {
++        qCDebug(KDECONNECT_PLUGIN_REMOTEAUTH) << "Remote peer does not advertise" << PACKET_TYPE_REMOTEAUTH_REQUEST;
++        return {};
++    }
++
++    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
++    const RemoteAuth::CreateResult created = m_manager.createChallenge(purpose, summary, nowMs, ttlMs);
++    if (!created.ok) {
++        qCWarning(KDECONNECT_PLUGIN_REMOTEAUTH) << "Failed to create challenge:" << created.error;
++        return {};
++    }
++
++    NetworkPacket np(PACKET_TYPE_REMOTEAUTH_REQUEST);
++    np.set(QStringLiteral("challengeId"), created.challenge.challengeId);
++    np.set(QStringLiteral("nonce"), created.challenge.nonceBase64);
++    np.set(QStringLiteral("purpose"), created.challenge.purpose);
++    np.set(QStringLiteral("summary"), created.challenge.summary);
++    np.set(QStringLiteral("ttlMs"), created.challenge.ttlMs);
++    if (!sendPacket(np)) {
++        return {};
++    }
++
++    if (!m_pruneTimer.isActive()) {
++        m_pruneTimer.start();
++    }
++    return created.challenge.challengeId;
++}
++
++void RemoteAuthPlugin::receivePacket(const NetworkPacket &np)
++{
++    if (np.type() != PACKET_TYPE_REMOTEAUTH) {
++        return;
++    }
++
++    const QString challengeId = np.get<QString>(QStringLiteral("challengeId"));
++    const QString nonceBase64 = np.get<QString>(QStringLiteral("nonce"));
++    const bool approved = np.get<bool>(QStringLiteral("approved"), false);
++    const QString authType = np.get<QString>(QStringLiteral("authType"));
++    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
++
++    const RemoteAuth::EvalResult res = m_manager.evaluateResponse(challengeId, nonceBase64, approved, unlockAllowed(), nowMs);
++    if (m_manager.pendingCount() == 0 && m_pruneTimer.isActive()) {
++        m_pruneTimer.stop();
++    }
++
++    if (res.status == RemoteAuth::EvalStatus::Approved) {
++        qCDebug(KDECONNECT_PLUGIN_REMOTEAUTH) << "Approved remoteauth challenge" << challengeId << "purpose" << res.purpose << "authType" << authType;
++        if (res.purpose == QLatin1String("unlock") && unlockAllowed()) {
++            m_login1Interface.Unlock();
++        }
++        Q_EMIT challengeResolved(challengeId, true, res.reason);
++    } else {
++        qCWarning(KDECONNECT_PLUGIN_REMOTEAUTH) << "Rejected remoteauth challenge" << challengeId << "reason" << res.reason;
++        Q_EMIT challengeResolved(challengeId, false, res.reason);
++    }
++}
++
++void RemoteAuthPlugin::onPruneTick()
++{
++    const QStringList expired = m_manager.pruneExpired(QDateTime::currentMSecsSinceEpoch());
++    for (const QString &id : expired) {
++        Q_EMIT challengeResolved(id, false, QStringLiteral("expired"));
++    }
++    if (m_manager.pendingCount() == 0) {
++        m_pruneTimer.stop();
++    }
++}
++
++#include "moc_remoteauthplugin.cpp"
++#include "remoteauthplugin.moc"
+diff --git a/plugins/remote_auth/remoteauthplugin.h b/plugins/remote_auth/remoteauthplugin.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..b317013eb71b342d79640bf34dadfa660a53ccea
+--- /dev/null
++++ b/plugins/remote_auth/remoteauthplugin.h
+@@ -0,0 +1,49 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#pragma once
++
++#include <QTimer>
++
++#include <core/kdeconnectplugin.h>
++
++#include "generated/systeminterfaces/login1.h"
++#include "remoteauthmanager.h"
++
++#define PACKET_TYPE_REMOTEAUTH QStringLiteral("kdeconnect.remoteauth")
++#define PACKET_TYPE_REMOTEAUTH_REQUEST QStringLiteral("kdeconnect.remoteauth.request")
++
++class RemoteAuthPlugin : public KdeConnectPlugin
++{
++    Q_OBJECT
++    Q_CLASSINFO("D-Bus Interface", "org.kde.kdeconnect.device.remoteauth")
++    Q_PROPERTY(bool unlockAllowed READ unlockAllowed WRITE setUnlockAllowed NOTIFY unlockAllowedChanged)
++
++public:
++    explicit RemoteAuthPlugin(QObject *parent, const QVariantList &args);
++
++    void receivePacket(const NetworkPacket &np) override;
++    QString dbusPath() const override;
++
++    Q_SCRIPTABLE QString requestApproval(const QString &summary, int ttlMs = RemoteAuth::kDefaultTtlMs);
++    Q_SCRIPTABLE QString requestSessionUnlock(const QString &summary);
++    Q_SCRIPTABLE bool unlockAllowed() const;
++    Q_SCRIPTABLE void setUnlockAllowed(bool allowed);
++
++Q_SIGNALS:
++    Q_SCRIPTABLE void challengeResolved(const QString &challengeId, bool approved, const QString &reason);
++    Q_SCRIPTABLE void unlockAllowedChanged(bool allowed);
++
++private Q_SLOTS:
++    void onPruneTick();
++
++private:
++    QString sendChallenge(const QString &purpose, const QString &summary, int ttlMs);
++
++    RemoteAuth::RemoteAuthManager m_manager;
++    OrgFreedesktopLogin1SessionInterface m_login1Interface;
++    QTimer m_pruneTimer;
++};
+diff --git a/plugins/remote_auth/remoteauthtest.cpp b/plugins/remote_auth/remoteauthtest.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..6145abd873dd0ba4937f47ed85d8bcf208b20059
+--- /dev/null
++++ b/plugins/remote_auth/remoteauthtest.cpp
+@@ -0,0 +1,95 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++#include "remoteauthmanager.h"
++
++#include <QtTest>
++
++class RemoteAuthTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void testValidApprovalAndReplayRejected()
++    {
++        RemoteAuth::RemoteAuthManager mgr;
++        const qint64 t0 = 1000000;
++        const auto created = mgr.createChallenge(QStringLiteral("confirm"), QStringLiteral("Authorize action"), t0, 30000);
++        QVERIFY(created.ok);
++        QCOMPARE(created.challenge.nonce.size(), RemoteAuth::kNonceBytes);
++
++        const auto first = mgr.evaluateResponse(created.challenge.challengeId, created.challenge.nonceBase64, true, false, t0 + 1000);
++        QCOMPARE(first.status, RemoteAuth::EvalStatus::Approved);
++        QCOMPARE(first.purpose, QStringLiteral("confirm"));
++
++        // Replay of the same challengeId/nonce must fail.
++        const auto replay = mgr.evaluateResponse(created.challenge.challengeId, created.challenge.nonceBase64, true, false, t0 + 1100);
++        QCOMPARE(replay.status, RemoteAuth::EvalStatus::UnknownChallenge);
++    }
++
++    void testExpiredAndForgedNonceRejected()
++    {
++        RemoteAuth::RemoteAuthManager mgr;
++        const qint64 t0 = 2000000;
++        const auto c1 = mgr.createChallenge(QStringLiteral("confirm"), QStringLiteral("Test expiry"), t0, 30000);
++        QVERIFY(c1.ok);
++
++        const auto expired = mgr.evaluateResponse(c1.challenge.challengeId, c1.challenge.nonceBase64, true, false, t0 + 30001);
++        QCOMPARE(expired.status, RemoteAuth::EvalStatus::Expired);
++
++        const auto c2 = mgr.createChallenge(QStringLiteral("confirm"), QStringLiteral("Test forged"), t0, 30000);
++        QVERIFY(c2.ok);
++        QByteArray badNonce(RemoteAuth::kNonceBytes, 'A');
++        const auto forged = mgr.evaluateResponse(c2.challenge.challengeId, QString::fromLatin1(badNonce.toBase64()), true, false, t0 + 500);
++        QCOMPARE(forged.status, RemoteAuth::EvalStatus::InvalidNonce);
++    }
++
++    void testDeniedAndUnlockOptInGate()
++    {
++        RemoteAuth::RemoteAuthManager mgr;
++        const qint64 t0 = 3000000;
++        const auto c1 = mgr.createChallenge(QStringLiteral("confirm"), QStringLiteral("Deny test"), t0);
++        QVERIFY(c1.ok);
++        const auto denied = mgr.evaluateResponse(c1.challenge.challengeId, c1.challenge.nonceBase64, false, false, t0 + 200);
++        QCOMPARE(denied.status, RemoteAuth::EvalStatus::Denied);
++
++        const auto c2 = mgr.createChallenge(QStringLiteral("unlock"), QStringLiteral("Unlock PC"), t0);
++        QVERIFY(c2.ok);
++        const auto blocked = mgr.evaluateResponse(c2.challenge.challengeId, c2.challenge.nonceBase64, true, false, t0 + 300);
++        QCOMPARE(blocked.status, RemoteAuth::EvalStatus::UnlockDisabled);
++
++        const auto c3 = mgr.createChallenge(QStringLiteral("unlock"), QStringLiteral("Unlock PC"), t0);
++        QVERIFY(c3.ok);
++        const auto allowed = mgr.evaluateResponse(c3.challenge.challengeId, c3.challenge.nonceBase64, true, true, t0 + 400);
++        QCOMPARE(allowed.status, RemoteAuth::EvalStatus::Approved);
++        QCOMPARE(allowed.purpose, QStringLiteral("unlock"));
++    }
++
++    void testRateLimitingAndSummarySanitization()
++    {
++        RemoteAuth::RemoteAuthManager mgr;
++        const qint64 t0 = 4000000;
++        for (int i = 0; i < RemoteAuth::kRateLimitMaxFailures; ++i) {
++            const auto r = mgr.evaluateResponse(QStringLiteral("missing-id"), QString(), false, false, t0 + i * 100);
++            QCOMPARE(r.status, RemoteAuth::EvalStatus::UnknownChallenge);
++        }
++
++        const auto limited = mgr.createChallenge(QStringLiteral("confirm"), QStringLiteral("Blocked"), t0 + 1000);
++        QVERIFY(!limited.ok);
++        QCOMPARE(limited.error, QStringLiteral("rate_limited"));
++
++        const auto recovered = mgr.createChallenge(
++            QStringLiteral("confirm"),
++            QString(300, QLatin1Char('X')) + QStringLiteral("\n\tsecret"),
++            t0 + RemoteAuth::kRateLimitWindowMs + 2000);
++        QVERIFY(recovered.ok);
++        QCOMPARE(recovered.challenge.summary.size(), RemoteAuth::kMaxSummaryLength);
++    }
++};
++
++QTEST_MAIN(RemoteAuthTest)
++
++#include "remoteauthtest.moc"

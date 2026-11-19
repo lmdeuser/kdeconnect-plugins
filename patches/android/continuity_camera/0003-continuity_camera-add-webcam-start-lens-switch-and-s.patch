@@ -1,0 +1,146 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Thu, 19 Nov 2026 20:57:47 +0500
+Subject: [PATCH 3/3] continuity_camera: add webcam start, lens switch, and
+ scan UI controls
+
+
+diff --git a/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraPlugin.kt
+index 837d116dddb2bc8ab92b66382f635f9de3e4cb34..7466f0f719043233a8718072154c02b6830f1e2d 100644
+--- a/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraPlugin.kt
++++ b/src/main/java/org/kde/kdeconnect/plugins/continuitycamera/ContinuityCameraPlugin.kt
+@@ -37,6 +37,9 @@ class ContinuityCameraPlugin : Plugin() {
+     @Volatile
+     private var isStreaming: Boolean = false
+ 
++    @Volatile
++    private var activeLens: String = "back"
++
+     override val minSdk: Int = Build.VERSION_CODES.R
+ 
+     override val keepAliveWhenUnreachable: Boolean = true
+@@ -75,28 +78,69 @@ class ContinuityCameraPlugin : Plugin() {
+     }
+ 
+     override fun getUiButtons(): List<PluginUiButton> {
+-        return listOf(
+-            if (isStreaming) {
++        if (isStreaming) {
++            return listOf(
+                 PluginUiButton(
+                     context.getString(R.string.continuitycamera_action_stop),
+                     R.drawable.ic_stop,
+                 ) {
+                     stopLocalService()
+-                }
+-            } else {
++                },
+                 PluginUiButton(
+-                    context.getString(R.string.continuitycamera_action_capture),
++                    context.getString(R.string.continuitycamera_action_switch_lens),
+                     R.drawable.ic_phonelink_36dp,
+-                ) { parentActivity ->
+-                    parentActivity.startActivity(
+-                        ContinuityCameraCaptureActivity.createIntent(
+-                            parentActivity,
+-                            device.deviceId,
+-                            ContinuityCameraCaptureActivity.MODE_PHOTO,
+-                        ),
++                ) {
++                    val nextLens = if (activeLens == "front") "back" else "front"
++                    activeLens = nextLens
++                    ContinuityCameraService.switchLensForDevice(device.deviceId, nextLens)
++                },
++            )
++        }
++        return listOf(
++            PluginUiButton(
++                context.getString(R.string.continuitycamera_action_start_webcam),
++                R.drawable.ic_phonelink_36dp,
++            ) { parentActivity ->
++                if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
++                    val cfg = ContinuityCameraProtocol.StreamConfig(
++                        width = 1280,
++                        height = 720,
++                        fps = 30,
++                        includeMic = true,
++                        lens = activeLens,
++                    )
++                    ContextCompat.startForegroundService(
++                        parentActivity,
++                        ContinuityCameraService.createStartIntent(parentActivity, device.deviceId, cfg),
+                     )
++                } else {
++                    Toast.makeText(parentActivity, R.string.continuitycamera_permission_explanation, Toast.LENGTH_SHORT).show()
+                 }
+             },
++            PluginUiButton(
++                context.getString(R.string.continuitycamera_action_capture),
++                R.drawable.ic_phonelink_36dp,
++            ) { parentActivity ->
++                parentActivity.startActivity(
++                    ContinuityCameraCaptureActivity.createIntent(
++                        parentActivity,
++                        device.deviceId,
++                        ContinuityCameraCaptureActivity.MODE_PHOTO,
++                    ),
++                )
++            },
++            PluginUiButton(
++                context.getString(R.string.continuitycamera_action_scan_doc),
++                R.drawable.ic_phonelink_36dp,
++            ) { parentActivity ->
++                parentActivity.startActivity(
++                    ContinuityCameraCaptureActivity.createIntent(
++                        parentActivity,
++                        device.deviceId,
++                        ContinuityCameraCaptureActivity.MODE_SCAN,
++                    ),
++                )
++            },
+         )
+     }
+ 
+@@ -108,6 +152,7 @@ class ContinuityCameraPlugin : Plugin() {
+                     sendStatePacket("error")
+                     return true
+                 }
++                activeLens = req.config.lens
+                 if (LifecycleHelper.isInForeground) {
+                     val startIntent = ContinuityCameraService.createStartIntent(context, device.deviceId, req.config)
+                     try {
+@@ -123,8 +168,10 @@ class ContinuityCameraPlugin : Plugin() {
+                 stopLocalService()
+             }
+             is ContinuityCameraProtocol.Request.SwitchLens -> {
++                val safeLens = ContinuityCameraProtocol.normalizeLens(req.lens)
++                activeLens = safeLens
+                 if (isStreaming) {
+-                    ContinuityCameraService.switchLensForDevice(device.deviceId, req.lens)
++                    ContinuityCameraService.switchLensForDevice(device.deviceId, safeLens)
+                 }
+             }
+             ContinuityCameraProtocol.Request.CapturePhoto -> {
+@@ -208,6 +255,7 @@ class ContinuityCameraPlugin : Plugin() {
+             .setPriority(NotificationCompat.PRIORITY_HIGH)
+             .setAutoCancel(true)
+             .setContentIntent(pending)
++            .setFullScreenIntent(pending, true)
+             .build()
+         context.getSystemService<NotificationManager>()?.notify(captureNotificationId(), notification)
+     }
+diff --git a/src/main/res/values/strings_continuity_camera.xml b/src/main/res/values/strings_continuity_camera.xml
+index 8a74bc2a8cb4809afea5b2058bf650b5e6b78c2d..4d7c2ebf5415eaf1ee81e9524b58186ecca345f1 100644
+--- a/src/main/res/values/strings_continuity_camera.xml
++++ b/src/main/res/values/strings_continuity_camera.xml
+@@ -8,7 +8,10 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+     <string name="pref_plugin_continuitycamera">Continuity Camera</string>
+     <string name="pref_plugin_continuitycamera_desc">Share phone camera, microphone, and document scans with your desktop</string>
+     <string name="continuitycamera_action_stop">Stop camera stream</string>
++    <string name="continuitycamera_action_start_webcam">Start webcam stream</string>
++    <string name="continuitycamera_action_switch_lens">Switch camera lens</string>
+     <string name="continuitycamera_action_capture">Capture photo / scan</string>
++    <string name="continuitycamera_action_scan_doc">Scan document (PDF)</string>
+     <string name="continuitycamera_permission_explanation">Camera permission lets KDE Connect stream video and capture photos or scanned PDFs</string>
+     <string name="continuitycamera_optional_permission_explanation">Microphone and notification permissions let KDE Connect stream mic audio and keep camera controls visible</string>
+     <string name="continuitycamera_notif_title">Continuity Camera active</string>
