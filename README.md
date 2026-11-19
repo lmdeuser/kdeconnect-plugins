@@ -9,16 +9,60 @@ This repository (`lmdeuser/kdeconnect-plugins`) does not fork the desktop or And
 
 ## Included plugins and enhancements
 
-All six active entries declared in [plugins.toml](plugins.toml):
+Six active features defined in [plugins.toml](plugins.toml) make up the continuity stack:
 
-| ID | Kind | Spec | Summary |
+| Plugin | Type | Summary | Specification |
 | --- | --- | --- | --- |
-| `screenstream` | `new_plugin` | [docs/plugins/screenstream/spec.md](docs/plugins/screenstream/spec.md) | Live Android [H.264](https://www.itu.int/rec/T-REC-H.264) screen mirroring ([MediaProjection](https://developer.android.com/media/grow/media-projection) + [MediaCodec](https://developer.android.com/reference/android/media/MediaCodec)) and eligible playback audio (`pcm_s16le` 48 kHz mono via [AudioPlaybackCapture](https://developer.android.com/media/platform/av-capture)) rendered in an isolated [Qt 6 Widgets](https://doc.qt.io/qt-6/qtwidgets-index.html) + [GStreamer](https://gstreamer.freedesktop.org/) helper (`kdeconnect-screenstream-viewer`). Reuses KDE Connect input, clipboard, share (up to 32 files by drag-and-drop), and notification actions ("Open on Phone Screen"), clamps viewer geometry on Wayland rotation via [KWin Scripting](https://develop.kde.org/docs/plasma/kwin/api/), honors [`FLAG_SECURE`](https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE), persists explicit stop across reconnects, and toggles screencast vs Bluetooth audio live via [AudioDeviceCallback](https://developer.android.com/reference/android/media/AudioDeviceCallback). |
-| `continuity_camera` | `new_plugin` | [docs/plugins/continuity_camera/spec.md](docs/plugins/continuity_camera/spec.md) | Streams phone [Camera2](https://developer.android.com/media/camera/camera2) video and optional [AudioRecord](https://developer.android.com/reference/android/media/AudioRecord) mic audio to Linux through `kdeconnect-continuitycamera-bridge` and [PipeWire](https://pipewire.org/) [`pipewiresink`](https://gitlab.freedesktop.org/pipewire/pipewire/-/tree/master/src/gst) (`kdeconnect_continuity_camera` / `kdeconnect_continuity_mic`), running strictly in userspace without a [`v4l2loopback`](https://github.com/v4l2loopback/v4l2loopback) kernel module, plus on-demand photo capture and multi-page PDF scans built with Android [PdfDocument](https://developer.android.com/reference/android/graphics/pdf/PdfDocument). |
-| `bt_audio_switch` | `new_plugin` | [docs/plugins/bt_audio_switch/spec.md](docs/plugins/bt_audio_switch/spec.md) | Coordinates [Bluetooth A2DP / HFP](https://www.bluetooth.com/specifications/specs/) headset ownership between Ubuntu ([BlueZ `org.bluez.Device1`](https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc/org.bluez.Device.rst) + PipeWire) and Android for user-allowlisted MAC addresses, with a 3000 ms anti-oscillation hysteresis cooldown and shared audio arbitration that suppresses automatic phone `media` claims while PC screencast audio is active. |
-| `clipboard_images` | `upstream_enhancement` | [docs/plugins/clipboard_images/spec.md](docs/plugins/clipboard_images/spec.md) | Bidirectional image clipboard synchronization over `kdeconnect.clipboard.file` (capped at 20 MiB on Android, shared via [FileProvider](https://developer.android.com/reference/androidx/core/content/FileProvider) with 5-file cache pruning, and exposed as both `QImage` and URL `QMimeData` on Linux Wayland via [KSystemClipboard](https://invent.kde.org/frameworks/kguiaddons/-/blob/master/src/systemclipboard/ksystemclipboard.h)). |
-| `otp_autofill` | `upstream_enhancement` | [docs/plugins/otp_autofill/spec.md](docs/plugins/otp_autofill/spec.md) | Automatically copies 4-8 digit 2FA/OTP codes from non-silent English or Russian notifications into the desktop clipboard via [KSystemClipboard](https://invent.kde.org/frameworks/kguiaddons/-/blob/master/src/systemclipboard/ksystemclipboard.h), tags them with `x-kde-passwordManagerHint=secret` (honored by [Klipper](https://invent.kde.org/plasma/plasma-workspace/-/blob/master/klipper/klipper.cpp)), clears after 60 s if unchanged, filters out years, currency amounts, and phone numbers, and falls back to real-time incoming inbox SMS deltas (`SMSPlugin`, <= 16 messages, <= 120 s old) when [Android 15 sensitive-notification redaction](https://developer.android.com/about/versions/15/behavior-changes-all#sensitive-notifications) hides OTP text from third-party [NotificationListenerService](https://developer.android.com/reference/android/service/notification/NotificationListenerService) apps lacking system-only [`RECEIVE_SENSITIVE_NOTIFICATIONS`](https://developer.android.com/reference/android/Manifest.permission#RECEIVE_SENSITIVE_NOTIFICATIONS). |
-| `remote_auth` | `new_plugin` | [docs/plugins/remote_auth/spec.md](docs/plugins/remote_auth/spec.md) | Prompts interactive Android [BiometricPrompt](https://developer.android.com/reference/android/hardware/biometrics/BiometricPrompt) confirmation for desktop [D-Bus](https://dbus.freedesktop.org/doc/dbus-specification.html) requests (`org.kde.kdeconnect.device.remoteauth`) and opt-in [`org.freedesktop.login1`](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html) session unlock (`unlockAllowed` defaults to `false`), using single-use 256-bit CSPRNG nonces, a 30 s TTL, and max 5/min rate limiting. System-wide PAM/polkit replacement is out of scope. |
+| [`screenstream`](#screen-stream-screenstream) | New plugin | Live phone screen and audio viewer with mouse/keyboard control | [screenstream](docs/plugins/screenstream/spec.md) |
+| [`continuity_camera`](#continuity-camera-continuity_camera) | New plugin | Phone camera and mic as PipeWire devices plus photo/PDF scans | [continuity_camera](docs/plugins/continuity_camera/spec.md) |
+| [`bt_audio_switch`](#bluetooth-audio-switch-bt_audio_switch) | New plugin | Coordinated Bluetooth headset handoff between PC and phone | [bt_audio_switch](docs/plugins/bt_audio_switch/spec.md) |
+| [`clipboard_images`](#image-clipboard-clipboard_images) | Enhancement | Bidirectional PNG/JPEG clipboard sync over Wi-Fi | [clipboard_images](docs/plugins/clipboard_images/spec.md) |
+| [`otp_autofill`](#otp-auto-copy-otp_autofill) | Enhancement | Automatic 2FA/OTP copy with secret hint and Android 15 fallback | [otp_autofill](docs/plugins/otp_autofill/spec.md) |
+| [`remote_auth`](#remote-biometric-auth-remote_auth) | New plugin | Phone fingerprint/credential approval for desktop requests | [remote_auth](docs/plugins/remote_auth/spec.md) |
+
+### Screen Stream (`screenstream`)
+
+Streams an Android 11+ display over [H.264](https://www.itu.int/rec/T-REC-H.264) ([MediaProjection](https://developer.android.com/media/grow/media-projection) + [MediaCodec](https://developer.android.com/reference/android/media/MediaCodec)) and eligible playback audio (`pcm_s16le` 48 kHz mono via [AudioPlaybackCapture](https://developer.android.com/media/platform/av-capture)) to an isolated [Qt 6 Widgets](https://doc.qt.io/qt-6/qtwidgets-index.html) and [GStreamer](https://gstreamer.freedesktop.org/) viewer (`kdeconnect-screenstream-viewer`).
+
+- **Input & sharing:** Reuses KDE Connect's mouse, long-press, scroll, keyboard, clipboard, drag-and-drop file sharing (up to 32 files via `SharePlugin`), and "Open on Phone Screen" notification action.
+- **Wayland window clamping:** Keeps the viewer within monitor work-area bounds across portrait/landscape phone rotations via [KWin Scripting](https://develop.kde.org/docs/plasma/kwin/api/) on Plasma Wayland.
+- **Privacy controls:** Honors [`FLAG_SECURE`](https://developer.android.com/reference/android/view/WindowManager.LayoutParams#FLAG_SECURE) windows, requires Android's system capture consent per session, and remembers an explicit stop across reconnects.
+- **Live audio toggle:** Switches seamlessly between `Audio: Screencast` and `Audio: Bluetooth` via [`AudioDeviceCallback`](https://developer.android.com/reference/android/media/AudioDeviceCallback) without restarting video.
+
+### Continuity Camera (`continuity_camera`)
+
+Exposes the paired phone's camera and microphone to Linux desktop apps over Wi-Fi, alongside on-demand photo capture and multi-page document scanning.
+
+- **Userspace PipeWire webcam & mic:** `kdeconnect-continuitycamera-bridge` publishes [PipeWire](https://pipewire.org/) [`pipewiresink`](https://gitlab.freedesktop.org/pipewire/pipewire/-/tree/master/src/gst) sources (`kdeconnect_continuity_camera` and `kdeconnect_continuity_mic`) without requiring a [`v4l2loopback`](https://github.com/v4l2loopback/v4l2loopback) kernel module.
+- **Camera2 & PDF capture:** Streams [Camera2](https://developer.android.com/media/camera/camera2) video and optional [AudioRecord](https://developer.android.com/reference/android/media/AudioRecord) audio with front/rear lens switching, or builds multi-page scanned PDFs with Android [`PdfDocument`](https://developer.android.com/reference/android/graphics/pdf/PdfDocument).
+
+### Bluetooth Audio Switch (`bt_audio_switch`)
+
+Coordinates [Bluetooth A2DP and HFP](https://www.bluetooth.com/specifications/specs/) headset ownership between Ubuntu and Android for explicitly allowlisted MAC addresses.
+
+- **Handoff with hysteresis:** Uses [BlueZ (`org.bluez.Device1`)](https://git.kernel.org/pub/scm/bluetooth/bluez.git/tree/doc/org.bluez.Device.rst) with PipeWire sink routing on Ubuntu and Android Bluetooth profile proxies, guarded by a 3000 ms cooldown against ping-pong reconnects.
+- **Screencast audio arbitration:** Suppresses automatic phone `media` headset claims while Screen Stream audio is active on the PC so sound never plays on both routes at once.
+
+### Image Clipboard (`clipboard_images`)
+
+Adds bidirectional image synchronization over `kdeconnect.clipboard.file`.
+
+- **Android transfer:** Caps received images at 20 MiB, prunes its local cache to 5 recent files, and exposes content URIs safely via [`FileProvider`](https://developer.android.com/reference/androidx/core/content/FileProvider).
+- **Wayland paste integration:** Populates both `QImage` pixels and file URLs in `QMimeData` through [`KSystemClipboard`](https://invent.kde.org/frameworks/kguiaddons/-/blob/master/src/systemclipboard/ksystemclipboard.h) so images paste cleanly into browsers and editors.
+
+### OTP Auto-Copy (`otp_autofill`)
+
+Extracts 4-8 digit two-factor authentication codes from incoming phone notifications and places them on the Ubuntu Wayland clipboard.
+
+- **Noise filter & secret hint:** Supports English and Russian OTP phrasing while rejecting years, currency amounts, and phone numbers; attaches `x-kde-passwordManagerHint=secret` for [Klipper](https://invent.kde.org/plasma/plasma-workspace/-/blob/master/klipper/klipper.cpp) and clears after 60 s if unchanged.
+- **Android 15 SMS fallback:** When [Android 15 sensitive-notification redaction](https://developer.android.com/about/versions/15/behavior-changes-all#sensitive-notifications) hides OTPs from third-party [`NotificationListenerService`](https://developer.android.com/reference/android/service/notification/NotificationListenerService) apps lacking [`RECEIVE_SENSITIVE_NOTIFICATIONS`](https://developer.android.com/reference/android/Manifest.permission#RECEIVE_SENSITIVE_NOTIFICATIONS), `SMSPlugin` pushes fresh incoming inbox deltas (`<= 16` messages, `<= 120 s`) if `READ_SMS` is granted.
+
+### Remote Biometric Auth (`remote_auth`)
+
+Displays an interactive Android [`BiometricPrompt`](https://developer.android.com/reference/android/hardware/biometrics/BiometricPrompt) confirmation dialog on the phone for desktop D-Bus approval requests.
+
+- **Replay & burst protection:** Uses single-use 256-bit CSPRNG nonces, a 30 s TTL, and a 5 requests/minute cap on its [D-Bus](https://dbus.freedesktop.org/doc/dbus-specification.html) interface (`org.kde.kdeconnect.device.remoteauth`).
+- **Opt-in session unlock:** Optionally unlocks an idle desktop session over [`org.freedesktop.login1`](https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html) when `unlockAllowed` is enabled (`false` by default). System-wide PAM or polkit replacement is out of scope.
 
 ## Install on Ubuntu 26.04 (x86_64, Wayland)
 
