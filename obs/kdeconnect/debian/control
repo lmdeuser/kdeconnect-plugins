@@ -82,7 +82,8 @@ Homepage: https://kdeconnect.kde.org
 
 Package: kdeconnect
 Architecture: any
-Depends: kdeconnect-libs (>= ${binary:Version}),
+Depends: gstreamer1.0-pipewire,
+         kdeconnect-libs (>= ${binary:Version}),
          kirigami-addons-data,
          libqca-qt6-plugins,
          plasma-desktoptheme,
@@ -92,7 +93,6 @@ Depends: kdeconnect-libs (>= ${binary:Version}),
          ${qml6:Depends},
          ${shlibs:Depends},
 Recommends: gstreamer1.0-libav,
-            gstreamer1.0-pipewire,
             gstreamer1.0-plugins-bad,
             gstreamer1.0-plugins-base,
             gstreamer1.0-plugins-good,
