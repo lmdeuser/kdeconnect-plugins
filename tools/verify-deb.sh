@@ -66,6 +66,8 @@ if [[ $rebuild_image -eq 1 ]]; then
     docker builder prune -f --filter "until=168h" >/dev/null 2>&1 || true
 fi
 
+deb_checks=$(python3 "$project/tools/plugin_registry.py" deb-checks --registry "$project/plugins.toml")
+
 docker run --rm \
   --network none \
   --security-opt=no-new-privileges:true \
@@ -80,26 +82,13 @@ docker run --rm \
   --memory-swap=1g \
   --pids-limit=256 \
   --shm-size=128m \
+  -e "DEB_CHECKS=$deb_checks" \
   --mount "type=bind,src=$debs_dir,dst=/input/debs,readonly" \
   --mount "type=bind,src=$libei_dir,dst=/input/libei,readonly" \
   "$image_tag" bash -lc '
 set -euo pipefail
 dpkg -i /input/libei/libei1_*.deb /input/debs/kdeconnect-libs_*.deb /input/debs/qml6-module-org-kde-kdeconnect_*.deb /input/debs/kdeconnect_*.deb
-so_path=$(find /usr/lib -name "kdeconnect_screenstream.so" | head -n 1)
-test -n "$so_path"
-test -x /usr/bin/kdeconnect-screenstream-viewer
-test -f /usr/share/kdeconnect/kdeconnect_screenstream_config.qml
-
-needed=$(LC_ALL=C readelf -d /usr/bin/kdeconnect-screenstream-viewer | grep "(NEEDED)")
-echo "$needed"
-if echo "$needed" | grep -qi "Qt6Multimedia"; then
-    echo "ERROR: Qt6Multimedia must not be linked" >&2
-    exit 1
-fi
-echo "$needed" | grep -q "libgstreamer-1.0.so.0"
-echo "$needed" | grep -q "libQt6Widgets.so.6"
-
-gst-inspect-1.0 appsrc h264parse avdec_h264 audioconvert audioresample autoaudiosink >/dev/null
+bash -euo pipefail -c "$DEB_CHECKS"
 dpkg -P kdeconnect qml6-module-org-kde-kdeconnect kdeconnect-libs libei1
 echo "VERIFY_DEB_OK"
 '

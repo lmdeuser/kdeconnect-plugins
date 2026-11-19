@@ -15,14 +15,15 @@ Use this skill when preparing verified upstream `work/<plugin_id>` branches for 
 
 ## Mandatory Upstream Compliance
 
-1. Verify `work/<plugin_id>` is rebased cleanly onto the verified `origin/master` of `kdeconnect-kde` (or `kdeconnect-android`) with coherent, single-purpose commits.
-2. Run the upstream branch checker from the harness repository:
+1. Verify each individual `work/<plugin_id>` branch registered in `plugins.toml` is rebased cleanly onto the verified `origin/master` of `kdeconnect-kde` (or `kdeconnect-android`) with coherent, single-purpose commits (never submit `work/continuity-stack` or `obs/kdeconnect-staging`).
+2. Run the upstream branch checker per branch from the harness repository:
    ```bash
    python3 tools/check_kde_compliance.py \
      --upstream-repo "$KDECONNECT_DESKTOP_SRC" \
-     --base origin/master
+     --base origin/master \
+     --ref "refs/heads/work/<plugin_id>"
    ```
-3. Confirm the check verifies:
+3. Confirm each branch check verifies:
    - Zero non-ASCII characters in source/CMake/Kotlin/QML files
    - Valid REUSE 3.0 SPDX headers on all added files
    - Zero `debian/`, `obs/`, `.agents/`, `prototype/`, or `.state/` files in the upstream diff

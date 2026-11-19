@@ -254,7 +254,8 @@ class UpstreamSyncSecurityTests(unittest.TestCase):
         self.assertIn("docker image prune -f", script)
         self.assertNotIn("docker image prune -a", script)
         self.assertIn('docker builder prune -f --filter "until=168h"', script)
-        self.assertIn("readelf -d /usr/bin/kdeconnect-screenstream-viewer", script)
+        self.assertIn("plugin_registry.py", script)
+        self.assertIn("deb-checks", script)
         self.assertNotIn("ldd ", script)
 
         ov_hash = compute_overlay_sha256(ROOT / "obs" / "kdeconnect" / "debian")

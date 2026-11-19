@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
+# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+
+version = 1
+
+[[plugins]]
+id = "screenstream"
+kind = "new_plugin"
+status = "active"
+desktop_branch = "work/screenstream"
+android_branch = "work/screenstream"
+spec = "docs/plugins/screenstream/spec.md"
+verify_so = ["kdeconnect_screenstream.so"]
+verify_bins = ["/usr/bin/kdeconnect-screenstream-viewer"]
+verify_qml = ["/usr/share/kdeconnect/kdeconnect_screenstream_config.qml"]
+verify_gst_elements = ["appsrc", "h264parse", "avdec_h264", "audioconvert", "audioresample", "autoaudiosink"]
+
+[plugins.required_needed_libs]
+"/usr/bin/kdeconnect-screenstream-viewer" = ["libgstreamer-1.0.so.0", "libQt6Widgets.so.6"]
+
+[plugins.forbidden_needed_libs]
+"/usr/bin/kdeconnect-screenstream-viewer" = ["Qt6Multimedia"]
+
+[[plugins]]
+id = "clipboard_images"
+kind = "upstream_enhancement"
+status = "active"
+desktop_branch = "work/clipboard_images"
+android_branch = "work/clipboard_images"
+spec = "docs/plugins/clipboard_images/spec.md"
+verify_so = ["kdeconnect_clipboard.so"]
+
+[[plugins]]
+id = "otp_autofill"
+kind = "upstream_enhancement"
+status = "active"
+desktop_branch = "work/otp_autofill"
+android_branch = ""
+spec = "docs/plugins/otp_autofill/spec.md"
+verify_so = ["kdeconnect_notifications.so"]
+
+[[plugins]]
+id = "continuity_camera"
+kind = "new_plugin"
+status = "planned"
+desktop_branch = "work/continuity_camera"
+android_branch = "work/continuity_camera"
+spec = "docs/plugins/continuity_camera/spec.md"
+verify_so = ["kdeconnect_continuitycamera.so"]
+verify_bins = ["/usr/bin/kdeconnect-continuitycamera-bridge"]
+verify_gst_elements = ["appsrc", "h264parse", "avdec_h264", "pipewiresink"]
+
+[[plugins]]
+id = "remote_auth"
+kind = "new_plugin"
+status = "planned"
+desktop_branch = "work/remote_auth"
+android_branch = "work/remote_auth"
+spec = "docs/plugins/remote_auth/spec.md"
+verify_so = ["kdeconnect_remoteauth.so"]
+
+[[plugins]]
+id = "bt_audio_switch"
+kind = "new_plugin"
+status = "planned"
+desktop_branch = "work/bt_audio_switch"
+android_branch = "work/bt_audio_switch"
+spec = "docs/plugins/bt_audio_switch/spec.md"
+verify_so = ["kdeconnect_btaudioswitch.so"]

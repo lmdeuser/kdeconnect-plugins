@@ -145,13 +145,38 @@ def _find_non_ascii_line(text: str) -> tuple[int, str] | None:
     return None
 
 
-def check_upstream_branch(repo_path: Path, base_ref: str) -> list[str]:
+def _find_non_ascii_in_diff(
+    repo_path: Path,
+    base_ref: str,
+    head_ref: str,
+    rel: str,
+) -> tuple[int, str] | None:
+    patch = subprocess.check_output(
+        ["git", "-C", str(repo_path), "diff", "-U0", f"{base_ref}..{head_ref}", "--", rel],
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    lineno = 0
+    for line in patch.splitlines():
+        if line.startswith("@@"):
+            plus_part = line.split("+", 1)[1].split(" ", 1)[0]
+            lineno = int(plus_part.split(",", 1)[0])
+        elif line.startswith("+") and not line.startswith("+++ "):
+            for ch in line[1:]:
+                if ord(ch) > 127:
+                    return lineno, f"U+{ord(ch):04X}"
+            lineno += 1
+    return None
+
+
+def check_upstream_branch(repo_path: Path, base_ref: str, head_ref: str = "HEAD") -> list[str]:
     """Validate an external KDE Connect upstream branch against Invent contribution rules."""
     issues: list[str] = []
     known = _known_licenses(repo_path)
 
     diff_raw = subprocess.check_output(
-        ["git", "-C", str(repo_path), "diff", "--name-status", f"{base_ref}..HEAD"],
+        ["git", "-C", str(repo_path), "diff", "--name-status", f"{base_ref}..{head_ref}"],
         text=True,
     )
     for line in diff_raw.splitlines():
@@ -169,7 +194,7 @@ def check_upstream_branch(repo_path: Path, base_ref: str) -> list[str]:
 
         try:
             content = subprocess.check_output(
-                ["git", "-C", str(repo_path), "show", f"HEAD:{rel}"],
+                ["git", "-C", str(repo_path), "show", f"{head_ref}:{rel}"],
                 text=True,
                 encoding="utf-8",
             )
@@ -178,7 +203,11 @@ def check_upstream_branch(repo_path: Path, base_ref: str) -> list[str]:
 
         name = Path(rel).name
         if rel.endswith(ASCII_REQUIRED_SUFFIXES) or name == "CMakeLists.txt":
-            bad_char = _find_non_ascii_line(content)
+            bad_char = (
+                _find_non_ascii_line(content)
+                if status.startswith("A")
+                else _find_non_ascii_in_diff(repo_path, base_ref, head_ref, rel)
+            )
             if bad_char:
                 lineno, codepoint = bad_char
                 issues.append(f"{rel}:{lineno}: contains non-ASCII character ({codepoint}); use ASCII")
@@ -192,7 +221,7 @@ def check_upstream_branch(repo_path: Path, base_ref: str) -> list[str]:
                     issues.append(f"{rel}: missing SPDX header")
 
     commit_log = subprocess.check_output(
-        ["git", "-C", str(repo_path), "log", "--format=%H%n%B%n---END---", f"{base_ref}..HEAD"],
+        ["git", "-C", str(repo_path), "log", "--format=%H%n%B%n---END---", f"{base_ref}..{head_ref}"],
         text=True,
         encoding="utf-8",
     )
@@ -211,10 +240,11 @@ def main() -> int:
     parser.add_argument("--repo-root", type=Path, default=Path.cwd(), help="Harness repository root")
     parser.add_argument("--upstream-repo", type=Path, help="External KDE Connect checkout to validate")
     parser.add_argument("--base", default="origin/master", help="Base ref for upstream branch diff")
+    parser.add_argument("--ref", default="HEAD", help="Target ref for upstream branch diff (default: HEAD)")
     args = parser.parse_args()
 
     if args.upstream_repo is not None:
-        issues = check_upstream_branch(args.upstream_repo.resolve(), args.base)
+        issues = check_upstream_branch(args.upstream_repo.resolve(), args.base, head_ref=args.ref)
         label = "Upstream KDE Invent compliance"
     else:
         issues = check_repo_reuse(args.repo_root.resolve())

@@ -432,6 +432,60 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(obs_controller._cmd_cycle(wait_sec=0), 0)
                 synth_mock.assert_not_called()
 
+    def test_cycle_uses_multi_plugin_stack_manifest_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "hub"
+            state = root / ".state"
+            repo = state / "repos" / "kdeconnect-kde"
+            overlay = root / "obs" / "kdeconnect" / "debian"
+            (state / "sync").mkdir(parents=True)
+            overlay.mkdir(parents=True)
+            (overlay / "control").write_text("Source: kdeconnect\n", encoding="utf-8")
+            (repo / ".git").mkdir(parents=True)
+            upstream_sha = "a" * 40
+            base_sha = "c" * 40
+            plugin_shas = {
+                "screenstream": "1" * 40,
+                "clipboard_images": "2" * 40,
+                "otp_autofill": "3" * 40,
+            }
+            stack_manifest = [
+                {"id": pid, "ref": f"refs/heads/plugin/{pid}", "base_sha": base_sha}
+                for pid in plugin_shas
+            ]
+            (state / "sync" / "stack.json").write_text(json.dumps(stack_manifest), encoding="utf-8")
+
+            from tools.upstream_sync import compute_overlay_sha256, compute_stack_fingerprint
+
+            fp = compute_stack_fingerprint(upstream_sha, plugin_shas, compute_overlay_sha256(overlay))
+
+            def fake_git(_repo: Path | None, *args: str, **_kwargs: object) -> subprocess.CompletedProcess:
+                if args == ("remote", "get-url", "origin"):
+                    return subprocess.CompletedProcess([], 0, stdout="https://invent.kde.org/network/kdeconnect-kde.git\n")
+                if args == ("fetch", "origin", "master"):
+                    return subprocess.CompletedProcess([], 0, stdout="")
+                if args == ("rev-parse", "refs/remotes/origin/master"):
+                    return subprocess.CompletedProcess([], 0, stdout=upstream_sha + "\n")
+                for pid, sha in plugin_shas.items():
+                    if args == ("rev-parse", f"refs/heads/plugin/{pid}"):
+                        return subprocess.CompletedProcess([], 0, stdout=sha + "\n")
+                raise AssertionError(f"Unexpected git call: {args}")
+
+            with (
+                mock.patch.object(obs_controller, "ROOT", root),
+                mock.patch.object(obs_controller, "STATE", state),
+                mock.patch.object(obs_controller, "_cmd_verify_env", return_value=0),
+                mock.patch.object(obs_controller, "check_android_upstream_drift", return_value={"status": "ok"}),
+                mock.patch.object(obs_controller, "run_git_hardened", side_effect=fake_git),
+                mock.patch.object(obs_controller, "synthesize_plugin_stack") as stack_mock,
+            ):
+                (state / "sync" / "kdeconnect.json").write_text(
+                    json.dumps({"promoted_fingerprint": fp}),
+                    encoding="utf-8",
+                )
+                self.assertEqual(obs_controller._cmd_cycle(wait_sec=0), 0)
+                stack_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

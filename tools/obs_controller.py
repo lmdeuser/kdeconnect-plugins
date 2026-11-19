@@ -22,26 +22,32 @@ try:
     from tools.check_kde_compliance import check_upstream_branch
     from tools.obs_packaging import build_kdeconnect_bundle, strip_spdx_comments, strip_xml_comments, verify_bundle_manifest
     from tools.upstream_sync import (
+        PluginStackEntry,
         SRCMD5_RE,
         build_scrubbed_env,
         compute_cycle_fingerprint,
         compute_overlay_sha256,
+        compute_stack_fingerprint,
         query_remote_head,
         run_git_hardened,
         synthesize_plugin_branch,
+        synthesize_plugin_stack,
         validate_remote_url,
     )
 except ImportError:
     from check_kde_compliance import check_upstream_branch
     from obs_packaging import build_kdeconnect_bundle, strip_spdx_comments, strip_xml_comments, verify_bundle_manifest
     from upstream_sync import (
+        PluginStackEntry,
         SRCMD5_RE,
         build_scrubbed_env,
         compute_cycle_fingerprint,
         compute_overlay_sha256,
+        compute_stack_fingerprint,
         query_remote_head,
         run_git_hardened,
         synthesize_plugin_branch,
+        synthesize_plugin_stack,
         validate_remote_url,
     )
 
@@ -757,24 +763,44 @@ def _cmd_cycle(wait_sec: int = 2400, no_promote: bool = False, dry_run: bool = F
     check_android_upstream_drift(STATE)
 
     repo_dir = STATE / "repos" / "kdeconnect-kde"
+    stack_file = STATE / "sync" / "stack.json"
     base_file = STATE / "sync" / "plugin_base.txt"
-    if not (repo_dir / ".git").exists() or not base_file.is_file():
+    if not (repo_dir / ".git").exists() or (not stack_file.is_file() and not base_file.is_file()):
         print(
             "ERROR: Runner desktop mirror not initialized; run tools/sync-runner.sh from workstation first.",
             file=sys.stderr,
         )
         return 1
 
-    plugin_base_sha = base_file.read_text(encoding="utf-8").strip()
     origin_url = run_git_hardened(repo_dir, "remote", "get-url", "origin").stdout.strip()
     validate_remote_url(origin_url)
     run_git_hardened(repo_dir, "fetch", "origin", "master")
 
     upstream_sha = run_git_hardened(repo_dir, "rev-parse", "refs/remotes/origin/master").stdout.strip()
-    plugin_sha = run_git_hardened(repo_dir, "rev-parse", "refs/heads/plugin/screenstream").stdout.strip()
     overlay_dir = ROOT / "obs" / "kdeconnect" / "debian"
     overlay_sha = compute_overlay_sha256(overlay_dir)
-    fingerprint = compute_cycle_fingerprint(upstream_sha, plugin_sha, overlay_sha)
+
+    stack_entries: list[PluginStackEntry] | None = None
+    plugin_shas: dict[str, str] = {}
+    if stack_file.is_file():
+        stack_raw = json.loads(stack_file.read_text(encoding="utf-8"))
+        stack_entries = [
+            PluginStackEntry(
+                plugin_id=str(item["id"]),
+                plugin_ref=str(item["ref"]),
+                plugin_base_sha=str(item["base_sha"]),
+            )
+            for item in stack_raw
+        ]
+        for entry in stack_entries:
+            plugin_shas[entry.plugin_id] = run_git_hardened(repo_dir, "rev-parse", entry.plugin_ref).stdout.strip()
+        plugin_base_sha = stack_entries[0].plugin_base_sha
+        plugin_sha = plugin_shas[stack_entries[0].plugin_id]
+        fingerprint = compute_stack_fingerprint(upstream_sha, plugin_shas, overlay_sha)
+    else:
+        plugin_base_sha = base_file.read_text(encoding="utf-8").strip()
+        plugin_sha = run_git_hardened(repo_dir, "rev-parse", "refs/heads/plugin/screenstream").stdout.strip()
+        fingerprint = compute_cycle_fingerprint(upstream_sha, plugin_sha, overlay_sha)
 
     sync_path = STATE / "sync" / "kdeconnect.json"
     sync_state = json.loads(sync_path.read_text(encoding="utf-8")) if sync_path.is_file() else {}
@@ -791,6 +817,8 @@ def _cmd_cycle(wait_sec: int = 2400, no_promote: bool = False, dry_run: bool = F
         wait_sec=wait_sec,
         no_promote=no_promote,
         dry_run=dry_run,
+        stack_entries=stack_entries,
+        plugin_shas=plugin_shas,
     )
 
 
@@ -808,6 +836,8 @@ def _execute_cycle_with_cleanup(
     wait_sec: int,
     no_promote: bool,
     dry_run: bool,
+    stack_entries: list[PluginStackEntry] | None = None,
+    plugin_shas: dict[str, str] | None = None,
 ) -> int:
     if dry_run:
         if sync_state.get("promoted_fingerprint") == fingerprint:
@@ -841,13 +871,21 @@ def _execute_cycle_with_cleanup(
             candidate = None
 
         if candidate is None:
-            synth = synthesize_plugin_branch(
-                repo_dir=repo_dir,
-                upstream_ref="refs/remotes/origin/master",
-                plugin_ref="refs/heads/plugin/screenstream",
-                plugin_base_sha=plugin_base_sha,
-                target_branch="obs/kdeconnect-staging",
-            )
+            if stack_entries is not None:
+                synth = synthesize_plugin_stack(
+                    repo_dir=repo_dir,
+                    upstream_ref="refs/remotes/origin/master",
+                    entries=stack_entries,
+                    target_branch="obs/kdeconnect-staging",
+                )
+            else:
+                synth = synthesize_plugin_branch(
+                    repo_dir=repo_dir,
+                    upstream_ref="refs/remotes/origin/master",
+                    plugin_ref="refs/heads/plugin/screenstream",
+                    plugin_base_sha=plugin_base_sha,
+                    target_branch="obs/kdeconnect-staging",
+                )
             if not synth.ok or not synth.synthesized_sha:
                 sync_state["active_candidate"] = {
                     "fingerprint": fingerprint,
@@ -897,6 +935,7 @@ def _execute_cycle_with_cleanup(
                 "stage": "staging_uploaded",
                 "upstream_sha": upstream_sha,
                 "plugin_sha": plugin_sha,
+                "plugin_shas": dict(plugin_shas or {}),
                 "overlay_sha": overlay_sha,
                 "synthesized_sha": synth.synthesized_sha,
                 "srcmd5": cand_meta["srcmd5"],

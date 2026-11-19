@@ -95,6 +95,13 @@ FORBIDDEN_TREE_TOP_PREFIXES = ("debian/", "obs/", ".state/", ".github/workflows/
 
 
 @dataclass(frozen=True)
+class PluginStackEntry:
+    plugin_id: str
+    plugin_ref: str
+    plugin_base_sha: str
+
+
+@dataclass(frozen=True)
 class SynthesisResult:
     ok: bool
     status: str
@@ -372,72 +379,97 @@ def compute_cycle_fingerprint(upstream_sha: str, plugin_sha: str, overlay_sha: s
     return hashlib.sha256(payload).hexdigest()
 
 
-def synthesize_plugin_branch(
+def compute_stack_fingerprint(upstream_sha: str, plugin_shas: dict[str, str], overlay_sha: str) -> str:
+    """Compute a deterministic fingerprint over upstream HEAD, ordered plugin SHAs, and overlay."""
+    ordered = ",".join(f"{key}={plugin_shas[key]}" for key in sorted(plugin_shas))
+    payload = f"{upstream_sha}:{ordered}:{overlay_sha}".encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def synthesize_plugin_stack(
     repo_dir: Path,
     upstream_ref: str,
-    plugin_ref: str,
-    plugin_base_sha: str,
+    entries: list[PluginStackEntry],
     target_branch: str = "obs/kdeconnect-staging",
     allow_file_protocol: bool = False,
 ) -> SynthesisResult:
-    """Cherry-pick plugin_base_sha..plugin_ref onto upstream_ref without rewriting plugin_ref."""
-    if not SHA40_RE.match(plugin_base_sha):
-        return SynthesisResult(ok=False, status="invalid_base_sha", error=f"Invalid base SHA: {plugin_base_sha}")
+    """Cherry-pick multiple plugin branches onto upstream_ref without mutating source refs."""
+    if not entries:
+        return SynthesisResult(ok=False, status="empty_stack", error="No plugin entries supplied")
 
-    rev_proc = run_git_hardened(
-        repo_dir,
-        "rev-list",
-        "--reverse",
-        f"{plugin_base_sha}..{plugin_ref}",
-        allow_file_protocol=allow_file_protocol,
-        check=False,
-    )
-    if rev_proc.returncode != 0:
-        return SynthesisResult(ok=False, status="rev_list_failed", error=rev_proc.stderr.strip())
-    commits = [line.strip() for line in rev_proc.stdout.splitlines() if line.strip()]
-    if not commits:
-        return SynthesisResult(ok=False, status="empty_range", error="No plugin commits found above base SHA")
+    planned_picks: list[tuple[PluginStackEntry, list[str]]] = []
+    for entry in entries:
+        if not SHA40_RE.match(entry.plugin_base_sha):
+            return SynthesisResult(
+                ok=False,
+                status="invalid_base_sha",
+                error=f"{entry.plugin_id}: invalid base SHA {entry.plugin_base_sha}",
+            )
 
-    plugin_tree_issues = verify_tree_cleanliness(repo_dir, plugin_ref)
-    if plugin_tree_issues:
-        return SynthesisResult(
-            ok=False,
-            status="dirty_tree",
-            error="; ".join(plugin_tree_issues),
+        rev_proc = run_git_hardened(
+            repo_dir,
+            "rev-list",
+            "--reverse",
+            f"{entry.plugin_base_sha}..{entry.plugin_ref}",
+            allow_file_protocol=allow_file_protocol,
+            check=False,
         )
+        if rev_proc.returncode != 0:
+            return SynthesisResult(
+                ok=False,
+                status="rev_list_failed",
+                error=f"{entry.plugin_id}: {rev_proc.stderr.strip()}",
+            )
+        commits = [line.strip() for line in rev_proc.stdout.splitlines() if line.strip()]
+        if not commits:
+            return SynthesisResult(
+                ok=False,
+                status="empty_range",
+                error=f"{entry.plugin_id}: no plugin commits found above base SHA",
+            )
+
+        plugin_tree_issues = verify_tree_cleanliness(repo_dir, entry.plugin_ref)
+        if plugin_tree_issues:
+            return SynthesisResult(
+                ok=False,
+                status="dirty_tree",
+                error=f"{entry.plugin_id}: " + "; ".join(plugin_tree_issues),
+            )
+        planned_picks.append((entry, commits))
 
     run_git_hardened(repo_dir, "checkout", "-f", "-B", target_branch, upstream_ref, allow_file_protocol=allow_file_protocol)
     run_git_hardened(repo_dir, "reset", "--hard", upstream_ref, allow_file_protocol=allow_file_protocol)
     run_git_hardened(repo_dir, "clean", "-fdx", allow_file_protocol=allow_file_protocol)
 
-    cp_proc = run_git_hardened(
-        repo_dir,
-        "cherry-pick",
-        "--no-gpg-sign",
-        *commits,
-        allow_file_protocol=allow_file_protocol,
-        check=False,
-        extra_config=(("user.name", MAINTAINER_NAME), ("user.email", MAINTAINER_EMAIL)),
-    )
-    if cp_proc.returncode != 0:
-        conflicts_proc = run_git_hardened(
+    for entry, commits in planned_picks:
+        cp_proc = run_git_hardened(
             repo_dir,
-            "diff",
-            "--name-only",
-            "--diff-filter=U",
+            "cherry-pick",
+            "--no-gpg-sign",
+            *commits,
             allow_file_protocol=allow_file_protocol,
             check=False,
+            extra_config=(("user.name", MAINTAINER_NAME), ("user.email", MAINTAINER_EMAIL)),
         )
-        conflicts = tuple(line.strip() for line in conflicts_proc.stdout.splitlines() if line.strip())
-        run_git_hardened(repo_dir, "cherry-pick", "--abort", allow_file_protocol=allow_file_protocol, check=False)
-        run_git_hardened(repo_dir, "reset", "--hard", upstream_ref, allow_file_protocol=allow_file_protocol)
-        run_git_hardened(repo_dir, "clean", "-fdx", allow_file_protocol=allow_file_protocol)
-        return SynthesisResult(
-            ok=False,
-            status="rebase_conflict",
-            conflict_files=conflicts,
-            error=cp_proc.stderr.strip() or "cherry-pick conflict",
-        )
+        if cp_proc.returncode != 0:
+            conflicts_proc = run_git_hardened(
+                repo_dir,
+                "diff",
+                "--name-only",
+                "--diff-filter=U",
+                allow_file_protocol=allow_file_protocol,
+                check=False,
+            )
+            conflicts = tuple(line.strip() for line in conflicts_proc.stdout.splitlines() if line.strip())
+            run_git_hardened(repo_dir, "cherry-pick", "--abort", allow_file_protocol=allow_file_protocol, check=False)
+            run_git_hardened(repo_dir, "reset", "--hard", upstream_ref, allow_file_protocol=allow_file_protocol)
+            run_git_hardened(repo_dir, "clean", "-fdx", allow_file_protocol=allow_file_protocol)
+            return SynthesisResult(
+                ok=False,
+                status="rebase_conflict",
+                conflict_files=conflicts,
+                error=f"{entry.plugin_id}: {cp_proc.stderr.strip() or 'cherry-pick conflict'}",
+            )
 
     tree_issues = verify_tree_cleanliness(repo_dir, "HEAD")
     if tree_issues:
@@ -449,6 +481,30 @@ def synthesize_plugin_branch(
 
     head_sha = run_git_hardened(repo_dir, "rev-parse", "HEAD", allow_file_protocol=allow_file_protocol).stdout.strip()
     return SynthesisResult(ok=True, status="ok", synthesized_sha=head_sha)
+
+
+def synthesize_plugin_branch(
+    repo_dir: Path,
+    upstream_ref: str,
+    plugin_ref: str,
+    plugin_base_sha: str,
+    target_branch: str = "obs/kdeconnect-staging",
+    allow_file_protocol: bool = False,
+) -> SynthesisResult:
+    """Cherry-pick plugin_base_sha..plugin_ref onto upstream_ref without rewriting plugin_ref."""
+    return synthesize_plugin_stack(
+        repo_dir=repo_dir,
+        upstream_ref=upstream_ref,
+        entries=[
+            PluginStackEntry(
+                plugin_id="screenstream",
+                plugin_ref=plugin_ref,
+                plugin_base_sha=plugin_base_sha,
+            )
+        ],
+        target_branch=target_branch,
+        allow_file_protocol=allow_file_protocol,
+    )
 
 
 def main() -> int:
