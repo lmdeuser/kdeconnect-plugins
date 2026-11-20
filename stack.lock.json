@@ -4,69 +4,74 @@
     "desktop": {
       "upstream_url": "https://invent.kde.org/network/kdeconnect-kde.git",
       "base_sha": "69ce9c5c49ce209600873bf10ddf61bfe4dfab1c",
-      "expected_tree_sha": "bbd5be1c642138d7b5e9da7645f4f699b82d714c",
-      "expected_head_sha": "0c8af24677a1e29d5239df41c1e31abe696c7051",
+      "expected_tree_sha": "959c58c7490c4139f43cfdaeab768f6a08fc502f",
+      "expected_head_sha": "3fc12614bd3e3cd96e14025a96fe6ae4914d9890",
       "plugins": [
         {
           "id": "screenstream",
           "branch": "work/screenstream",
-          "expected_tree_sha": "725a383f376942dc9ebe8b8cf896263d78181a88",
-          "expected_head_sha": "b8c7537c6ea83efcba305e446cf6209956ba5774",
+          "expected_tree_sha": "6432695cbe03d3a5956b6e80715360f4fff8db45",
+          "expected_head_sha": "4ad8a19cef201ab8e711cd58ca9579cac686c04a",
           "patches": [
             {
               "path": "patches/desktop/screenstream/0001-Add-screenstream-plugin-and-Wayland-viewer-helper.patch",
-              "sha256": "28b7ab97777155b7e67967bc94d351877daff57a7ecc51169bf25f6860e8dc6b",
+              "sha256": "5dfd6957e6dd8032656b41a9fce7560f1f9fd30ee291c5e854ee7f263355023f",
               "bytes": 123768
             },
             {
               "path": "patches/desktop/screenstream/0002-feat-screenstream-add-Wake-Screen-action-and-fix-vie.patch",
-              "sha256": "3a3470125f65bb0352c968ae58bceecad5b935c94f4abd50ed2daeffc2b3c6ea",
+              "sha256": "6506f04e5ac0a5568ac314d17afc4999752eaa4f9e497b1bcda7c98726265f4f",
               "bytes": 15284
             },
             {
               "path": "patches/desktop/screenstream/0003-feat-screenstream-support-stationary-left-button-lon.patch",
-              "sha256": "e45b411b06a98ad6e6b6fa7356f76eb1a21b3da6696a519b2193fb6a3412086e",
+              "sha256": "0122f91b1fbc5b0d6da128281f446b79a68a17aca134a6a4cd6380d66fb0161b",
               "bytes": 6279
             },
             {
               "path": "patches/desktop/screenstream/0004-screenstream-forward-viewer-logs-and-repeat-H.264-SP.patch",
-              "sha256": "bf8a9545462737e5840eeef3a83c227e51e24271344bcb9cb0d8977a1a8ef86e",
+              "sha256": "bd4cf8699d0cdcca5f21d97cefb3d58deb3aa595b464a82a2f83255f29f53a5b",
               "bytes": 1572
             },
             {
               "path": "patches/desktop/screenstream/0005-screenstream-add-Drag-Drop-file-share-and-Open-on-Ph.patch",
-              "sha256": "3ace3e6f75e4e31ad7ffed3c857473014d9bb2325708c80ce74d3e4aa76be257",
+              "sha256": "56ff84b4757a6500ab5cd252ff34bec95d1d0fe8d21c2ae7ddf674adbdb2ca01",
               "bytes": 9189
             },
             {
               "path": "patches/desktop/screenstream/0006-screenstream-fix-geometry-scaling-D-Bus-deadlock-Gst.patch",
-              "sha256": "741d2ee099eb79efc68ce2ddfae5207f80b2b5f7060780c211755c28a4050fba",
+              "sha256": "177f009bbbc70fb8d755842467c5b6e925e4da52d4c27dd36ec8608797668d2b",
               "bytes": 29403
             },
             {
               "path": "patches/desktop/screenstream/0007-screenstream-clamp-viewer-window-within-monitor-boun.patch",
-              "sha256": "699b017908f66c3df64b7674b8715218b9407a47221d06ecaac70ea81247e75e",
+              "sha256": "b6158140a0e3cbf3eb5467065af33a7485e8778f7ab7f74795b3deeee54c8b37",
               "bytes": 20161
             },
             {
               "path": "patches/desktop/screenstream/0008-screenstream-add-mutually-exclusive-screencast-Bluet.patch",
-              "sha256": "f09a9064889b5addb445b5c2d4a765fc4e1c85a41cf70be96216e44d2c62bfae",
+              "sha256": "9068a4eff10830721fb2dd1dda916f05310b285df5c98bee16169adb322d8ab9",
               "bytes": 21020
             },
             {
               "path": "patches/desktop/screenstream/0009-screenstream-support-48-kHz-stereo-audio-sample-PTS-.patch",
-              "sha256": "f51cec94bfe9df6387ddf7e33b3ce3aeaaa3ee6b7cdba839dc43837e4565c017",
+              "sha256": "39f5c3c86898d8ea0f3c1d1dd6067829f38151bff996436fb22515a22d0fc850",
               "bytes": 36161
             },
             {
               "path": "patches/desktop/screenstream/0010-screenstream-auto-suspend-A2DP-and-enable-HFP-gatewa.patch",
-              "sha256": "836ccde8c3bc284c0549a2077a0e20a7fe916dfe932da5bbc87f5ed208adb11e",
+              "sha256": "7473684e4dfbc07ac18c9e6c4709e2910d1c05ae4620799415fce54535dd9316",
               "bytes": 12996
             },
             {
               "path": "patches/desktop/screenstream/0011-screenstream-keep-phone-A2DP-connected-and-mute-PC-l.patch",
-              "sha256": "bf5953bc7cd9cc26916107898487389994878dabf1ecb655471873b8a2729090",
+              "sha256": "a93ad10452ad7dd7a53e81359303d052e47b7ed2abb6fca031b3443d1c387f63",
               "bytes": 8044
+            },
+            {
+              "path": "patches/desktop/screenstream/0012-screenstream-add-Plasma-plasmoid-quick-toggle-and-me.patch",
+              "sha256": "f2cf6f2e664fcb565c2e9b6d55ac357a577cef0fdb1b1fa51649161f3539aa36",
+              "bytes": 5490
             }
           ]
         },
@@ -109,38 +114,43 @@
         {
           "id": "continuity_camera",
           "branch": "work/continuity_camera",
-          "expected_tree_sha": "07846f0293f4aa5e0d7b75de4ace84062de3a550",
-          "expected_head_sha": "99c259ae96ff452a37b7c23478f2d88bc0e42260",
+          "expected_tree_sha": "a8f826f85dbc6983f8922497bd23d139219f0244",
+          "expected_head_sha": "1c9885b8b6763d6bccb97854971bf87efed652cb",
           "patches": [
             {
               "path": "patches/desktop/continuity_camera/0001-plugins-add-continuity_camera-PipeWire-virtual-camer.patch",
-              "sha256": "f964a7e4648c72f31b34c1f525c40794a9df4030b5eac66a47367961265722a7",
+              "sha256": "d6d413b420daf05bae23482dac1e3188cdfd5b9e3f113813033e6cf5c48c6b03",
               "bytes": 55455
             },
             {
               "path": "patches/desktop/continuity_camera/0002-continuity_camera-fix-live-PTS-stall-capture-collisi.patch",
-              "sha256": "7c3e98f911803e7db35527d50763cea43546ffb69b8e9f74f88ed32332c60aa2",
+              "sha256": "9b02d35302638207deddd1e3c256cfc44c9d949e344cc431e211cc03c85a270b",
               "bytes": 17158
             },
             {
               "path": "patches/desktop/continuity_camera/0003-continuity_camera-pass-lvalue-NetworkPacket-to-sendP.patch",
-              "sha256": "31332ea8399545e2eeaad2707ec2ce7ccbb45bc137d7f5c5148bf429ccfd374b",
+              "sha256": "82a9a98d29f8e174e762aa15c72d976d454d5871fd0c74cdfe8711847a8120ad",
               "bytes": 1134
             },
             {
               "path": "patches/desktop/continuity_camera/0004-continuity_camera-add-QML-D-Bus-webcam-controls-and-.patch",
-              "sha256": "3fa210eb2bc956860de860ae98b793560faa7f0e2b29baeb0f54f73d68ad9b27",
+              "sha256": "5a1fa505f03faf3e14d3bdb16fe4f7cda9c990db1c0be75fd297addadf36f3a7",
               "bytes": 20698
             },
             {
               "path": "patches/desktop/continuity_camera/0005-continuity_camera-add-PipeWire-audio-jitter-queue-sa.patch",
-              "sha256": "8a0a60a54ab157742a971e83e898c80bca12cf0abae5bfcf46eee231150dee2d",
+              "sha256": "76ed425afa99793acc04d74b83ff0af84b606f16a31295106b4f1da83e1d73ef",
               "bytes": 8490
             },
             {
               "path": "patches/desktop/continuity_camera/0006-continuity_camera-normalize-I420-30fps-PipeWire-caps.patch",
-              "sha256": "71cfa297ad1dbdd13feb6e74359e54218b8c2e50fd4a0b59c79d5a4057ab3b4f",
+              "sha256": "0cdf7d8021ea4f12a65ec815017f88eb695d332a5431ca23dcd73e8099bab5bb",
               "bytes": 11311
+            },
+            {
+              "path": "patches/desktop/continuity_camera/0007-continuity_camera-add-Plasma-plasmoid-webcam-and-sca.patch",
+              "sha256": "678d79e08112b627bfb80f45c5fe4c81ce129d60280122fb96da37897ad573ce",
+              "bytes": 4635
             }
           ]
         },
@@ -165,28 +175,33 @@
         {
           "id": "bt_audio_switch",
           "branch": "work/bt_audio_switch",
-          "expected_tree_sha": "321cab0c4c151e4066511525bebd6a813fdd2a03",
-          "expected_head_sha": "11f2492558abda6034052d7f650dea7358b02d3c",
+          "expected_tree_sha": "c13689c448862d4c69749b8258ed786622935b88",
+          "expected_head_sha": "aec36d39ada8d8ea26c2da4c1cd9b2124bf07a56",
           "patches": [
             {
               "path": "patches/desktop/bt_audio_switch/0001-plugins-add-bt_audio_switch-headset-handoff-plugin.patch",
-              "sha256": "236fa731f54504d494e311d809bba33aecfe03d7e33088e7b2d6438bfc7aa80e",
+              "sha256": "200cd8714df6b93c88251ca8f056c205785a80fe910e2dc70db7333f021a9a5c",
               "bytes": 26100
             },
             {
               "path": "patches/desktop/bt_audio_switch/0002-bt_audio_switch-fix-stale-claim-timer-async-sink-sel.patch",
-              "sha256": "d8b5fa3ac146bf32387a862dd89725476d73608bba27b465d901e813f1de7c51",
+              "sha256": "5b5449cb6aae213fdc582080d51cec31f1ef4e347978f72dbe8b903f66f666db",
               "bytes": 16359
             },
             {
               "path": "patches/desktop/bt_audio_switch/0003-bt_audio_switch-call-Device1.Disconnect-after-Discon.patch",
-              "sha256": "c21b5f29ede0b7824cac7f426fef0a9b486195472d7c692175201b9d1156375a",
+              "sha256": "61561147dd04703dc61f3bb7d8b7e752ef216bafadc41d93759e5498d585976a",
               "bytes": 1260
             },
             {
               "path": "patches/desktop/bt_audio_switch/0004-bt_audio_switch-auto-resolve-BlueZ-device-path-acros.patch",
-              "sha256": "25c4ba2476c87b38851a3dc9bfcac1817084c968898715d69d6116ae58636354",
+              "sha256": "a17c4639e0861771ef70b841c46f63fe11372f362d83f483b00ff10a57602115",
               "bytes": 3629
+            },
+            {
+              "path": "patches/desktop/bt_audio_switch/0005-bt_audio_switch-add-QML-D-Bus-wrapper-and-Plasma-pla.patch",
+              "sha256": "6d352b66a86a1584fa4af860939299271ff14d3957b0fc8d3a4282c31be1f569",
+              "bytes": 10199
             }
           ]
         }

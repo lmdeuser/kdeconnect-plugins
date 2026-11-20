@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 16:05:16 +0500
-Subject: [PATCH 2/6] continuity_camera: fix live PTS stall, capture collision
+Subject: [PATCH 2/7] continuity_camera: fix live PTS stall, capture collision
  delete, and teardown races
 
 

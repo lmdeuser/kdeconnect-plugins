@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 14:09:51 +0500
-Subject: [PATCH 05/11] screenstream: add Drag & Drop file share and Open on
+Subject: [PATCH 05/12] screenstream: add Drag & Drop file share and Open on
  Phone Screen action
 
 

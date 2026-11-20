@@ -1,0 +1,247 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 21:31:14 +0500
+Subject: [PATCH 5/5] bt_audio_switch: add QML D-Bus wrapper and Plasma
+ plasmoid menu actions
+
+
+diff --git a/dbusinterfaces/CMakeLists.txt b/dbusinterfaces/CMakeLists.txt
+index 622c506c265c813f71890f88e23a0010b5e4ee9c..d61fcf6ec0095d1d2a0c89a4d1ccab9b89ce9e0e 100644
+--- a/dbusinterfaces/CMakeLists.txt
++++ b/dbusinterfaces/CMakeLists.txt
+@@ -34,6 +34,7 @@ set(dbusinterfaces_SRC
+ geninterface(${PROJECT_SOURCE_DIR}/core/daemon.h generated/daemoninterface)
+ geninterface(${PROJECT_SOURCE_DIR}/core/device.h generated/deviceinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/battery/batteryplugin.h generated/batteryinterface)
++geninterface(${PROJECT_SOURCE_DIR}/plugins/bt_audio_switch/btaudioswitchplugin.h generated/btaudioswitchinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/connectivity-report/connectivity_reportplugin.h generated/connectivityinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/sftp/sftpplugin.h generated/devicesftpinterface)
+ geninterface(${PROJECT_SOURCE_DIR}/plugins/notifications/notificationsplugin.h generated/devicenotificationsinterface)
+diff --git a/dbusinterfaces/dbusinterfaces.cpp b/dbusinterfaces/dbusinterfaces.cpp
+index 40374c314434af2c5ec49b1e2b6809294738b70a..444ea20969125a7aa92b74dc6274cb5fc0c7e334 100644
+--- a/dbusinterfaces/dbusinterfaces.cpp
++++ b/dbusinterfaces/dbusinterfaces.cpp
+@@ -62,6 +62,18 @@ BatteryDbusInterface::BatteryDbusInterface(const QString &id, QObject *parent)
+     connect(this, &OrgKdeKdeconnectDeviceBatteryInterface::refreshed, this, &BatteryDbusInterface::refreshedProxy);
+ }
+ 
++BtAudioSwitchDbusInterface::BtAudioSwitchDbusInterface(const QString &id, QObject *parent)
++    : OrgKdeKdeconnectDeviceBtaudioswitchInterface(DaemonDbusInterface::activatedService(),
++                                                   QLatin1String("/modules/kdeconnect/devices/%1/btaudioswitch").arg(id),
++                                                   QDBusConnection::sessionBus(),
++                                                   parent)
++{
++    connect(this,
++            &OrgKdeKdeconnectDeviceBtaudioswitchInterface::allowedHeadsetMacsChanged,
++            this,
++            &BtAudioSwitchDbusInterface::allowedHeadsetMacsChangedProxy);
++}
++
+ ConnectivityReportDbusInterface::ConnectivityReportDbusInterface(const QString &id, QObject *parent)
+     : OrgKdeKdeconnectDeviceConnectivity_reportInterface(DaemonDbusInterface::activatedService(),
+                                                          QLatin1String("/modules/kdeconnect/devices/%1/connectivity_report").arg(id),
+diff --git a/dbusinterfaces/dbusinterfaces.h b/dbusinterfaces/dbusinterfaces.h
+index f7ad3fa26c97673f400edf60481aa537f8c23f45..5493fc236b4dca9f5972cb2c5c4db5bb2de18027 100644
+--- a/dbusinterfaces/dbusinterfaces.h
++++ b/dbusinterfaces/dbusinterfaces.h
+@@ -19,6 +19,7 @@
+ #include "generated/devicenotificationsinterface.h"
+ #include "generated/devicesftpinterface.h"
+ #include "generated/lockdeviceinterface.h"
++#include "generated/btaudioswitchinterface.h"
+ #include "generated/mprisremoteinterface.h"
+ #include "generated/notificationinterface.h"
+ #include "generated/remotecommandsinterface.h"
+@@ -98,6 +99,17 @@ Q_SIGNALS:
+     void refreshedProxy(bool isCharging, int charge);
+ };
+ 
++class KDECONNECTDBUSINTERFACES_EXPORT BtAudioSwitchDbusInterface : public OrgKdeKdeconnectDeviceBtaudioswitchInterface
++{
++    Q_OBJECT
++    Q_PROPERTY(QStringList allowedHeadsetMacs READ allowedHeadsetMacs WRITE setAllowedHeadsetMacs NOTIFY allowedHeadsetMacsChangedProxy)
++public:
++    explicit BtAudioSwitchDbusInterface(const QString &deviceId, QObject *parent = nullptr);
++
++Q_SIGNALS:
++    void allowedHeadsetMacsChangedProxy(const QStringList &macs);
++};
++
+ class KDECONNECTDBUSINTERFACES_EXPORT ConnectivityReportDbusInterface : public OrgKdeKdeconnectDeviceConnectivity_reportInterface
+ {
+     Q_OBJECT
+diff --git a/declarativeplugin/kdeconnectdeclarativeplugin.h b/declarativeplugin/kdeconnectdeclarativeplugin.h
+index c0ab263ec7b0956541fe0eb50de8102ed295a1f2..dab721552e6b5dac0fbfef035b57f35b73717562 100644
+--- a/declarativeplugin/kdeconnectdeclarativeplugin.h
++++ b/declarativeplugin/kdeconnectdeclarativeplugin.h
+@@ -109,6 +109,14 @@ class BatteryDbusInterfaceForeign
+     QML_FOREIGN(BatteryDbusInterface)
+ };
+ 
++class BtAudioSwitchDbusInterfaceForeign
++{
++    Q_GADGET
++    QML_NAMED_ELEMENT(BtAudioSwitchDbusInterface)
++    QML_UNCREATABLE("")
++    QML_FOREIGN(BtAudioSwitchDbusInterface)
++};
++
+ class DeviceDbusInterfaceForeign
+ {
+     Q_GADGET
+@@ -265,6 +273,18 @@ public:
+     }
+ };
+ 
++class BtAudioSwitchDbusInterfaceFactory : public QObject
++{
++    Q_OBJECT
++    QML_ELEMENT
++    QML_SINGLETON
++public:
++    Q_INVOKABLE BtAudioSwitchDbusInterface *create(const QString &deviceId)
++    {
++        return new BtAudioSwitchDbusInterface(deviceId);
++    }
++};
++
+ class DeviceConnectivityReportDbusInterfaceFactory : public QObject
+ {
+     Q_OBJECT
+diff --git a/plasmoid/package/contents/ui/BtAudioSwitch.qml b/plasmoid/package/contents/ui/BtAudioSwitch.qml
+new file mode 100644
+index 0000000000000000000000000000000000000000..8291233f85311466c0e79f72d66730012f18417e
+--- /dev/null
++++ b/plasmoid/package/contents/ui/BtAudioSwitch.qml
+@@ -0,0 +1,52 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++pragma ComponentBehavior: Bound
++
++import QtQuick
++
++import org.kde.kdeconnect as KDEConnect
++
++QtObject {
++    id: root
++
++    required property KDEConnect.DeviceDbusInterface device
++
++    readonly property alias available: checker.available
++
++    readonly property KDEConnect.PluginChecker pluginChecker: KDEConnect.PluginChecker {
++        id: checker
++        pluginName: "btaudioswitch"
++        device: root.device
++    }
++
++    readonly property KDEConnect.BtAudioSwitchDbusInterface plugin:
++        available ? KDEConnect.BtAudioSwitchDbusInterfaceFactory.create(device.id()) : null
++
++    readonly property bool hasHeadsets: (plugin?.allowedHeadsetMacs?.length ?? 0) > 0
++
++    function applyToHeadsets(claim: bool): void {
++        if (!plugin) {
++            return;
++        }
++        const macs = plugin.allowedHeadsetMacs;
++        for (let i = 0; i < macs.length; ++i) {
++            if (claim) {
++                plugin.claimHeadset(macs[i], "manual");
++            } else {
++                plugin.releaseHeadset(macs[i]);
++            }
++        }
++    }
++
++    function claimHeadsets(): void {
++        applyToHeadsets(true);
++    }
++
++    function releaseHeadsets(): void {
++        applyToHeadsets(false);
++    }
++}
+diff --git a/plasmoid/package/contents/ui/DeviceDelegate.qml b/plasmoid/package/contents/ui/DeviceDelegate.qml
+index 2aff75be560ce421ce84feee1f58675c3e20f65d..d45e4b8f1b16a3b9a8a907d53fe70668808dc8df 100644
+--- a/plasmoid/package/contents/ui/DeviceDelegate.qml
++++ b/plasmoid/package/contents/ui/DeviceDelegate.qml
+@@ -41,6 +41,11 @@ PlasmaComponents.ItemDelegate {
+         device: root.device
+     }
+ 
++    BtAudioSwitch {
++        id: btaudioswitch
++        device: root.device
++    }
++
+     Clipboard {
+         id: clipboard
+         device: root.device
+@@ -155,6 +160,21 @@ PlasmaComponents.ItemDelegate {
+                 sms.plugin.launchApp()
+             }
+         }
++
++        // Bluetooth Audio Switch
++        PlasmaExtras.MenuItem {
++            icon: "audio-headphones"
++            visible: btaudioswitch.available && btaudioswitch.hasHeadsets
++            text: i18n("Claim headset audio")
++            onClicked: btaudioswitch.claimHeadsets()
++        }
++
++        PlasmaExtras.MenuItem {
++            icon: "network-bluetooth"
++            visible: btaudioswitch.available && btaudioswitch.hasHeadsets
++            text: i18n("Release headset audio")
++            onClicked: btaudioswitch.releaseHeadsets()
++        }
+     }
+ 
+     DropArea {
+diff --git a/plugins/bt_audio_switch/btaudioswitchplugin.cpp b/plugins/bt_audio_switch/btaudioswitchplugin.cpp
+index 52783985ef0898e13af9e68e558bfb876926b2ab..4e7835d6188dbefcda6b96cd2b6176380912794e 100644
+--- a/plugins/bt_audio_switch/btaudioswitchplugin.cpp
++++ b/plugins/bt_audio_switch/btaudioswitchplugin.cpp
+@@ -52,8 +52,10 @@ QString BtAudioSwitchPlugin::dbusPath() const
+ 
+ void BtAudioSwitchPlugin::onConfigChanged()
+ {
++    const QStringList previous = m_coordinator.allowlist();
+     const QString rawMacs = config()->getString(QStringLiteral("allowedHeadsetMacs"), QString());
+-    m_coordinator.setAllowlist(BtAudioSwitch::parseAllowlist(rawMacs));
++    const QStringList next = BtAudioSwitch::parseAllowlist(rawMacs);
++    m_coordinator.setAllowlist(next);
+     for (auto it = m_transitionGeneration.begin(); it != m_transitionGeneration.end(); ++it) {
+         ++(*it);
+     }
+@@ -62,6 +64,9 @@ void BtAudioSwitchPlugin::onConfigChanged()
+     }
+     m_autoSwitch = config()->getBool(QStringLiteral("autoSwitch"), true);
+     m_adapterPath = config()->getString(QStringLiteral("adapterPath"), QStringLiteral("/org/bluez/hci0"));
++    if (next != previous) {
++        Q_EMIT allowedHeadsetMacsChanged(next);
++    }
+ }
+ 
+ QStringList BtAudioSwitchPlugin::allowedHeadsetMacs() const
+diff --git a/plugins/bt_audio_switch/btaudioswitchplugin.h b/plugins/bt_audio_switch/btaudioswitchplugin.h
+index 7e89ea01628e73df0fd44526c0b51179b078aa46..c2bc00e7931bd683b3fc39e84cd296e9503d88f9 100644
+--- a/plugins/bt_audio_switch/btaudioswitchplugin.h
++++ b/plugins/bt_audio_switch/btaudioswitchplugin.h
+@@ -32,8 +32,8 @@ public:
+ 
+     Q_SCRIPTABLE bool claimHeadset(const QString &mac, const QString &reason = QStringLiteral("manual"));
+     Q_SCRIPTABLE bool releaseHeadset(const QString &mac);
+-    Q_SCRIPTABLE QStringList allowedHeadsetMacs() const;
+-    Q_SCRIPTABLE void setAllowedHeadsetMacs(const QStringList &macs);
++    QStringList allowedHeadsetMacs() const;
++    void setAllowedHeadsetMacs(const QStringList &macs);
+ 
+ Q_SIGNALS:
+     Q_SCRIPTABLE void headsetOwnerChanged(const QString &mac, const QString &owner, const QString &reason);

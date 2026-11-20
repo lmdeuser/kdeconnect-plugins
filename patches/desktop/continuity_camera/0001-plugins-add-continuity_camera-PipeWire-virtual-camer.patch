@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 14:56:43 +0500
-Subject: [PATCH 1/6] plugins: add continuity_camera PipeWire virtual camera
+Subject: [PATCH 1/7] plugins: add continuity_camera PipeWire virtual camera
  and mic plugin
 
 

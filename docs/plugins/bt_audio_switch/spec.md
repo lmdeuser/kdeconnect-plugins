@@ -24,7 +24,7 @@
   - `PauseMusicPlugin` (`plugins/pausemusic/`) pattern for `PulseAudioQt::Context` and call-state (`kdeconnect.telephony`) / MPRIS playback monitoring.
   - Existing KDE Connect paired mutual-TLS transport for coordination messages (`kdeconnect.btaudioswitch`).
 - **New plugin components (planned Wave 2):**
-  - Desktop `plugins/bt_audio_switch/`: `BtAudioSwitchPlugin` coordinating BlueZ `org.bluez.Device1::Connect` / `DisconnectProfile` + `Disconnect` (auto-resolving devices across `/org/bluez/hci*` adapters and dropping residual ACL/AVRCP links for single-point headsets) and PipeWire default sink selection, paired with per-device MAC allowlist configuration and anti-oscillation hysteresis (`3000 ms`).
+  - Desktop `plugins/bt_audio_switch/`: `BtAudioSwitchPlugin` coordinating BlueZ `org.bluez.Device1::Connect` / `DisconnectProfile` + `Disconnect` (auto-resolving devices across `/org/bluez/hci*` adapters and dropping residual ACL/AVRCP links for single-point headsets) and PipeWire default sink selection, paired with per-device MAC allowlist configuration, anti-oscillation hysteresis (`3000 ms`), QML `BtAudioSwitchDbusInterface` / `BtAudioSwitchDbusInterfaceFactory` bindings, and Plasma tray `plasmoid/package/contents/ui/` (`BtAudioSwitch.qml`, `DeviceDelegate.qml`) menu actions (`Claim headset audio`, `Release headset audio` when `allowedHeadsetMacs` is non-empty).
   - Android `plugins/btaudioswitch/`: `BtAudioSwitchPlugin.kt` monitoring active audio playback / `AudioManager.MODE_IN_CALL` and executing opt-in Bluetooth profile connect/release for allowlisted headset MACs.
 - **Session and capability isolation:** Never alters unconnected Bluetooth devices; operates strictly on paired, user-allowlisted headset MAC addresses configured on both sides.
 
@@ -44,6 +44,6 @@
 - **Build-time tests (`ctest` / JUnit):**
   - Desktop `ctest`: MAC validation, allowlist enforcement rejecting unlisted MACs, 3000 ms hysteresis deduplication, tie-break priority (`call` overrides `media`).
   - Android JUnit: packet parsing, MAC canonicalization, and allowlist enforcement.
-- **OBS package checks:** `plugins.toml` verifies `kdeconnect_btaudioswitch.so` in staged `.deb`.
+- **OBS package checks:** `plugins.toml` verifies `kdeconnect_btaudioswitch.so` and `BtAudioSwitch.qml` in staged `.deb`.
 - **Live device matrix:** Pair dual-connected Bluetooth headset to Ubuntu desktop and Android phone -> start media on phone while idle on PC -> verify audio routes cleanly without loop; receive call on phone while watching video on PC -> verify HFP call claim; verify permission-denied graceful disable.
 - **Open design questions:** Resolved (single-point yield delay fixed at `300 ms` after remote disconnect before initiating BlueZ `Connect()`).

@@ -207,6 +207,9 @@ Canvas interactions inside `ScreenCanvasWidget` (active only while streaming and
   - **`Switch webcam to front camera` / `Switch webcam to rear camera`** (visible while webcam active): Switches active phone lens live via `ContinuityCameraPlugin::toggleLens()`.
   - **`Take photo with phone`**: Triggers Android capture UI (`MODE_PHOTO`) to shoot and transfer a still JPEG.
   - **`Scan document with phone`**: Triggers multi-page Android document scanner (`MODE_SCAN`) returning a consolidated PDF via `SharePlugin`.
+- **Plasma Tray Applet (Plasmoid, `org.kde.kdeconnect`):**
+  - **Device header quick toggle (`ScreenStream.qml`):** Icon button alongside battery/signal indicators toggles **`View device screen`** / **`Stop screen stream`**.
+  - **Overflow menu (`DeviceDelegate.qml`):** Exposes **`View device screen` / `Stop screen stream`**, **`Wake device screen`** (`screenstream`), **`Use phone as webcam` / `Stop phone webcam`**, **`Switch webcam to front camera` / `Switch webcam to rear camera`** (when webcam active), **`Take photo with phone`**, **`Scan document with phone`** (`continuity_camera`), plus **`Claim headset audio`** and **`Release headset audio`** (`bt_audio_switch`, shown when `allowedHeadsetMacs` is non-empty).
 - **Plasma Notification Action:**
   - **`Open on Phone Screen`** (shown on synced Android notifications with `hasContentIntent == true`): Triggers the phone's `contentIntent` and either wakes an active `screenstream` session or launches the viewer.
 - **Screen Stream Plugin Settings (`kdeconnect_screenstream_config.qml`):**

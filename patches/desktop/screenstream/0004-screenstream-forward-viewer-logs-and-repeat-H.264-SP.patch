@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Thu, 19 Nov 2026 13:44:21 +0500
-Subject: [PATCH 04/11] screenstream: forward viewer logs and repeat H.264
+Subject: [PATCH 04/12] screenstream: forward viewer logs and repeat H.264
  SPS/PPS on IDR
 
 

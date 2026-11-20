@@ -1,0 +1,132 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 21:29:47 +0500
+Subject: [PATCH 7/7] continuity_camera: add Plasma plasmoid webcam and scan
+ menu actions
+
+
+diff --git a/plasmoid/package/contents/ui/ContinuityCamera.qml b/plasmoid/package/contents/ui/ContinuityCamera.qml
+new file mode 100644
+index 0000000000000000000000000000000000000000..29fb67d972bff415ac93201b63c15f7eec764cf7
+--- /dev/null
++++ b/plasmoid/package/contents/ui/ContinuityCamera.qml
+@@ -0,0 +1,28 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++pragma ComponentBehavior: Bound
++
++import QtQuick
++
++import org.kde.kdeconnect as KDEConnect
++
++QtObject {
++    id: root
++
++    required property KDEConnect.DeviceDbusInterface device
++
++    readonly property alias available: checker.available
++
++    readonly property KDEConnect.PluginChecker pluginChecker: KDEConnect.PluginChecker {
++        id: checker
++        pluginName: "continuitycamera"
++        device: root.device
++    }
++
++    readonly property KDEConnect.ContinuityCameraDbusInterface plugin:
++        available ? KDEConnect.ContinuityCameraDbusInterfaceFactory.create(device.id()) : null
++}
+diff --git a/plasmoid/package/contents/ui/DeviceDelegate.qml b/plasmoid/package/contents/ui/DeviceDelegate.qml
+index 2aff75be560ce421ce84feee1f58675c3e20f65d..74f75c7da565322e725789e0c3da7851e968df31 100644
+--- a/plasmoid/package/contents/ui/DeviceDelegate.qml
++++ b/plasmoid/package/contents/ui/DeviceDelegate.qml
+@@ -56,6 +56,11 @@ PlasmaComponents.ItemDelegate {
+         device: root.device
+     }
+ 
++    ContinuityCamera {
++        id: continuitycamera
++        device: root.device
++    }
++
+     RemoteCommands {
+         id: remoteCommands
+         device: root.device
+@@ -123,6 +128,59 @@ PlasmaComponents.ItemDelegate {
+             }
+         }
+ 
++        // Continuity Camera
++        PlasmaExtras.MenuItem {
++            icon: (continuitycamera.plugin?.active ?? false) ? "media-playback-stop" : "camera-video"
++            visible: continuitycamera.available
++            text: (continuitycamera.plugin?.active ?? false) ? i18n("Stop phone webcam") : i18n("Use phone as webcam")
++            onClicked: {
++                if (!continuitycamera.plugin) {
++                    return;
++                }
++                if (continuitycamera.plugin.active) {
++                    continuitycamera.plugin.stopCamera();
++                    continuityCameraPrompt.visible = false;
++                } else {
++                    continuitycamera.plugin.startDefaultCamera();
++                    continuityCameraPrompt.subtitle = continuitycamera.plugin.lastError;
++                    continuityCameraPrompt.visible = continuityCameraPrompt.subtitle.length > 0;
++                }
++            }
++        }
++
++        PlasmaExtras.MenuItem {
++            icon: "view-refresh"
++            visible: continuitycamera.available && (continuitycamera.plugin?.active ?? false)
++            text: (continuitycamera.plugin?.currentLens === "front") ? i18n("Switch webcam to rear camera") : i18n("Switch webcam to front camera")
++            onClicked: {
++                if (continuitycamera.plugin) {
++                    continuitycamera.plugin.toggleLens();
++                }
++            }
++        }
++
++        PlasmaExtras.MenuItem {
++            icon: "camera-photo"
++            visible: continuitycamera.available
++            text: i18n("Take photo with phone")
++            onClicked: {
++                if (continuitycamera.plugin) {
++                    continuitycamera.plugin.requestPhotoCapture();
++                }
++            }
++        }
++
++        PlasmaExtras.MenuItem {
++            icon: "scanner"
++            visible: continuitycamera.available
++            text: i18n("Scan document with phone")
++            onClicked: {
++                if (continuitycamera.plugin) {
++                    continuitycamera.plugin.requestDocumentScan();
++                }
++            }
++        }
++
+         // Find my phone
+         PlasmaExtras.MenuItem {
+             icon: "irc-voice"
+@@ -170,6 +228,14 @@ PlasmaComponents.ItemDelegate {
+         }
+     }
+ 
++    Kirigami.PromptDialog {
++        id: continuityCameraPrompt
++        visible: false
++        showCloseButton: true
++        standardButtons: Kirigami.Dialog.NoButton
++        title: i18n("Continuity Camera is not available")
++    }
++
+     contentItem: ColumnLayout {
+         spacing: Kirigami.Units.smallSpacing
+ 

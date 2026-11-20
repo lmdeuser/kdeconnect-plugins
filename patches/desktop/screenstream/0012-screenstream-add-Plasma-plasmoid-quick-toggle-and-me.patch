@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitriy Volkov <dennshield@duck.com>
+Date: Fri, 20 Nov 2026 21:29:13 +0500
+Subject: [PATCH 12/12] screenstream: add Plasma plasmoid quick toggle and menu
+ actions
+
+
+diff --git a/plasmoid/package/contents/ui/DeviceDelegate.qml b/plasmoid/package/contents/ui/DeviceDelegate.qml
+index 2aff75be560ce421ce84feee1f58675c3e20f65d..80c8af7517e5b763a157d7aef1c6868cf797ab7f 100644
+--- a/plasmoid/package/contents/ui/DeviceDelegate.qml
++++ b/plasmoid/package/contents/ui/DeviceDelegate.qml
+@@ -81,6 +81,33 @@ PlasmaComponents.ItemDelegate {
+         device: root.device
+     }
+ 
++    ScreenStream {
++        id: screenstream
++        device: root.device
++    }
++
++    Kirigami.PromptDialog {
++        id: screenStreamPrompt
++        visible: false
++        showCloseButton: true
++        standardButtons: Kirigami.Dialog.NoButton
++        title: i18n("Screen Stream is not available")
++    }
++
++    function toggleScreenStream(): void {
++        if (!screenstream.plugin) {
++            return;
++        }
++        if (screenstream.plugin.active) {
++            screenstream.plugin.stopStream();
++            screenStreamPrompt.visible = false;
++        } else {
++            screenstream.plugin.startStream();
++            screenStreamPrompt.subtitle = screenstream.plugin.lastError;
++            screenStreamPrompt.visible = screenStreamPrompt.subtitle.length > 0;
++        }
++    }
++
+     Kirigami.PromptDialog {
+         id: prompt
+         visible: false
+@@ -104,6 +131,28 @@ PlasmaComponents.ItemDelegate {
+         visualParent: overflowMenu
+         placement: PlasmaExtras.Menu.BottomPosedLeftAlignedPopup
+ 
++        // Screen Stream
++        PlasmaExtras.MenuItem {
++            icon: (screenstream.plugin?.active ?? false) ? "media-playback-stop" : "video-display"
++            visible: screenstream.available
++            text: (screenstream.plugin?.active ?? false) ? i18n("Stop screen stream") : i18n("View device screen")
++            onClicked: root.toggleScreenStream()
++        }
++
++        PlasmaExtras.MenuItem {
++            icon: "preferences-desktop-display"
++            visible: screenstream.available
++            text: i18n("Wake device screen")
++            onClicked: {
++                if (!screenstream.plugin) {
++                    return;
++                }
++                screenstream.plugin.wakeScreen();
++                screenStreamPrompt.subtitle = screenstream.plugin.lastError;
++                screenStreamPrompt.visible = screenStreamPrompt.subtitle.length > 0;
++            }
++        }
++
+         // Share
+         PlasmaExtras.MenuItem {
+             icon: "document-share"
+@@ -191,7 +240,7 @@ PlasmaComponents.ItemDelegate {
+                 z: -1  // Behind content so it doesn't block interactions
+                 
+                 // Show only when hovering empty space (not hovering any interactive buttons)
+-                active: deviceHeaderContainer.hovered && !overflowMenu.hovered && !virtualMonitorButton.hovered && !dismissAllButton.hovered
++                active: deviceHeaderContainer.hovered && !overflowMenu.hovered && !virtualMonitorButton.hovered && !screenStreamButton.hovered && !dismissAllButton.hovered
+                 mainText: i18n("File Transfer")
+                 subText: i18n("Drop a file to transfer it onto your phone.")
+             }
+@@ -249,6 +298,23 @@ PlasmaComponents.ItemDelegate {
+                         }
+                     }
+ 
++                    // Screen stream toggle icon
++                    PlasmaComponents.ToolButton {
++                        id: screenStreamButton
++                        icon.name: "video-display"
++                        icon.width: Kirigami.Units.iconSizes.small
++                        icon.height: Kirigami.Units.iconSizes.small
++                        visible: screenstream.available
++                        display: PlasmaComponents.AbstractButton.IconOnly
++                        checked: visible && !!screenstream.plugin?.active
++                        checkable: true
++
++                        hoverEnabled: true
++                        PlasmaComponents.ToolTip.text: checked ? i18n("Stop screen stream") : i18n("View device screen")
++
++                        onClicked: root.toggleScreenStream()
++                    }
++
+                     RowLayout {
+                         id: connectionInformation
+ 
+diff --git a/plasmoid/package/contents/ui/ScreenStream.qml b/plasmoid/package/contents/ui/ScreenStream.qml
+new file mode 100644
+index 0000000000000000000000000000000000000000..f09993d4e3fddfcb7a29cf1bbb9dea3584e16e71
+--- /dev/null
++++ b/plasmoid/package/contents/ui/ScreenStream.qml
+@@ -0,0 +1,28 @@
++/**
++ * SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
++ *
++ * SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
++ */
++
++pragma ComponentBehavior: Bound
++
++import QtQuick
++
++import org.kde.kdeconnect as KDEConnect
++
++QtObject {
++    id: root
++
++    required property KDEConnect.DeviceDbusInterface device
++
++    readonly property alias available: checker.available
++
++    readonly property KDEConnect.PluginChecker pluginChecker: KDEConnect.PluginChecker {
++        id: checker
++        pluginName: "screenstream"
++        device: root.device
++    }
++
++    readonly property KDEConnect.ScreenStreamDbusInterface plugin:
++        available ? KDEConnect.ScreenStreamDbusInterfaceFactory.create(device.id()) : null
++}

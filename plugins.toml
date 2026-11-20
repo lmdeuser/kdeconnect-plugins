@@ -12,7 +12,7 @@ android_branch = "work/screenstream"
 spec = "docs/plugins/screenstream/spec.md"
 verify_so = ["kdeconnect_screenstream.so"]
 verify_bins = ["/usr/bin/kdeconnect-screenstream-viewer"]
-verify_qml = ["/usr/share/kdeconnect/kdeconnect_screenstream_config.qml"]
+verify_qml = ["/usr/share/kdeconnect/kdeconnect_screenstream_config.qml", "/usr/share/plasma/plasmoids/org.kde.kdeconnect/contents/ui/ScreenStream.qml"]
 verify_gst_elements = ["appsrc", "h264parse", "avdec_h264", "audioconvert", "audioresample", "autoaudiosink"]
 
 [plugins.required_needed_libs]
@@ -48,6 +48,7 @@ android_branch = "work/continuity_camera"
 spec = "docs/plugins/continuity_camera/spec.md"
 verify_so = ["kdeconnect_continuitycamera.so"]
 verify_bins = ["/usr/bin/kdeconnect-continuitycamera-bridge"]
+verify_qml = ["/usr/share/plasma/plasmoids/org.kde.kdeconnect/contents/ui/ContinuityCamera.qml"]
 verify_gst_elements = ["appsrc", "h264parse", "avdec_h264", "pipewiresink"]
 
 [plugins.required_needed_libs]
@@ -70,3 +71,4 @@ desktop_branch = "work/bt_audio_switch"
 android_branch = "work/bt_audio_switch"
 spec = "docs/plugins/bt_audio_switch/spec.md"
 verify_so = ["kdeconnect_btaudioswitch.so"]
+verify_qml = ["/usr/share/plasma/plasmoids/org.kde.kdeconnect/contents/ui/BtAudioSwitch.qml"]

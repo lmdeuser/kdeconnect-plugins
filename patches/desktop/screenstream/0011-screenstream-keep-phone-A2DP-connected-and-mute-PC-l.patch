@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Dmitriy Volkov <dennshield@duck.com>
 Date: Fri, 20 Nov 2026 02:14:04 +0500
-Subject: [PATCH 11/11] screenstream: keep phone A2DP connected and mute PC
+Subject: [PATCH 11/12] screenstream: keep phone A2DP connected and mute PC
  loopback during screencast
 
 
