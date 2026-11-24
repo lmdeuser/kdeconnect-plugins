@@ -6,7 +6,7 @@ Subject: [PATCH 1/4] plugins: add ContinuityCamera streaming and capture
 
 
 diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
-index 8bf7ff8c5a43384bd29a33261942d580d5b4e0ce..2aa893b1a98a1f15e0284bce4e0ed4e975397058 100644
+index dd58a5c762f6d9080b41b0fb6bed6d0c316c9728..f0d619d933cecd59e48b434c44b36812d6fecee5 100644
 --- a/src/main/AndroidManifest.xml
 +++ b/src/main/AndroidManifest.xml
 @@ -56,6 +56,8 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
@@ -18,7 +18,7 @@ index 8bf7ff8c5a43384bd29a33261942d580d5b4e0ce..2aa893b1a98a1f15e0284bce4e0ed4e9
      <uses-permission android:name="android.permission.RECEIVE_MMS" />
      <uses-permission android:name="android.permission.WAKE_LOCK" />
      <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
-@@ -357,6 +359,17 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -361,6 +363,17 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
                  android:name="android.service.chooser.chooser_target_service"
                  android:value="org.kde.kdeconnect.plugins.share.ShareChooserTargetService" />
          </activity>

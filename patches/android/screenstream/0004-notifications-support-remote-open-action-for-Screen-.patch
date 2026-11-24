@@ -6,7 +6,7 @@ Subject: [PATCH 4/8] notifications: support remote open action for Screen
 
 
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
-index 9dceab33eb6b7ccd3f81999263ee3cbb13cc4230..763669f00179b1c78fbaa97fceeee9932ce7b920 100644
+index dec2a2ecc48211b011db71aa3dbed5fbdb5dc850..f0232e60aa110f5d25b1535cb9f61fa30a6695e5 100644
 --- a/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
 +++ b/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
 @@ -6,6 +6,7 @@
@@ -17,15 +17,15 @@ index 9dceab33eb6b7ccd3f81999263ee3cbb13cc4230..763669f00179b1c78fbaa97fceeee993
  import android.app.KeyguardManager
  import android.app.Notification
  import android.app.PendingIntent
-@@ -55,6 +56,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+@@ -56,6 +57,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
      private val postedNotifications = HashSet<String>()
      private val pendingIntents = HashMap<String, RepliableNotification>()
      private val pendingActions = mutableMapOf<String, MutableList<Notification.Action>>()
 +    private val pendingContentIntents = HashMap<String, PendingIntent>()
+     @Volatile
      private var serviceReady = false
-     private lateinit var keyguardManager: KeyguardManager
-     private lateinit var mainHandler: Handler
-@@ -90,6 +92,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+     // Set when the remote asked for the current notifications before the listener service was ready
+@@ -94,6 +96,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
          notificationsIcons.clear()
          pendingIntents.clear()
          pendingActions.clear()
@@ -33,7 +33,7 @@ index 9dceab33eb6b7ccd3f81999263ee3cbb13cc4230..763669f00179b1c78fbaa97fceeee993
  
          synchronized(postedNotificationsLock) {
              mainHandler.removeCallbacksAndMessages(null)
-@@ -117,6 +120,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+@@ -124,6 +127,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
          }
  
          pendingActions.remove(id)
@@ -41,7 +41,7 @@ index 9dceab33eb6b7ccd3f81999263ee3cbb13cc4230..763669f00179b1c78fbaa97fceeee993
  
          if (!appDatabase.isEnabled(statusBarNotification.packageName)) {
              currentNotifications.remove(id)
-@@ -250,6 +254,11 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+@@ -257,6 +261,11 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
          val isGroupConversation = isConversation && messagingStyle.isGroupConversation() && messagingStyle.conversationTitle != null
  
          np["actions"] = extractActions(notification, key)
@@ -53,7 +53,7 @@ index 9dceab33eb6b7ccd3f81999263ee3cbb13cc4230..763669f00179b1c78fbaa97fceeee993
  
          // Some apps ask to notify the user only once they are posted and not for updates, but (for some reason),
          // some messaging apps also set that flag, and we should notify the user for every new message (since they
-@@ -507,6 +516,28 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+@@ -518,6 +527,28 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
      override fun onPacketReceived(np: NetworkPacket): Boolean {
          if (np.type == PACKET_TYPE_NOTIFICATION_ACTION) {
              val key = np.getString("key")

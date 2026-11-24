@@ -5,7 +5,7 @@ Subject: [PATCH 1/2] plugins: add RemoteAuth biometric prompt plugin
 
 
 diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
-index 8bf7ff8c5a43384bd29a33261942d580d5b4e0ce..50f740ea47319e248564ca14346792274938e6ac 100644
+index dd58a5c762f6d9080b41b0fb6bed6d0c316c9728..7c94bd06b48efc5e9184734cec9c3c327734940b 100644
 --- a/src/main/AndroidManifest.xml
 +++ b/src/main/AndroidManifest.xml
 @@ -39,6 +39,7 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
@@ -16,7 +16,7 @@ index 8bf7ff8c5a43384bd29a33261942d580d5b4e0ce..50f740ea47319e248564ca1434679227
      <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
      <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
      <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
-@@ -287,6 +288,13 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -291,6 +292,13 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
                  android:name="android.support.PARENT_ACTIVITY"
                  android:value="org.kde.kdeconnect.ui.MainActivity" />
          </activity>

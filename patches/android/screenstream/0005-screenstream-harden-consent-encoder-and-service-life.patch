@@ -6,10 +6,10 @@ Subject: [PATCH 5/8] screenstream: harden consent, encoder, and service
 
 
 diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
-index 71c06fdb416ed7f5636614872213b046a245fcba..bae5a4d9fe358f2ade7ef6aa0d2ea73834575e92 100644
+index 27bb5e9e34c0e9c28322b82c625c4d6303b5d7e2..bfdcc13e0e98d589574f0763d3126251c7c2df3b 100644
 --- a/src/main/AndroidManifest.xml
 +++ b/src/main/AndroidManifest.xml
-@@ -212,7 +212,6 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -216,7 +216,6 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
              android:name="org.kde.kdeconnect.plugins.screenstream.ScreenStreamPermissionActivity"
              android:exported="false"
              android:excludeFromRecents="true"
@@ -18,7 +18,7 @@ index 71c06fdb416ed7f5636614872213b046a245fcba..bae5a4d9fe358f2ade7ef6aa0d2ea738
              tools:targetApi="r" />
  
 diff --git a/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt b/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
-index 763669f00179b1c78fbaa97fceeee9932ce7b920..b16cdf52c02d63c5b0eef71fe3cefec0923b9041 100644
+index f0232e60aa110f5d25b1535cb9f61fa30a6695e5..6bc5a72aecfd5d96f47f8c5180bcbf17b5396093 100644
 --- a/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
 +++ b/src/main/java/org/kde/kdeconnect/plugins/notifications/NotificationsPlugin.kt
 @@ -46,6 +46,7 @@ import org.kde.kdeconnect_tp.R
@@ -26,19 +26,19 @@ index 763669f00179b1c78fbaa97fceeee9932ce7b920..b16cdf52c02d63c5b0eef71fe3cefec0
  import java.security.MessageDigest
  import java.util.Locale
 +import java.util.concurrent.ConcurrentHashMap
+ import java.util.concurrent.atomic.AtomicBoolean
  
  @LoadablePlugin
- class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener {
-@@ -56,7 +57,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+@@ -57,7 +58,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
      private val postedNotifications = HashSet<String>()
      private val pendingIntents = HashMap<String, RepliableNotification>()
      private val pendingActions = mutableMapOf<String, MutableList<Notification.Action>>()
 -    private val pendingContentIntents = HashMap<String, PendingIntent>()
 +    private val pendingContentIntents = ConcurrentHashMap<String, PendingIntent>()
+     @Volatile
      private var serviceReady = false
-     private lateinit var keyguardManager: KeyguardManager
-     private lateinit var mainHandler: Handler
-@@ -258,6 +259,8 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
+     // Set when the remote asked for the current notifications before the listener service was ready
+@@ -265,6 +266,8 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener
          if (contentIntent != null) {
              pendingContentIntents[key] = contentIntent
              np["hasContentIntent"] = true

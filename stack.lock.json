@@ -209,19 +209,19 @@
     },
     "android": {
       "upstream_url": "https://invent.kde.org/network/kdeconnect-android.git",
-      "base_sha": "d0534acc70cd9403fb56d78f645f228e21097492",
-      "expected_tree_sha": "7bd2dd2f2d524468302bcf5157df5254f17e6aa0",
-      "expected_head_sha": "46410b4c6bfa628969d145f35b6fb79a968ad40e",
+      "base_sha": "34fff43ee71d15c239789d230547eda7c2fbfd93",
+      "expected_tree_sha": "e249eb0cea7369b85bfff4e11dfa0fda077ed460",
+      "expected_head_sha": "aa7b3fb05d190a81582f415f170f170ee4fcd4ed",
       "plugins": [
         {
           "id": "screenstream",
           "branch": "work/screenstream",
-          "expected_tree_sha": "4ec03cd89e5a0a325ea1c46cf96d1c2e7175d26c",
-          "expected_head_sha": "4c5a826754e92b7f2b25eb8291a548285b8b296c",
+          "expected_tree_sha": "d6cf516d29b44a4d2c4fda1bd141d575850f4d48",
+          "expected_head_sha": "ce70b461fef959c368ec8b63fd7864583cc49992",
           "patches": [
             {
               "path": "patches/android/screenstream/0001-feat-screenstream-add-Android-screen-and-playback-au.patch",
-              "sha256": "ff07bf345cf56c1792c70ff9993444217ddc003358ffc2d7bd9f813839e59402",
+              "sha256": "8e86bce4bb23c4ca06c3a8eb9c1838a29ee58ab53e08388072cdfd319e7c8ebc",
               "bytes": 112743
             },
             {
@@ -236,13 +236,13 @@
             },
             {
               "path": "patches/android/screenstream/0004-notifications-support-remote-open-action-for-Screen-.patch",
-              "sha256": "59a009224403c5d8ca67af148fb0f68773b1affcaffcb88b157259cbe1509ec0",
-              "bytes": 4447
+              "sha256": "606db145cf6678bfa7dd7bbf093b0152ed6802814af8f3eb553bcf34e2c15783",
+              "bytes": 4458
             },
             {
               "path": "patches/android/screenstream/0005-screenstream-harden-consent-encoder-and-service-life.patch",
-              "sha256": "a97e1c81c6cb146811a58e9a73194865f59bf33e53946a2773ceab6f3319e066",
-              "bytes": 44913
+              "sha256": "7501db7e5215ba46e8120af81fff77b135b06192316e4b5a4116cb6064cbfeab",
+              "bytes": 44891
             },
             {
               "path": "patches/android/screenstream/0006-screenstream-add-live-audio-route-switching-and-Blue.patch",
@@ -264,8 +264,8 @@
         {
           "id": "clipboard_images",
           "branch": "work/clipboard_images",
-          "expected_tree_sha": "8b608634047d9d8a2f29db6e4ebfa07bf2a512ab",
-          "expected_head_sha": "27874541eb3950f5aaaad7178de5e5f7320022c0",
+          "expected_tree_sha": "be7083f88cb68bd725602fc9052061069589e33a",
+          "expected_head_sha": "174b6c9d13b1877f17667cd5e415dc245121d85c",
           "patches": [
             {
               "path": "patches/android/clipboard_images/0001-clipboard-add-bidirectional-clipboard-image-sync.patch",
@@ -282,8 +282,8 @@
         {
           "id": "otp_autofill",
           "branch": "work/otp_autofill",
-          "expected_tree_sha": "520d12e57ef5d757ac203ee0cd474edf8bbfa346",
-          "expected_head_sha": "6722b4717285b77b468df8935185450600a32bbd",
+          "expected_tree_sha": "a36ea4bd883fb0173d439d45430da800e19354be",
+          "expected_head_sha": "6076933415c29079e49e678b708eb652db967ae4",
           "patches": [
             {
               "path": "patches/android/otp_autofill/0001-sms-push-strictly-newer-inbox-messages-for-OTP-redac.patch",
@@ -295,12 +295,12 @@
         {
           "id": "continuity_camera",
           "branch": "work/continuity_camera",
-          "expected_tree_sha": "23c8cc9cf4dfee70f62926ab8292fc0feede1d52",
-          "expected_head_sha": "6d313183e7fd4d287357b786941c929bdc6660b7",
+          "expected_tree_sha": "4269f92ac629f9faa7d18826733dcea8d001367c",
+          "expected_head_sha": "22e8f94ea08cf9253d3261cc61308a40b7dde628",
           "patches": [
             {
               "path": "patches/android/continuity_camera/0001-plugins-add-ContinuityCamera-streaming-and-capture-p.patch",
-              "sha256": "9307dddb83e2088f25ad14408d554bfb0151b3f41c2eaafdb101ed10699f7ebc",
+              "sha256": "d812f4bf0ff570614e4a49524696b3a55343f1010ec8790acdf316ce58e9ad4b",
               "bytes": 65968
             },
             {
@@ -323,17 +323,17 @@
         {
           "id": "remote_auth",
           "branch": "work/remote_auth",
-          "expected_tree_sha": "7163d265954edc15694886a37e1a3d57c7577777",
-          "expected_head_sha": "01c92af34ce941f91269c00d920d82bd02efd90e",
+          "expected_tree_sha": "718175eab6022868febf3bc3b7c42b8efb37c1b9",
+          "expected_head_sha": "d4163b95524eaf59388ea75d99e365c00d9a0a25",
           "patches": [
             {
               "path": "patches/android/remote_auth/0001-plugins-add-RemoteAuth-biometric-prompt-plugin.patch",
-              "sha256": "eed8a95722a0226fd5ddc44d0bb49e5e6dc0406b729fdf3e658bec8fa6b5fff2",
+              "sha256": "342880f561bdd58fd3ffbbe49dbc14d0f998f01ae479b581021928566f62d05c",
               "bytes": 23956
             },
             {
               "path": "patches/android/remote_auth/0002-remoteauth-fix-challenge-deadline-tracking-lockscree.patch",
-              "sha256": "7d323c0c723a20d0547d6d65dd99c0cd701624a8a8b865b14143554fa474a254",
+              "sha256": "f13cb98d0eee55b3e9cd44a4412749db331446b213608bb2b5b2222e296d4ed0",
               "bytes": 13387
             }
           ]
@@ -341,8 +341,8 @@
         {
           "id": "bt_audio_switch",
           "branch": "work/bt_audio_switch",
-          "expected_tree_sha": "d9b687e574161a23f2a5860dc86f48628dc73f06",
-          "expected_head_sha": "c1c0e3de0ddfd84734654dd14b09a3f54842c1df",
+          "expected_tree_sha": "a5aed9af704821ba733d1bd42428234a1b6fc937",
+          "expected_head_sha": "2823b9671d2e789735c4f42a6087e3b31bd5af41",
           "patches": [
             {
               "path": "patches/android/bt_audio_switch/0001-plugins-add-BtAudioSwitch-headset-handoff-plugin.patch",

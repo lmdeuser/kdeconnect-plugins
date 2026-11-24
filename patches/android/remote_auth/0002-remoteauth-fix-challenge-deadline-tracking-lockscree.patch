@@ -6,10 +6,10 @@ Subject: [PATCH 2/2] remoteauth: fix challenge deadline tracking, lockscreen
 
 
 diff --git a/src/main/AndroidManifest.xml b/src/main/AndroidManifest.xml
-index 50f740ea47319e248564ca14346792274938e6ac..a6ea28a6e8c3e27d99e963e244997b984f72fb51 100644
+index 7c94bd06b48efc5e9184734cec9c3c327734940b..44231b9d3c268d7875dafbdf94d3c8bf5dacf390 100644
 --- a/src/main/AndroidManifest.xml
 +++ b/src/main/AndroidManifest.xml
-@@ -292,7 +292,8 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
+@@ -296,7 +296,8 @@ SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted
              android:name="org.kde.kdeconnect.plugins.remoteauth.RemoteAuthPromptActivity"
              android:exported="false"
              android:excludeFromRecents="true"
