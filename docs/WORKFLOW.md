@@ -9,11 +9,12 @@ Every plugin developed under `lmdeuser/kdeconnect-plugins` moves sequentially th
 
 | Contour | Location | Purpose | Allowed Contents |
 | --- | --- | --- | --- |
-| Public Hub | `lmdeuser/kdeconnect-plugins` (`main`) | Engineering harness, `plugins.toml` registry, specs, patches, lockfile, OBS overlay, Python gate checks | `AGENTS.md`, `README.md`, `plugins.toml`, `stack.lock.json`, `patches/`, `.agents/skills/`, `docs/`, `prototype/`, `obs/`, `tools/`, `tests/`, `LICENSES/` |
+| Public Hub | `lmdeuser/kdeconnect-plugins` (`main`) | Engineering harness, `plugins.toml` registry, specs, patches, lockfile, OBS and Gentoo overlays, Python gate checks | `AGENTS.md`, `README.md`, `plugins.toml`, `stack.lock.json`, `patches/`, `.agents/skills/`, `docs/`, `prototype/`, `obs/`, `gentoo/`, `tools/`, `tests/`, `LICENSES/` |
 | Desktop Upstream | External `kdeconnect-kde` checkout (`work/<plugin_id>`) | Independent upstream C++/Qt/QML branches for `invent.kde.org` | Plugin code, CMake integration, Qt tests, REUSE headers; zero packaging/harness files |
 | Android Upstream | External `kdeconnect-android` checkout (`work/<plugin_id>`) | Independent upstream Kotlin/Android branches; ephemeral `work/continuity-stack` for APK testing | Android plugin code, manifest/permissions, unit tests, REUSE headers |
 | OBS Staging | `home:dwolfF:kdeconnect:staging` (`xUbuntu_26.04`, `x86_64`) | Synthesized `obs/kdeconnect-staging` build, `ctest`, `lintian`, `sourceaccess=disable`, publish disabled | Rebased active `work/<plugin_id>` stack + Debian/OBS overlay |
 | OBS Stable | `home:dwolfF:kdeconnect` (`xUbuntu_26.04`, `x86_64`) | Public APT distribution of verified packages | Promoted staging binaries only |
+| Gentoo Portage Overlay | `gentoo/` + `tools/gentoo_packaging.py` | Reproducible EAPI 8 `kdeconnect-continuity` overlay emission (`Wayland`, Qt 6 / KF6) | `metadata/layout.conf`, `profiles/`, generated `kde-misc/kdeconnect` ebuild, staged patches, optional `Manifest` |
 
 ## Gate Sequence
 
@@ -44,6 +45,7 @@ Apply `/code-complete` construction, scientific debugging, and verification disc
    - Confirm staging status is `succeeded`, `ctest` executed > 0 tests with 0 failures, and `lintian` reported 0 errors.
 4. **Gate 3 -- Artifact Inspection and Promotion Gate**:
    - Inspect staged `.deb` file paths and ELF dependencies dynamically generated from `plugins.toml` (`tools/plugin_registry.py deb-checks` inside `tools/verify-deb.sh`).
+   - For Gentoo Linux (Portage EAPI 8, Wayland) targets, emit and verify the overlay via `tools/reproduce_stack.py checkout --emit-gentoo-overlay` (or `tools/gentoo_packaging.py`) and verify installed runtime binaries, plugins, QML files, and GStreamer elements via `tools/plugin_registry.py gentoo-checks`.
    - Run isolated Rootless Docker install/uninstall/reinstall verification without network access.
    - Evaluate `evaluate_package_promotion_readiness(...)` / `evaluate_promotion_readiness(...)` before any promotion to `home:dwolfF:kdeconnect`.
 5. **Gate 4 -- Virtual-First Acceptance, Post-Release Bug Hunt, and Live Hardware Matrix** (`.agents/skills/live-acceptance-matrix/SKILL.md`):

@@ -8,6 +8,7 @@ RUN export DEBIAN_FRONTEND=noninteractive && \
     apt-get install -y --no-install-recommends \
       binutils \
       kdeconnect \
+      pulseaudio-utils \
       qml6-module-org-kde-kcmutils \
       gstreamer1.0-tools \
       gstreamer1.0-plugins-base \

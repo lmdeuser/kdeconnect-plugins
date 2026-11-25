@@ -3,7 +3,7 @@
 
 # KDE Connect Plugin Engineering Harness
 
-This repository (`lmdeuser/kdeconnect-plugins`) is the public engineering harness, protocol specification hub, verification suite, and Ubuntu 26.04 OBS packaging workspace for KDE Connect plugins targeting upstream submission to KDE Invent.
+This repository (`lmdeuser/kdeconnect-plugins`) is the public engineering harness, protocol specification hub, verification suite, and packaging workspace (Ubuntu 26.04 OBS and Gentoo Linux Portage EAPI 8) for KDE Connect plugins targeting upstream submission to KDE Invent.
 
 ## 1. Repository Scope, Identity, and Confidentiality
 
@@ -17,14 +17,14 @@ This repository (`lmdeuser/kdeconnect-plugins`) is the public engineering harnes
 ## 2. Two-Contour Repository Architecture
 
 1. **Public Harness and Packaging Hub (`lmdeuser/kdeconnect-plugins`)**:
-   - Owns `AGENTS.md`, `README.md`, `plugins.toml`, `stack.lock.json`, `patches/`, `.agents/skills/`, `docs/`, `prototype/`, `obs/`, `tools/`, and `tests/`.
+   - Owns `AGENTS.md`, `README.md`, `plugins.toml`, `stack.lock.json`, `patches/`, `.agents/skills/`, `docs/`, `prototype/`, `obs/`, `gentoo/`, `tools/`, and `tests/`.
    - `plugins.toml` defines every registered plugin/enhancement (`id`, `kind`, `status`, `desktop_branch`, `android_branch`, `spec`, and `.deb` verification metadata).
    - Whenever `work/<plugin_id>` branches or specs change, run `tools/export_stack_patches.py` and `tools/reproduce_stack.py verify-lock`, keep `README.md` and `docs/plugins/<plugin_id>/spec.md` synchronized, verify Gate 1 hygiene checks, and commit + push the public harness (`README.md`, `docs/`, `patches/`, `stack.lock.json`, tooling) to `origin/main` on GitHub (`https://github.com/lmdeuser/kdeconnect-plugins.git`). Note: pushing to `origin` (`lmdeuser/kdeconnect-plugins`) is separate from upstream `invent.kde.org`, which must never be pushed automatically.
 2. **External Upstream KDE Connect Checkouts (configured in `.state/local.env`)**:
    - Desktop upstream: `https://invent.kde.org/network/kdeconnect-kde.git`
    - Android upstream: `https://invent.kde.org/network/kdeconnect-android.git`
    - GitHub KDE repositories are read-only mirrors; official Merge Requests are accepted only on KDE Invent (`invent.kde.org`).
-   - Implement each upstream plugin or enhancement on its own clean `work/<plugin_id>` branch inside the external checkouts. Never mutate individual `work/<plugin_id>` branches during integration: OBS synthesizes all active desktop `work/<plugin_id>` branches onto `obs/kdeconnect-staging` (`tools/obs_controller.py`), and Android APK builds synthesize active `work/<plugin_id>` branches onto an ephemeral `work/continuity-stack` branch (`tools/synthesize_android_stack.py`). Keep `debian/`, `obs/`, `.agents/`, and `prototype/` completely out of `work/<plugin_id>` and `work/continuity-stack`.
+   - Implement each upstream plugin or enhancement on its own clean `work/<plugin_id>` branch inside the external checkouts. Never mutate individual `work/<plugin_id>` branches during integration: OBS synthesizes all active desktop `work/<plugin_id>` branches onto `obs/kdeconnect-staging` (`tools/obs_controller.py`), and Android APK builds synthesize active `work/<plugin_id>` branches onto an ephemeral `work/continuity-stack` branch (`tools/synthesize_android_stack.py`). Keep `debian/`, `obs/`, `gentoo/`, `.agents/`, and `prototype/` completely out of `work/<plugin_id>` and `work/continuity-stack`.
 
 ## 3. Build, Runner, and CI Boundaries
 
@@ -39,6 +39,9 @@ This repository (`lmdeuser/kdeconnect-plugins`) is the public engineering harnes
 - **OBS two-contour targets (`xUbuntu_26.04`, `x86_64`)**:
   - **Staging (`home:dwolfF:kdeconnect:staging`)**: `sourceaccess=disable`, publishing disabled; performs CMake compilation, `ctest`, and `lintian`.
   - **Stable (`home:dwolfF:kdeconnect`)**: receives binary promotion only after staging build `succeeded`, `ctest` executes > 0 tests with 0 failures, `lintian` reports 0 errors, and isolated `.deb` checks pass.
+- **Gentoo Linux Portage EAPI 8 (`gentoo/`)**:
+  - `gentoo/` provides the `kdeconnect-continuity` overlay metadata (`metadata/layout.conf`, `profiles/repo_name`, `profiles/package.mask/gentoo-kdeconnect`, and `gentoo/README.md`).
+  - `tools/gentoo_packaging.py` (and `tools/reproduce_stack.py checkout --emit-gentoo-overlay`) verifies `stack.lock.json` and emits an EAPI 8 `kde-misc/kdeconnect` ebuild (`Wayland`-first, `pulseaudio` required for `bt_audio_switch`, optional `bluetooth`/`telephony`/`X`) with numbered patches, while `tools/plugin_registry.py gentoo-checks` emits distro-neutral runtime ELF/QML/GStreamer checks.
 - **Android verification targets**: Desktop OBS builds never verify `kdeconnect-android`. Verify Android changes via local resource-bounded `./gradlew assembleDebug lintDebug testDebugUnitTest` + `apksigner verify` against the target SDK platform (and Android Studio inspections/IDE sync), plus optional diagnostic `kdeconnect-android-probe` builds in OBS staging.
 
 ## 4. Construction and Security Standards

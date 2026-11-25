@@ -384,11 +384,17 @@ def apply_locked_target(
     mirror_repo: Path | None = None,
     emit_deb_source: Path | None = None,
     obs_rev: int = 1,
+    emit_gentoo_overlay: Path | None = None,
+    gentoo_ebuild_version: str = "27.03.70_p1",
     check_compliance: bool = True,
 ) -> dict:
-    """Reproduce a verified locked target checkout (and optional Debian source bundle)."""
+    """Reproduce a verified locked target checkout (and optional Debian/Gentoo packaging)."""
     if target not in EXPECTED_URLS:
         raise ValueError(f"Unsupported target: {target}")
+    if emit_deb_source is not None and target != "desktop":
+        raise ValueError("--emit-deb-source is only supported for --target desktop")
+    if emit_gentoo_overlay is not None and target != "desktop":
+        raise ValueError("--emit-gentoo-overlay is only supported for --target desktop")
     repo_root = repo_root.resolve()
     ensure_disk_tmpdir(repo_root)
 
@@ -489,6 +495,20 @@ def apply_locked_target(
         ).hexdigest()
         summary["deb_source"]["files"] = manifest["files"]
 
+    if emit_gentoo_overlay is not None:
+        if emit_gentoo_overlay.is_symlink():
+            raise ValueError(f"Refusing symlink --emit-gentoo-overlay path: {emit_gentoo_overlay}")
+        try:
+            from tools.gentoo_packaging import emit_gentoo_overlay as _emit_gentoo_overlay
+        except ImportError:
+            from gentoo_packaging import emit_gentoo_overlay as _emit_gentoo_overlay
+        summary["gentoo_overlay"] = _emit_gentoo_overlay(
+            repo_root=repo_root,
+            output_dir=emit_gentoo_overlay.resolve(),
+            ebuild_version=gentoo_ebuild_version,
+            lock_path=lock_path,
+        )
+
     return summary
 
 
@@ -507,6 +527,16 @@ def main() -> int:
     out_p.add_argument("--mirror", type=Path, help="Optional local upstream mirror for offline builds/tests")
     out_p.add_argument("--emit-deb-source", type=Path, help="Optional output dir for 3.0 (quilt) .dsc bundle")
     out_p.add_argument("--obs-rev", type=int, default=1)
+    out_p.add_argument(
+        "--emit-gentoo-overlay",
+        type=Path,
+        help="Optional output dir for a verified Gentoo Portage EAPI 8 overlay",
+    )
+    out_p.add_argument(
+        "--gentoo-ebuild-version",
+        default="27.03.70_p1",
+        help="Ebuild version for --emit-gentoo-overlay (default: 27.03.70_p1)",
+    )
 
     args = parser.parse_args()
     if args.command == "verify-lock":
@@ -531,6 +561,8 @@ def main() -> int:
                 mirror_repo=args.mirror,
                 emit_deb_source=args.emit_deb_source,
                 obs_rev=args.obs_rev,
+                emit_gentoo_overlay=args.emit_gentoo_overlay,
+                gentoo_ebuild_version=args.gentoo_ebuild_version,
             )
         except Exception as exc:
             print(f"ERROR: {exc}", file=sys.stderr)

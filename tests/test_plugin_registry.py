@@ -12,6 +12,7 @@ from tools.plugin_registry import (
     active_android_plugins,
     active_desktop_plugins,
     build_deb_check_script,
+    build_gentoo_check_script,
     load_registry,
 )
 from tools.upstream_sync import PluginStackEntry, compute_stack_fingerprint, synthesize_plugin_stack
@@ -96,7 +97,28 @@ class PluginRegistryTests(unittest.TestCase):
         self.assertIn("Qt6Multimedia", script)
         self.assertIn("gst-inspect-1.0 appsrc h264parse avdec_h264 audioconvert audioresample autoaudiosink", script)
         self.assertIn("pipewiresink", script)
+        self.assertIn("find /usr/lib /usr/lib64 -name kdeconnect_screenstream.so 2>/dev/null | head -n 1", script)
         self.assertNotIn("ldd ", script)
+
+        gentoo_script = build_gentoo_check_script(entries)
+        self.assertEqual(gentoo_script, script)
+        bash_syntax = subprocess.run(
+            ["bash", "-n"],
+            input=gentoo_script,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(bash_syntax.returncode, 0, bash_syntax.stderr)
+
+        cli_proc = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "plugin_registry.py"), "gentoo-checks", "--registry", str(ROOT / "plugins.toml")],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(cli_proc.returncode, 0, cli_proc.stderr)
+        self.assertEqual(cli_proc.stdout.strip(), gentoo_script.strip())
 
     def test_load_registry_rejects_invalid_entries(self) -> None:
         cases = [

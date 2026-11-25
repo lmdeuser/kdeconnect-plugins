@@ -3,9 +3,9 @@
 
 # KDE Connect Continuity Plugins
 
-This project extends [KDE Connect](https://kdeconnect.kde.org/) into a six-plugin continuity stack between Android (11-15+) and Ubuntu 26.04 LTS ([Wayland](https://wayland.freedesktop.org/), `x86_64`) over KDE Connect's paired LAN mutual-[TLS](https://datatracker.ietf.org/doc/html/rfc8446) connection. It requires no USB cable, no ADB in daily use, and no third-party screen or webcam server.
+This project extends [KDE Connect](https://kdeconnect.kde.org/) into a six-plugin continuity stack between Android (11-15+) and Linux desktops (Ubuntu 26.04 LTS and Gentoo Linux Portage EAPI 8, [Wayland](https://wayland.freedesktop.org/)) over KDE Connect's paired LAN mutual-[TLS](https://datatracker.ietf.org/doc/html/rfc8446) connection. It requires no USB cable, no ADB in daily use, and no third-party screen or webcam server.
 
-This repository (`lmdeuser/kdeconnect-plugins`) does not fork the desktop or Android codebases. Instead, it ships the SHA-256-locked patch series under [patches/](patches/), pinned base and result hashes in [stack.lock.json](stack.lock.json), a hardened reproducer ([tools/reproduce_stack.py](tools/reproduce_stack.py)), the multi-plugin registry ([plugins.toml](plugins.toml)), protocol specifications under `docs/plugins/`, Ubuntu 26.04 packaging overlays under [obs/](obs/), and verification tests under [tests/](tests/). Anyone cloning this repository can reconstruct the exact 6-plugin desktop and Android source trees from pinned commits on [kdeconnect-kde](https://invent.kde.org/network/kdeconnect-kde) and [kdeconnect-android](https://invent.kde.org/network/kdeconnect-android) without trusting third-party mirrors.
+This repository (`lmdeuser/kdeconnect-plugins`) does not fork the desktop or Android codebases. Instead, it ships the SHA-256-locked patch series under [patches/](patches/), pinned base and result hashes in [stack.lock.json](stack.lock.json), a hardened reproducer ([tools/reproduce_stack.py](tools/reproduce_stack.py)), the multi-plugin registry ([plugins.toml](plugins.toml)), protocol specifications under `docs/plugins/`, Ubuntu 26.04 packaging overlays under [obs/](obs/), Gentoo Portage EAPI 8 overlay tooling under [gentoo/](gentoo/), and verification tests under [tests/](tests/). Anyone cloning this repository can reconstruct the exact 6-plugin desktop and Android source trees from pinned commits on [kdeconnect-kde](https://invent.kde.org/network/kdeconnect-kde) and [kdeconnect-android](https://invent.kde.org/network/kdeconnect-android) without trusting third-party mirrors.
 
 ## Included plugins and enhancements
 
@@ -116,6 +116,22 @@ dpkg-source -x ../repro/kdeconnect-deb-src/kdeconnect_*.dsc ../repro/build-kdeco
 ```
 
 From `../repro/build-libei` and then `../repro/build-kdeconnect`, install build dependencies (`sudo apt build-dep .`) and build binary packages with `dpkg-buildpackage -us -uc`. See [obs/kdeconnect/debian/](obs/kdeconnect/debian/) for exact Debian build flags and `ctest` / `lintian` hooks.
+
+### Desktop packages on Gentoo Linux (Portage EAPI 8, Wayland)
+
+Generate a verified `kdeconnect-continuity` Portage EAPI 8 overlay (with `metadata/layout.conf`, `profiles/repo_name`, `kde-misc/kdeconnect/kdeconnect-27.03.70_p1.ebuild`, and SHA-256-verified `files/patches/`) directly from [stack.lock.json](stack.lock.json):
+
+```bash
+python3 tools/reproduce_stack.py checkout \
+  --target desktop \
+  --out ../repro/kdeconnect-kde \
+  --emit-gentoo-overlay ../repro/gentoo-overlay
+
+# Or emit only the Portage overlay without cloning upstream Git history:
+python3 tools/gentoo_packaging.py --output-dir ../repro/gentoo-overlay
+```
+
+See [gentoo/README.md](gentoo/README.md) for `repos.conf`, `package.mask`, USE flags (`bluetooth`, `+pulseaudio`, optional `telephony`, `X`), `Manifest` handling (`--distfile` / `--preserve-manifest-from`), and post-install runtime verification using `python3 tools/plugin_registry.py gentoo-checks`.
 
 ### Android APK (Android 11-15+)
 
@@ -265,6 +281,7 @@ See [obs/README.md](obs/README.md) for `status`, `cleanup`, and `--remove` cron 
 | [docs/WORKFLOW.md](docs/WORKFLOW.md) | Detailed Gate 0 to Gate 5 acceptance criteria and handoff checklist |
 | `docs/plugins/` | Per-plugin specifications linked in the plugin table above |
 | [obs/](obs/) | Ubuntu 26.04 Debian overlays, OBS project/package XMLs, `*.prjconf`, and [verifier.Dockerfile](obs/verifier.Dockerfile) |
+| [gentoo/](gentoo/) | Gentoo Linux Portage EAPI 8 (`kdeconnect-continuity`) metadata, profile mask notes, and installation guide |
 | [tools/](tools/) | Lockfile reproducer, patch exporter, stack synthesis, OBS controller/packaging, Docker verifier, and hygiene checks |
 | [tests/](tests/) | Python `unittest` suite covering reproducer integrity, registry schema, packaging, runner safety gates, and tree hygiene |
 | [prototype/](prototype/) | Initial standalone Android `MediaProjection` probe; see [prototype/README.md](prototype/README.md) |
@@ -298,6 +315,6 @@ python3 -m unittest discover -s tests -v
 
 ## Verification scope, upstream policy, and license
 
-- **Verification scope:** Virtual Gate 4 acceptance and packaging verification targeted Ubuntu 26.04 LTS (`x86_64`, Wayland) and Android 15 (API 35). X11 desktops and untested OEM Android builds or versions are outside verified claims until explicitly tested.
+- **Verification scope:** Virtual Gate 4 acceptance and packaging verification targeted Ubuntu 26.04 LTS (`x86_64`, Wayland) and Android 15 (API 35). Gentoo Linux (Portage EAPI 8, Wayland) overlay emission and `gentoo-checks` runtime probes are derived from the same verified patch lockfile; live Gentoo `emerge` verification runs on target Gentoo hosts. X11 desktops and untested OEM Android builds or versions are outside verified claims until explicitly tested.
 - **Upstream KDE policy:** Upstream KDE repositories do not accept automated pull requests or AI-authored merge requests. Individual `work/<plugin_id>` branches stay free of packaging overlays, undergo human maintainer review, and are discussed on the [KDE Connect mailing list](https://mail.kde.org/mailman/listinfo/kdeconnect) before manual submission to KDE Invent; see [AGENTS.md](AGENTS.md).
 - **License:** Tracked files follow [REUSE 3.0](https://reuse.software/spec-3.0/) backed by [REUSE.toml](REUSE.toml) and [LICENSES/](LICENSES/) (`GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL` for plugin/tool code and docs, `BSD-2-Clause` for build helpers, `Apache-2.0` where upstream Android/Gradle components apply, and `CC0-1.0` for manifests).

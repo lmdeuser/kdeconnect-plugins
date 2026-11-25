@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
+# SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
+
+# Mask the standard ::gentoo kde-misc/kdeconnect ebuild in /etc/portage/package.mask/
+# if you want Portage to resolve only the kdeconnect-continuity overlay package:
+#
+#   echo "kde-misc/kdeconnect::gentoo" | sudo tee /etc/portage/package.mask/kdeconnect-gentoo
+#
+# Kept commented inside the repository profile so Portage does not reject ::repo
+# syntax or mask the overlay's own kde-misc/kdeconnect ebuild across configurations.
+# kde-misc/kdeconnect::gentoo

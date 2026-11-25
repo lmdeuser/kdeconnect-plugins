@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Dmitriy Volkov <dennshield@duck.com>
 # SPDX-License-Identifier: GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL
 
-"""Multi-plugin registry loader, schema validator, and .deb check generator."""
+"""Multi-plugin registry loader, schema validator, and runtime check generator."""
 
 from __future__ import annotations
 
@@ -173,8 +173,8 @@ def active_android_plugins(entries: list[PluginSpec]) -> list[PluginSpec]:
     return [entry for entry in entries if entry.status == "active" and entry.android_branch]
 
 
-def build_deb_check_script(entries: list[PluginSpec]) -> str:
-    """Build shell verification commands for all active desktop plugins."""
+def build_runtime_check_script(entries: list[PluginSpec]) -> str:
+    """Build distro-neutral ELF, QML, and GStreamer verification commands for active desktop plugins."""
     lines: list[str] = []
     gst_elements: list[str] = []
     seen_gst: set[str] = set()
@@ -182,7 +182,9 @@ def build_deb_check_script(entries: list[PluginSpec]) -> str:
     for entry in active_desktop_plugins(entries):
         for so_name in entry.verify_so:
             q_so = shlex.quote(so_name)
-            lines.append(f"so_path=$(find /usr/lib -name {q_so} | head -n 1)")
+            lines.append(
+                f"so_path=$(find /usr/lib /usr/lib64 -name {q_so} 2>/dev/null | head -n 1 || true)"
+            )
             lines.append('test -n "$so_path"')
         for bin_path in entry.verify_bins:
             lines.append(f"test -x {shlex.quote(bin_path)}")
@@ -214,6 +216,16 @@ def build_deb_check_script(entries: list[PluginSpec]) -> str:
     return "\n".join(lines)
 
 
+def build_deb_check_script(entries: list[PluginSpec]) -> str:
+    """Build shell verification commands for Debian/Ubuntu .deb packages."""
+    return build_runtime_check_script(entries)
+
+
+def build_gentoo_check_script(entries: list[PluginSpec]) -> str:
+    """Build distro-neutral shell verification commands for Gentoo Portage installs."""
+    return build_runtime_check_script(entries)
+
+
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description="Validate and inspect the KDE Connect plugin registry")
@@ -229,6 +241,12 @@ def main() -> int:
 
     deb_p = sub.add_parser("deb-checks", help="Emit shell verification commands for active desktop plugins")
     deb_p.add_argument("--registry", type=Path, default=root / "plugins.toml")
+
+    gentoo_p = sub.add_parser(
+        "gentoo-checks",
+        help="Emit distro-neutral ELF/QML/GStreamer verification commands for active desktop plugins",
+    )
+    gentoo_p.add_argument("--registry", type=Path, default=root / "plugins.toml")
 
     args = parser.parse_args()
     registry_path = args.registry.resolve()
@@ -273,6 +291,10 @@ def main() -> int:
 
     if args.command == "deb-checks":
         print(build_deb_check_script(entries))
+        return 0
+
+    if args.command == "gentoo-checks":
+        print(build_gentoo_check_script(entries))
         return 0
 
     return 2
