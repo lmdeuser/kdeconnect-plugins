@@ -7,8 +7,8 @@
 
 - **Plugin ID:** `otp_autofill` (`upstream_enhancement` to desktop `kdeconnect_notifications` and Android `SMSPlugin`)
 - **Human owner / maintainer:** `Dmitriy Volkov <dennshield@duck.com>`
-- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/otp_autofill`, base SHA `69ce9c5c49ce209600873bf10ddf61bfe4dfab1c`)
-- **Android target:** `https://invent.kde.org/network/kdeconnect-android.git` (branch `work/otp_autofill`, base SHA `d0534acc70cd9403fb56d78f645f228e21097492`)
+- **Desktop target:** `https://invent.kde.org/network/kdeconnect-kde.git` (branch `work/otp_autofill`, base SHA `27568643beb5395d2fbb81416a32b18bb5a33c13`)
+- **Android target:** `https://invent.kde.org/network/kdeconnect-android.git` (branch `work/otp_autofill`, base SHA `6a6f7cd6cf7b3d576f653b3cfeba6eaad438faaa`)
 - **OBS packaging targets:** `home:dwolfF:kdeconnect:staging` -> `home:dwolfF:kdeconnect` (`xUbuntu_26.04`, `x86_64`)
 
 ## 2. User-Visible Goal and Platform Matrix

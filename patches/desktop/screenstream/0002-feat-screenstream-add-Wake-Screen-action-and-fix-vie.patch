@@ -6,10 +6,10 @@ Subject: [PATCH 02/12] feat(screenstream): add Wake Screen action and fix
 
 
 diff --git a/app/qml/DevicePage.qml b/app/qml/DevicePage.qml
-index 590bac191d220b8d6ca5f24d56f327878714bebb..160e6ff5c74dbf5a3691ac01bbf185432f321860 100644
+index ef99f27b006b9e365d0aa499600a337f1243f44d..eb230824c749c45ea92e0675272c61ac7b5581f8 100644
 --- a/app/qml/DevicePage.qml
 +++ b/app/qml/DevicePage.qml
-@@ -260,6 +260,7 @@ Kirigami.ScrollablePage {
+@@ -295,6 +295,7 @@ Kirigami.ScrollablePage {
                  device: root.currentDevice
              },
              PluginItem {
@@ -17,7 +17,7 @@ index 590bac191d220b8d6ca5f24d56f327878714bebb..160e6ff5c74dbf5a3691ac01bbf18543
                  readonly property QtObject screenStream: ScreenStreamDbusInterfaceFactory.create(root.currentDevice.id())
                  pluginName: "screenstream"
                  name: screenStream.active ? i18n("Stop screen stream") : i18n("View device screen")
-@@ -276,6 +277,19 @@ Kirigami.ScrollablePage {
+@@ -311,6 +312,19 @@ Kirigami.ScrollablePage {
                  section: "action"
                  device: root.currentDevice
              },

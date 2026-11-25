@@ -6,10 +6,10 @@ Subject: [PATCH 4/7] continuity_camera: add QML/D-Bus webcam controls and
 
 
 diff --git a/app/qml/DevicePage.qml b/app/qml/DevicePage.qml
-index 10ad0e82e7fc4fcf764da9a767e0c9298173134c..0b56f8121a4835898f20caa91327bce5c595b9cc 100644
+index b1e4cc3f6d1c0a8b4619fd73ae835c41df641b09..889fb0c1330e109cb0ebb9d278669ee247c8f8d9 100644
 --- a/app/qml/DevicePage.qml
 +++ b/app/qml/DevicePage.qml
-@@ -234,6 +234,50 @@ Kirigami.ScrollablePage {
+@@ -269,6 +269,50 @@ Kirigami.ScrollablePage {
                  section: "action"
                  device: root.currentDevice
              },
@@ -95,7 +95,7 @@ index 40374c314434af2c5ec49b1e2b6809294738b70a..cfe6e97be87b2e2a117de5de961637aa
      : OrgKdeKdeconnectDeviceShareInterface(DaemonDbusInterface::activatedService(),
                                             QLatin1String("/modules/kdeconnect/devices/%1/share").arg(deviceId),
 diff --git a/dbusinterfaces/dbusinterfaces.h b/dbusinterfaces/dbusinterfaces.h
-index f7ad3fa26c97673f400edf60481aa537f8c23f45..e2ac182f0882a9bb73b37b51f607f24adc1b28f5 100644
+index 053e553fd1ba5ef9bd45f0ca95670a3b8520e429..3b463d227c1df4c565301836ef2eda07e4d6e464 100644
 --- a/dbusinterfaces/dbusinterfaces.h
 +++ b/dbusinterfaces/dbusinterfaces.h
 @@ -11,6 +11,7 @@
@@ -106,7 +106,7 @@ index f7ad3fa26c97673f400edf60481aa537f8c23f45..e2ac182f0882a9bb73b37b51f607f24a
  #include "generated/conversationsinterface.h"
  #include "generated/daemoninterface.h"
  #include "generated/deviceclipboardinterface.h"
-@@ -225,6 +226,20 @@ public:
+@@ -226,6 +227,20 @@ public:
      explicit SmsDbusInterface(const QString &deviceId, QObject *parent = nullptr);
  };
  

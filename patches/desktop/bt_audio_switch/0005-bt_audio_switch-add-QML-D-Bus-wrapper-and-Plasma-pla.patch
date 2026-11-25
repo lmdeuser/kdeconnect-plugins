@@ -41,7 +41,7 @@ index 40374c314434af2c5ec49b1e2b6809294738b70a..444ea20969125a7aa92b74dc6274cb5f
      : OrgKdeKdeconnectDeviceConnectivity_reportInterface(DaemonDbusInterface::activatedService(),
                                                           QLatin1String("/modules/kdeconnect/devices/%1/connectivity_report").arg(id),
 diff --git a/dbusinterfaces/dbusinterfaces.h b/dbusinterfaces/dbusinterfaces.h
-index f7ad3fa26c97673f400edf60481aa537f8c23f45..5493fc236b4dca9f5972cb2c5c4db5bb2de18027 100644
+index 053e553fd1ba5ef9bd45f0ca95670a3b8520e429..12bb0c029a3c25c8884586a94b91a8102434c93e 100644
 --- a/dbusinterfaces/dbusinterfaces.h
 +++ b/dbusinterfaces/dbusinterfaces.h
 @@ -19,6 +19,7 @@

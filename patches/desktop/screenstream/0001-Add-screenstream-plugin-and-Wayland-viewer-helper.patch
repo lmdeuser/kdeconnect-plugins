@@ -19,10 +19,10 @@ index ec1e3ef8d74a5f7a627e748cf00ffca0770c4fc0..da04df12d4d9db33f7e4b30eb5870344
 +SPDX-License-Identifier = "GPL-2.0-only OR GPL-3.0-only OR LicenseRef-KDE-Accepted-GPL"
 +
 diff --git a/app/qml/DevicePage.qml b/app/qml/DevicePage.qml
-index 10ad0e82e7fc4fcf764da9a767e0c9298173134c..590bac191d220b8d6ca5f24d56f327878714bebb 100644
+index b1e4cc3f6d1c0a8b4619fd73ae835c41df641b09..ef99f27b006b9e365d0aa499600a337f1243f44d 100644
 --- a/app/qml/DevicePage.qml
 +++ b/app/qml/DevicePage.qml
-@@ -259,6 +259,23 @@ Kirigami.ScrollablePage {
+@@ -294,6 +294,23 @@ Kirigami.ScrollablePage {
                  section: "action"
                  device: root.currentDevice
              },
@@ -80,7 +80,7 @@ index 40374c314434af2c5ec49b1e2b6809294738b70a..c14e7450d5ff371129b70bbcb2e62992
      : OrgKdeKdeconnectDeviceClipboardInterface(DaemonDbusInterface::activatedService(),
                                                 QLatin1String("/modules/kdeconnect/devices/%1/clipboard").arg(deviceId),
 diff --git a/dbusinterfaces/dbusinterfaces.h b/dbusinterfaces/dbusinterfaces.h
-index f7ad3fa26c97673f400edf60481aa537f8c23f45..3f6719443174a76684520cf1ef144c44f8c085ce 100644
+index 053e553fd1ba5ef9bd45f0ca95670a3b8520e429..1365d380290340d913078027cb3b4686b82b064a 100644
 --- a/dbusinterfaces/dbusinterfaces.h
 +++ b/dbusinterfaces/dbusinterfaces.h
 @@ -27,6 +27,7 @@
@@ -91,7 +91,7 @@ index f7ad3fa26c97673f400edf60481aa537f8c23f45..3f6719443174a76684520cf1ef144c44
  #include "generated/virtualmonitorinterface.h"
  
  /**
-@@ -254,6 +255,18 @@ Q_SIGNALS:
+@@ -255,6 +256,18 @@ Q_SIGNALS:
      void activeChanged();
  };
  

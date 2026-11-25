@@ -3,24 +3,24 @@
   "targets": {
     "desktop": {
       "upstream_url": "https://invent.kde.org/network/kdeconnect-kde.git",
-      "base_sha": "69ce9c5c49ce209600873bf10ddf61bfe4dfab1c",
-      "expected_tree_sha": "959c58c7490c4139f43cfdaeab768f6a08fc502f",
-      "expected_head_sha": "3fc12614bd3e3cd96e14025a96fe6ae4914d9890",
+      "base_sha": "27568643beb5395d2fbb81416a32b18bb5a33c13",
+      "expected_tree_sha": "ad3888ee36e167c665f5e7975bab353f0b82e424",
+      "expected_head_sha": "264c5e8918564f00f567d8c068bed34348deb2b9",
       "plugins": [
         {
           "id": "screenstream",
           "branch": "work/screenstream",
-          "expected_tree_sha": "6432695cbe03d3a5956b6e80715360f4fff8db45",
-          "expected_head_sha": "4ad8a19cef201ab8e711cd58ca9579cac686c04a",
+          "expected_tree_sha": "e61ce9cf9f2bf6539081fd3d70a3bed3e46e0913",
+          "expected_head_sha": "f3d3cd1af27996cd01eabfd8d4fd51c7ee0a7dc6",
           "patches": [
             {
               "path": "patches/desktop/screenstream/0001-Add-screenstream-plugin-and-Wayland-viewer-helper.patch",
-              "sha256": "5dfd6957e6dd8032656b41a9fce7560f1f9fd30ee291c5e854ee7f263355023f",
+              "sha256": "e492f92879df97e07e38798143775084f1943f3ebc95736eb99165f0eb83affc",
               "bytes": 123768
             },
             {
               "path": "patches/desktop/screenstream/0002-feat-screenstream-add-Wake-Screen-action-and-fix-vie.patch",
-              "sha256": "6506f04e5ac0a5568ac314d17afc4999752eaa4f9e497b1bcda7c98726265f4f",
+              "sha256": "ebbf793c20c0a707be261e39d52373dca38b2b710fd57bd3bf187701bd78e560",
               "bytes": 15284
             },
             {
@@ -78,8 +78,8 @@
         {
           "id": "clipboard_images",
           "branch": "work/clipboard_images",
-          "expected_tree_sha": "92d56690121b1f0af0ec44382b9bebb34a19e9f8",
-          "expected_head_sha": "ec723ee89b5459ba4d94f8c67ef6e1feb4e09526",
+          "expected_tree_sha": "886425106cd464a1e34b83aa5955fd50bf543f76",
+          "expected_head_sha": "366c020262af847065acf981d29c78a51a187e1a",
           "patches": [
             {
               "path": "patches/desktop/clipboard_images/0001-clipboard-expose-local-image-files-as-QImage-clipboa.patch",
@@ -91,8 +91,8 @@
         {
           "id": "otp_autofill",
           "branch": "work/otp_autofill",
-          "expected_tree_sha": "6186a6d022bcf8078c3eb2de2edba4b87215b957",
-          "expected_head_sha": "52d215a79b6eb014843a1876eabd1a0df2b818f8",
+          "expected_tree_sha": "977a69005e3e14b52f545c6ee0f363ae76fdc385",
+          "expected_head_sha": "449e555f3bc2b92eaab18438e6de0b369ca0d1c6",
           "patches": [
             {
               "path": "patches/desktop/otp_autofill/0001-notifications-auto-copy-incoming-OTP-codes-with-secr.patch",
@@ -114,8 +114,8 @@
         {
           "id": "continuity_camera",
           "branch": "work/continuity_camera",
-          "expected_tree_sha": "a8f826f85dbc6983f8922497bd23d139219f0244",
-          "expected_head_sha": "1c9885b8b6763d6bccb97854971bf87efed652cb",
+          "expected_tree_sha": "8345140c01d7631a261498e4a31a11a9a768f79f",
+          "expected_head_sha": "8ab684c82b3678c611754d98cb8126e9a2906623",
           "patches": [
             {
               "path": "patches/desktop/continuity_camera/0001-plugins-add-continuity_camera-PipeWire-virtual-camer.patch",
@@ -134,7 +134,7 @@
             },
             {
               "path": "patches/desktop/continuity_camera/0004-continuity_camera-add-QML-D-Bus-webcam-controls-and-.patch",
-              "sha256": "5a1fa505f03faf3e14d3bdb16fe4f7cda9c990db1c0be75fd297addadf36f3a7",
+              "sha256": "cdd2c76ac4981b7628d65fb2be23eb44f7a760700ddee580410eb045a143825a",
               "bytes": 20698
             },
             {
@@ -157,8 +157,8 @@
         {
           "id": "remote_auth",
           "branch": "work/remote_auth",
-          "expected_tree_sha": "c226c45c55d0b43500a10516ab04a960f69e74a5",
-          "expected_head_sha": "bc11525a6c052cc39d5d9039b9415bd711c9a098",
+          "expected_tree_sha": "0bca5d2fd10de1b277bb43858294077e82a430e1",
+          "expected_head_sha": "1823dae2e46d04640f3fd933316d3174902a6abc",
           "patches": [
             {
               "path": "patches/desktop/remote_auth/0001-plugins-add-remote_auth-biometric-confirmation-and-s.patch",
@@ -175,8 +175,8 @@
         {
           "id": "bt_audio_switch",
           "branch": "work/bt_audio_switch",
-          "expected_tree_sha": "c13689c448862d4c69749b8258ed786622935b88",
-          "expected_head_sha": "aec36d39ada8d8ea26c2da4c1cd9b2124bf07a56",
+          "expected_tree_sha": "af954fcb6bb6df889eba1c66c6c60de687b348a9",
+          "expected_head_sha": "88e6b439c2ef32eb1af1a51908345d013ee2c42f",
           "patches": [
             {
               "path": "patches/desktop/bt_audio_switch/0001-plugins-add-bt_audio_switch-headset-handoff-plugin.patch",
@@ -200,7 +200,7 @@
             },
             {
               "path": "patches/desktop/bt_audio_switch/0005-bt_audio_switch-add-QML-D-Bus-wrapper-and-Plasma-pla.patch",
-              "sha256": "6d352b66a86a1584fa4af860939299271ff14d3957b0fc8d3a4282c31be1f569",
+              "sha256": "1a7c5d954733605ffec4cf81a6ffe216c61b17d41d4f9042eabbd436c3d79a33",
               "bytes": 10199
             }
           ]
@@ -209,15 +209,15 @@
     },
     "android": {
       "upstream_url": "https://invent.kde.org/network/kdeconnect-android.git",
-      "base_sha": "34fff43ee71d15c239789d230547eda7c2fbfd93",
-      "expected_tree_sha": "e249eb0cea7369b85bfff4e11dfa0fda077ed460",
-      "expected_head_sha": "aa7b3fb05d190a81582f415f170f170ee4fcd4ed",
+      "base_sha": "6a6f7cd6cf7b3d576f653b3cfeba6eaad438faaa",
+      "expected_tree_sha": "58b07ee8385870f418d751ebf101baa9fdd97da9",
+      "expected_head_sha": "fe3c50b8d23a68424f081ce166a8df928ac281a5",
       "plugins": [
         {
           "id": "screenstream",
           "branch": "work/screenstream",
-          "expected_tree_sha": "d6cf516d29b44a4d2c4fda1bd141d575850f4d48",
-          "expected_head_sha": "ce70b461fef959c368ec8b63fd7864583cc49992",
+          "expected_tree_sha": "548c03448b8aa1e517e359a193719d43f126c6e5",
+          "expected_head_sha": "e9b5278bdcbf088523039d6f31c39d6a1d9c0e8f",
           "patches": [
             {
               "path": "patches/android/screenstream/0001-feat-screenstream-add-Android-screen-and-playback-au.patch",
@@ -264,8 +264,8 @@
         {
           "id": "clipboard_images",
           "branch": "work/clipboard_images",
-          "expected_tree_sha": "be7083f88cb68bd725602fc9052061069589e33a",
-          "expected_head_sha": "174b6c9d13b1877f17667cd5e415dc245121d85c",
+          "expected_tree_sha": "ef53eb3b57b0dcc8de8e45b8e9484c701e3855b6",
+          "expected_head_sha": "e809f529c738d837a73a329aec6f3df17dcf9efa",
           "patches": [
             {
               "path": "patches/android/clipboard_images/0001-clipboard-add-bidirectional-clipboard-image-sync.patch",
@@ -282,8 +282,8 @@
         {
           "id": "otp_autofill",
           "branch": "work/otp_autofill",
-          "expected_tree_sha": "a36ea4bd883fb0173d439d45430da800e19354be",
-          "expected_head_sha": "6076933415c29079e49e678b708eb652db967ae4",
+          "expected_tree_sha": "35f9582f2940d2e0834034af5581f33bcab768b2",
+          "expected_head_sha": "e67963f933c952e90352728b2ebdcaef14138f62",
           "patches": [
             {
               "path": "patches/android/otp_autofill/0001-sms-push-strictly-newer-inbox-messages-for-OTP-redac.patch",
@@ -295,8 +295,8 @@
         {
           "id": "continuity_camera",
           "branch": "work/continuity_camera",
-          "expected_tree_sha": "4269f92ac629f9faa7d18826733dcea8d001367c",
-          "expected_head_sha": "22e8f94ea08cf9253d3261cc61308a40b7dde628",
+          "expected_tree_sha": "6d0af1e2cbe3f83d1a22764570f7ac78d7a80e6b",
+          "expected_head_sha": "77d0501e346a777e7169dbf86ef949734de86a50",
           "patches": [
             {
               "path": "patches/android/continuity_camera/0001-plugins-add-ContinuityCamera-streaming-and-capture-p.patch",
@@ -323,8 +323,8 @@
         {
           "id": "remote_auth",
           "branch": "work/remote_auth",
-          "expected_tree_sha": "718175eab6022868febf3bc3b7c42b8efb37c1b9",
-          "expected_head_sha": "d4163b95524eaf59388ea75d99e365c00d9a0a25",
+          "expected_tree_sha": "89b77ef9acafef7ac68c61e50e08a04bdcbeed5c",
+          "expected_head_sha": "3ad49199441766692d66d6b2ad5df1943dc33819",
           "patches": [
             {
               "path": "patches/android/remote_auth/0001-plugins-add-RemoteAuth-biometric-prompt-plugin.patch",
@@ -341,8 +341,8 @@
         {
           "id": "bt_audio_switch",
           "branch": "work/bt_audio_switch",
-          "expected_tree_sha": "a5aed9af704821ba733d1bd42428234a1b6fc937",
-          "expected_head_sha": "2823b9671d2e789735c4f42a6087e3b31bd5af41",
+          "expected_tree_sha": "26b44debe2ce2f3c9bdf0cf455c15beac580f874",
+          "expected_head_sha": "447486a31a7d474ba4745f78e71227904594ada6",
           "patches": [
             {
               "path": "patches/android/bt_audio_switch/0001-plugins-add-BtAudioSwitch-headset-handoff-plugin.patch",
